@@ -10,6 +10,7 @@ license.workspace = true
 ve_engine.workspace = true
 ve_model.workspace = true
 ve_ui.workspace = true
+gpu_import.workspace = true
 platform_winit.workspace = true
 libgui.workspace = true
 libgui_wgpu.workspace = true

@@ -1,5 +1,6 @@
-//! Encoding: H.264 / HEVC through VideoToolbox, ProRes 422 HQ through
-//! FFmpeg's own (LGPL) encoder, AAC audio, into MP4 or MOV.
+//! Encoding: H.264 / HEVC on the GPU's media engine — whichever this
+//! machine has (see [`video_encoders`]) — ProRes 422 HQ through FFmpeg's own
+//! (LGPL) encoder, AAC audio, into MP4 or MOV.
 //!
 //! Video arrives as display-encoded RGBA8 (what the compositor's display
 //! pass produces) and leaves as Rec.709 YCbCr, tagged as such.
@@ -9,7 +10,7 @@ use std::ptr;
 
 use ve_ports::*;
 
-use crate::{err, sys};
+use crate::{err, shared_device, sys};
 
 const EAGAIN: c_int = -(sys::EAGAIN as c_int);
 const EOF: c_int = -((b'E' as c_int) | (b'O' as c_int) << 8 | (b'F' as c_int) << 16 | (b' ' as c_int) << 24);
@@ -17,6 +18,51 @@ const EOF: c_int = -((b'E' as c_int) | (b'O' as c_int) << 8 | (b'F' as c_int) <<
 struct Stream {
     ctx: *mut sys::AVCodecContext,
     st: *mut sys::AVStream,
+    /// For encoders that take frames in GPU memory (VA-API, Vulkan): the
+    /// pool frames are uploaded into. Null otherwise.
+    hw_frames: *mut sys::AVBufferRef,
+    /// The format frames are converted to in memory (before any upload).
+    sw_pix: sys::AVPixelFormat,
+}
+
+/// An encoder to try: FFmpeg name, the device type it needs frames uploaded
+/// to (if any), and private options.
+type Candidate = (&'static str, Option<sys::AVHWDeviceType>, &'static [(&'static str, &'static str)]);
+
+/// Encoders for `codec`, best first. The first that this FFmpeg build has
+/// and that opens on this machine is used, so one list serves Apple
+/// (VideoToolbox), NVIDIA (NVENC), AMD (AMF, or Media Foundation on
+/// Windows), Intel (QSV, Media Foundation) and Linux (VA-API, Vulkan Video)
+/// — integrated or discrete GPU alike — and Windows' software encoder last.
+/// All LGPL-compatible.
+fn video_encoders(codec: &str) -> &'static [Candidate] {
+    use sys::AVHWDeviceType::{AV_HWDEVICE_TYPE_VAAPI as VAAPI, AV_HWDEVICE_TYPE_VULKAN as VULKAN};
+    const MF_HW: &[(&str, &str)] = &[("hw_encoding", "1")];
+    match codec {
+        "hevc" => &[
+            ("hevc_videotoolbox", None, &[]),
+            ("hevc_nvenc", None, &[]),
+            ("hevc_amf", None, &[]),
+            ("hevc_qsv", None, &[]),
+            ("hevc_mf", None, MF_HW),
+            ("hevc_vaapi", Some(VAAPI), &[]),
+            ("hevc_vulkan", Some(VULKAN), &[]),
+            // Windows' own software encoder (with the HEVC extension).
+            ("hevc_mf", None, &[]),
+        ],
+        "prores" => &[("prores_ks", None, &[("profile", "hq")])],
+        _ => &[
+            ("h264_videotoolbox", None, &[]),
+            ("h264_nvenc", None, &[]),
+            ("h264_amf", None, &[]),
+            ("h264_qsv", None, &[]),
+            ("h264_mf", None, MF_HW),
+            ("h264_vaapi", Some(VAAPI), &[]),
+            ("h264_vulkan", Some(VULKAN), &[]),
+            // Windows' own software encoder: machines with no GPU encoder.
+            ("h264_mf", None, &[]),
+        ],
+    }
 }
 
 pub struct FfEncoder {
@@ -52,7 +98,7 @@ impl FfEncoder {
             check(sys::avformat_alloc_output_context2(&mut oc, ptr::null(), container.as_ptr(), cpath.as_ptr()), "output format")?;
             let mut enc = FfEncoder {
                 oc,
-                video: Stream { ctx: ptr::null_mut(), st: ptr::null_mut() },
+                video: Stream { ctx: ptr::null_mut(), st: ptr::null_mut(), hw_frames: ptr::null_mut(), sw_pix: sys::AVPixelFormat::AV_PIX_FMT_NV12 },
                 audio: None,
                 sws: sys::sws_alloc_context(),
                 pkt: sys::av_packet_alloc(),
@@ -72,44 +118,92 @@ impl FfEncoder {
     }
 
     unsafe fn add_video(&mut self, s: &EncoderSettings) -> Result<Stream, MediaError> {
-        let (name, pix) = match s.video_codec.as_str() {
-            "hevc" => ("hevc_videotoolbox", sys::AVPixelFormat::AV_PIX_FMT_NV12),
-            "prores" => ("prores_ks", sys::AVPixelFormat::AV_PIX_FMT_YUV422P10LE),
-            _ => ("h264_videotoolbox", sys::AVPixelFormat::AV_PIX_FMT_NV12),
-        };
+        let mut tried = Vec::new();
+        for &(name, device, opts) in video_encoders(&s.video_codec) {
+            match unsafe { self.try_video(s, name, device, opts) } {
+                Ok(st) => return Ok(st),
+                Err(e) => tried.push(format!("{name}: {e}")),
+            }
+        }
+        Err(MediaError::Unsupported(format!("no {} encoder works here ({})", s.video_codec, tried.join("; "))))
+    }
+
+    /// Open encoder `name`, or say why not. Adds the stream only on success.
+    unsafe fn try_video(&mut self, s: &EncoderSettings, name: &str, device: Option<sys::AVHWDeviceType>, opts: &[(&str, &str)]) -> Result<Stream, String> {
         let cname = CString::new(name).unwrap();
-        let codec = sys::avcodec_find_encoder_by_name(cname.as_ptr());
+        let codec = unsafe { sys::avcodec_find_encoder_by_name(cname.as_ptr()) };
         if codec.is_null() {
-            return Err(MediaError::Unsupported(format!("encoder {name} is not in this build")));
+            return Err("not in this build".into());
         }
-        let st = sys::avformat_new_stream(self.oc, ptr::null());
-        let ctx = sys::avcodec_alloc_context3(codec);
-        (*ctx).width = s.width as c_int;
-        (*ctx).height = s.height as c_int;
-        (*ctx).time_base = sys::AVRational { num: s.rate.den as c_int, den: s.rate.num as c_int };
-        (*ctx).framerate = sys::AVRational { num: s.rate.num as c_int, den: s.rate.den as c_int };
-        (*ctx).pix_fmt = pix;
-        (*ctx).color_primaries = sys::AVColorPrimaries::AVCOL_PRI_BT709;
-        (*ctx).color_trc = sys::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
-        (*ctx).colorspace = sys::AVColorSpace::AVCOL_SPC_BT709;
-        (*ctx).color_range = sys::AVColorRange::AVCOL_RANGE_MPEG;
-        let pixels = (s.width * s.height) as u64;
-        (*ctx).bit_rate = s.video_bitrate.unwrap_or(match name {
-            "hevc_videotoolbox" => pixels * 6,  // ~12 Mb/s at 1080p
-            _ => pixels * 10,                    // ~20 Mb/s at 1080p
-        }) as i64;
-        if name == "prores_ks" {
-            let (k, v) = (CString::new("profile").unwrap(), CString::new("hq").unwrap());
-            sys::av_opt_set((*ctx).priv_data, k.as_ptr(), v.as_ptr(), 0);
+        let sw_pix = if name == "prores_ks" { sys::AVPixelFormat::AV_PIX_FMT_YUV422P10LE } else { sys::AVPixelFormat::AV_PIX_FMT_NV12 };
+        unsafe {
+            let mut ctx = sys::avcodec_alloc_context3(codec);
+            (*ctx).width = s.width as c_int;
+            (*ctx).height = s.height as c_int;
+            (*ctx).time_base = sys::AVRational { num: s.rate.den as c_int, den: s.rate.num as c_int };
+            (*ctx).framerate = sys::AVRational { num: s.rate.num as c_int, den: s.rate.den as c_int };
+            (*ctx).pix_fmt = sw_pix;
+            (*ctx).color_primaries = sys::AVColorPrimaries::AVCOL_PRI_BT709;
+            (*ctx).color_trc = sys::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+            (*ctx).colorspace = sys::AVColorSpace::AVCOL_SPC_BT709;
+            (*ctx).color_range = sys::AVColorRange::AVCOL_RANGE_MPEG;
+            let pixels = (s.width * s.height) as u64;
+            (*ctx).bit_rate = s.video_bitrate.unwrap_or(if s.video_codec == "hevc" {
+                pixels * 6 // ~12 Mb/s at 1080p
+            } else {
+                pixels * 10 // ~20 Mb/s at 1080p
+            }) as i64;
+            for (k, v) in opts {
+                let (k, v) = (CString::new(*k).unwrap(), CString::new(*v).unwrap());
+                sys::av_opt_set((*ctx).priv_data, k.as_ptr(), v.as_ptr(), 0);
+            }
+            if (*(*self.oc).oformat).flags & sys::AVFMT_GLOBALHEADER as c_int != 0 {
+                (*ctx).flags |= sys::AV_CODEC_FLAG_GLOBAL_HEADER as c_int;
+            }
+            // Encoders that read frames from GPU memory get a pool to upload into.
+            let mut hw_frames = ptr::null_mut();
+            if let Some(t) = device {
+                let Some(mut dev) = shared_device(t) else {
+                    sys::avcodec_free_context(&mut ctx);
+                    return Err("no such device here".into());
+                };
+                hw_frames = sys::av_hwframe_ctx_alloc(dev);
+                sys::av_buffer_unref(&mut dev);
+                let fc = (*hw_frames).data as *mut sys::AVHWFramesContext;
+                (*fc).format = match t {
+                    sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI => sys::AVPixelFormat::AV_PIX_FMT_VAAPI,
+                    _ => sys::AVPixelFormat::AV_PIX_FMT_VULKAN,
+                };
+                (*fc).sw_format = sw_pix;
+                (*fc).width = s.width as c_int;
+                (*fc).height = s.height as c_int;
+                (*fc).initial_pool_size = 8;
+                let r = sys::av_hwframe_ctx_init(hw_frames);
+                if r < 0 {
+                    sys::av_buffer_unref(&mut hw_frames);
+                    sys::avcodec_free_context(&mut ctx);
+                    return Err(format!("frame pool: {}", err(r)));
+                }
+                (*ctx).pix_fmt = (*fc).format;
+                (*ctx).hw_frames_ctx = sys::av_buffer_ref(hw_frames);
+            }
+            let r = sys::avcodec_open2(ctx, codec, ptr::null_mut());
+            if r < 0 {
+                sys::av_buffer_unref(&mut hw_frames);
+                sys::avcodec_free_context(&mut ctx);
+                return Err(err(r));
+            }
+            let st = sys::avformat_new_stream(self.oc, ptr::null());
+            let r = sys::avcodec_parameters_from_context((*st).codecpar, ctx);
+            if r < 0 {
+                sys::av_buffer_unref(&mut hw_frames);
+                sys::avcodec_free_context(&mut ctx);
+                return Err(format!("video parameters: {}", err(r)));
+            }
+            (*st).time_base = (*ctx).time_base;
+            (*st).avg_frame_rate = (*ctx).framerate;
+            Ok(Stream { ctx, st, hw_frames, sw_pix })
         }
-        if (*(*self.oc).oformat).flags & sys::AVFMT_GLOBALHEADER as c_int != 0 {
-            (*ctx).flags |= sys::AV_CODEC_FLAG_GLOBAL_HEADER as c_int;
-        }
-        check(sys::avcodec_open2(ctx, codec, ptr::null_mut()), name)?;
-        check(sys::avcodec_parameters_from_context((*st).codecpar, ctx), "video parameters")?;
-        (*st).time_base = (*ctx).time_base;
-        (*st).avg_frame_rate = (*ctx).framerate;
-        Ok(Stream { ctx, st })
     }
 
     unsafe fn add_audio(&mut self, s: &EncoderSettings) -> Result<Stream, MediaError> {
@@ -131,7 +225,7 @@ impl FfEncoder {
         check(sys::avcodec_open2(ctx, codec, ptr::null_mut()), "aac")?;
         check(sys::avcodec_parameters_from_context((*st).codecpar, ctx), "audio parameters")?;
         (*st).time_base = (*ctx).time_base;
-        Ok(Stream { ctx, st })
+        Ok(Stream { ctx, st, hw_frames: ptr::null_mut(), sw_pix: sys::AVPixelFormat::AV_PIX_FMT_NONE })
     }
 
     /// Send a frame (or `null` to flush) and write whatever comes out.
@@ -184,7 +278,7 @@ impl FfEncoder {
 
 impl Encoder for FfEncoder {
     fn push_video(&mut self, frame: VideoFrame) -> Result<(), MediaError> {
-        let FrameData::Cpu { planes, strides } = &frame.data else {
+        let Some(CpuPlanes { planes, strides }) = frame.data.cpu() else {
             return Err(MediaError::Unsupported("export frames must be in memory".into()));
         };
         if frame.format != PixelFormat::Rgba8 {
@@ -203,7 +297,7 @@ impl Encoder for FfEncoder {
             let mut dst = sys::av_frame_alloc();
             (*dst).width = (*ctx).width;
             (*dst).height = (*ctx).height;
-            (*dst).format = (*ctx).pix_fmt as c_int;
+            (*dst).format = self.video.sw_pix as c_int;
             (*dst).colorspace = sys::AVColorSpace::AVCOL_SPC_BT709;
             (*dst).color_primaries = sys::AVColorPrimaries::AVCOL_PRI_BT709;
             (*dst).color_trc = sys::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
@@ -216,6 +310,23 @@ impl Encoder for FfEncoder {
             }
             (*dst).pts = self.frames;
             self.frames += 1;
+            // An encoder that reads GPU memory gets the frame uploaded first.
+            if !self.video.hw_frames.is_null() {
+                let mut hw = sys::av_frame_alloc();
+                let mut r = sys::av_hwframe_get_buffer(self.video.hw_frames, hw, 0);
+                if r >= 0 {
+                    r = sys::av_hwframe_transfer_data(hw, dst, 0);
+                }
+                if r >= 0 {
+                    sys::av_frame_copy_props(hw, dst);
+                }
+                sys::av_frame_free(&mut dst);
+                if r < 0 {
+                    sys::av_frame_free(&mut hw);
+                    return Err(MediaError::Other(format!("upload to the encoder: {}", err(r))));
+                }
+                dst = hw;
+            }
             let r = self.send(false, dst);
             sys::av_frame_free(&mut dst);
             r
@@ -257,6 +368,7 @@ impl Drop for FfEncoder {
         unsafe {
             for s in [Some(&mut self.video), self.audio.as_mut()].into_iter().flatten() {
                 sys::avcodec_free_context(&mut s.ctx);
+                sys::av_buffer_unref(&mut s.hw_frames);
             }
             if !self.oc.is_null() {
                 if !(*self.oc).pb.is_null() {

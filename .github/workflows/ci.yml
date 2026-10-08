@@ -1,0 +1,230 @@
+# Build and test on every platform the editor targets, on x86_64 and ARM64:
+# macOS, Linux and Windows (each both architectures), plus iPadOS (device and
+# simulator builds).
+#
+# FFmpeg is built from the pinned source by scripts/build_ffmpeg.sh and
+# cached by its pins and build script, so only a pin or script change
+# rebuilds it.
+#
+# Hosted runners have no GPU media engine: hardware decode/encode paths fall
+# back to software here and the tests that need a hardware encoder say
+# "skipped". GPU tests run on a software rasterizer where the runner has one
+# (lavapipe on Linux, WARP on Windows) and skip where none is found.
+#
+# Note: the ARM64 Linux and Windows runners (ubuntu-24.04-arm,
+# windows-11-arm) are free for public repositories; check your plan for
+# private ones.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+            ffmpeg: macos-arm64
+            lint: true
+          - name: macOS x86_64
+            os: macos-15-intel
+            ffmpeg: macos-x86_64
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            ffmpeg: linux-x86_64
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+            ffmpeg: linux-arm64
+          - name: Windows x86_64
+            os: windows-2025
+            ffmpeg: windows-x86_64
+            msvc: x64
+            msystem: UCRT64
+            msys_bin: ucrt64
+            msys_install: make diffutils nasm
+          - name: Windows arm64
+            os: windows-11-arm
+            ffmpeg: windows-arm64
+            msvc: arm64
+            msystem: CLANGARM64
+            msys_bin: clangarm64
+            msys_install: make diffutils
+
+    steps:
+      - name: Long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v7
+
+      - name: Fetch pinned third-party sources
+        shell: bash
+        run: scripts/fetch_third_party.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # ---- platform tools ------------------------------------------------
+
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg nasm pkgconf
+
+      - name: Tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential nasm pkg-config clang libclang-dev \
+            libva-dev zlib1g-dev \
+            libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            mesa-vulkan-drivers ffmpeg
+
+      - name: MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc }}
+
+      - name: MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          path-type: inherit # keep MSVC's cl.exe/link.exe reachable
+          update: false
+          install: ${{ matrix.msys_install }}
+          pacboy: pkgconf:p
+
+      - name: pkg-config for the Rust build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"${{ steps.msys2.outputs.msys2-location }}\${{ matrix.msys_bin }}\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'
+
+      - name: libclang for bindgen (Windows x64)
+        if: runner.os == 'Windows' && matrix.msvc == 'x64'
+        shell: pwsh
+        run: '"LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV'
+
+      - name: libclang for bindgen (Windows arm64)
+        if: runner.os == 'Windows' && matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          # An ARM64 libclang: bindgen loads it into an ARM64 build script.
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-woa64.exe"
+          Invoke-WebRequest $url -OutFile llvm.exe
+          Start-Process -Wait -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\LLVM"
+          "LIBCLANG_PATH=C:\LLVM\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: ffmpeg CLI for making test clips (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # x64 build; runs emulated on ARM64. Only used to generate test media.
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath C:\ffmpeg-cli
+          (Get-ChildItem C:\ffmpeg-cli -Directory | Select-Object -First 1).FullName + "\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      # ---- FFmpeg (pinned, LGPL) ------------------------------------------
+
+      - name: Cache FFmpeg build
+        id: ffmpeg-cache
+        uses: actions/cache@v6
+        with:
+          path: third_party/_build/ffmpeg/${{ matrix.ffmpeg }}
+          key: ffmpeg-${{ matrix.ffmpeg }}-${{ hashFiles('third_party/PINS', 'scripts/build_ffmpeg.sh') }}
+
+      - name: Build FFmpeg (macOS, Linux)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
+        run: scripts/build_ffmpeg.sh ${{ matrix.ffmpeg }}
+
+      - name: Build FFmpeg (Windows)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          # MSYS2's coreutils link.exe would shadow MSVC's linker.
+          mv /usr/bin/link.exe /usr/bin/link.exe.msys 2>/dev/null || true
+          scripts/build_ffmpeg.sh ${{ matrix.ffmpeg }}
+
+      # ---- Rust ------------------------------------------------------------
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.ffmpeg }}
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        if: matrix.lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Architecture rules
+        if: matrix.lint
+        run: scripts/check_arch.sh
+
+  ipados:
+    name: iPadOS (device + simulator)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch pinned third-party sources
+        run: scripts/fetch_third_party.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+
+      - name: Tools
+        run: brew install pkgconf
+
+      - name: Cache FFmpeg builds
+        id: ffmpeg-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/_build/ffmpeg/ios-arm64
+            third_party/_build/ffmpeg/ios-sim-arm64
+          key: ffmpeg-ios-${{ hashFiles('third_party/PINS', 'scripts/build_ffmpeg.sh') }}
+
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          scripts/build_ffmpeg.sh ios-sim-arm64
+          scripts/build_ffmpeg.sh ios-arm64
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios
+
+      - name: Simulator app
+        run: scripts/ios_bundle.sh sim
+
+      - name: Device build
+        run: cargo build --release --locked -p editor_ios --target aarch64-apple-ios

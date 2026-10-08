@@ -97,3 +97,17 @@ pub fn resolve(project: &Project, plan: FramePlan, registry: &Registry, pool: &A
     }
     Frame { plan, layers, seq_size, space, complete, missing }
 }
+
+/// Ask the decoders to get ready for the clips that start on each video track
+/// within `ahead` of `t`, so a cut plays without a stall.
+pub fn prefetch(project: &Project, t: ve_time::Time, ahead: ve_time::Time, pool: &Arc<VideoPool>) {
+    let Some(seq) = project.active() else { return };
+    for track in seq.tracks.iter().filter(|tr| tr.kind == TrackKind::Video && tr.enabled) {
+        let next = track.clips.get(track.insertion_index(t)).filter(|c| c.enabled && c.timeline_start <= t + ahead);
+        if let Some(ClipSource::Asset { asset }) = next.map(|c| &c.source) {
+            if let Some(a) = project.assets.get(asset) {
+                pool.prefetch(a.id, &a.media, next.unwrap().source_range.start);
+            }
+        }
+    }
+}

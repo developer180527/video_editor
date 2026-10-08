@@ -272,7 +272,14 @@ impl EngineClient {
     /// the decoders have ready. Never blocks.
     pub fn frame(&self, quality: Quality) -> Option<crate::Frame> {
         let p = self.published();
-        let plan = p.snapshot.active().map(|s| ve_render::evaluate(s, p.transport.position_at(self.clocks(&p)), quality))?;
+        let t = p.transport.position_at(self.clocks(&p));
+        let plan = p.snapshot.active().map(|s| ve_render::evaluate(s, t, quality))?;
+        // Playing forwards: have the next cut's pictures ready in time.
+        if let State::Playing { rate } = p.transport.state() {
+            if rate > 0.0 {
+                crate::frame::prefetch(&p.snapshot, t, Time::from_seconds_f64(2.0 * rate), &self.video);
+            }
+        }
         Some(crate::frame::resolve(&p.snapshot, plan, &p.plugins, &self.video, None))
     }
 
@@ -285,10 +292,17 @@ impl EngineClient {
     }
 
     /// Export the active sequence as it is now to `out`, on its own thread,
-    /// rendering on `gpu`.
-    pub fn export(&self, gpu: (wgpu::Device, wgpu::Queue), preset: crate::ExportPreset, out: MediaRef) -> Arc<crate::ExportState> {
+    /// rendering on `gpu`, importing hardware-decoded frames with `importer`
+    /// when there is one.
+    pub fn export(
+        &self,
+        gpu: (wgpu::Device, wgpu::Queue),
+        preset: crate::ExportPreset,
+        out: MediaRef,
+        importer: Option<Arc<dyn ve_render::TextureImporter>>,
+    ) -> Arc<crate::ExportState> {
         let p = self.published();
-        crate::export::start(p.snapshot, self.platform.clone(), p.plugins, gpu, preset, out)
+        crate::export::start(p.snapshot, self.platform.clone(), p.plugins, gpu, preset, out, importer)
     }
 
     pub fn drain_events(&self) -> Vec<Event> {

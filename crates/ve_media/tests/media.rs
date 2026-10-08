@@ -62,7 +62,7 @@ fn missing_media_fails_cleanly() {
 }
 
 /// A project with the test clip's audio on A1 and A2.
-fn project(file: &PathBuf) -> (Project, SequenceId) {
+fn project(file: &std::path::Path) -> (Project, SequenceId) {
     let mut p = Project::new("t");
     let asset = Asset {
         id: AssetId::new(),
@@ -176,6 +176,23 @@ fn stills_make_thumbnails_and_peaks() {
     assert!((395..=401).contains(&peaks.len()), "{}", peaks.len());
     let max = peaks.iter().cloned().fold(0.0, f32::max);
     assert!((0.1..0.15).contains(&max), "{max}");
+    // A run along the clip (one decoder, sought each time, backwards too):
+    // every slot gets its own picture.
+    let mut got = std::collections::HashMap::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while got.len() < 4 {
+        for s in [3, 0, 2] {
+            if let Some((_, t)) = stills.thumb(asset, &media, Time::from_seconds(s)) {
+                got.insert(s, t.rgba.clone());
+            }
+        }
+        got.insert(1, thumb.rgba.clone());
+        assert!(std::time::Instant::now() < deadline, "thumbnails never came");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for (a, b) in [(0, 1), (1, 2), (2, 3), (0, 3)] {
+        assert_ne!(got[&a], got[&b], "slots {a} and {b} show the same picture");
+    }
 }
 
 /// Real-time playback against the cache: at 60 Hz for 4 s, ask for the frame
@@ -279,4 +296,30 @@ fn playback_clock_waits_for_the_mixer() {
     pb.stop();
     callback(&mut buf);
     assert_eq!(clock.read().0, n, "stopped: the clock stands still");
+}
+
+/// With frames left in GPU memory, the cache holds the decoder's own
+/// buffers: decoding must keep going while a second of them is held.
+#[test]
+fn native_frames_flow_through_the_cache() {
+    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_cache.mp4");
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=4", "-c:v", "h264_videotoolbox"])
+        .arg(&p)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        return eprintln!("skipped: no ffmpeg CLI with VideoToolbox");
+    }
+    let pool = VideoPool::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()), 512 << 20);
+    pool.set_gpu_frames(true);
+    let (asset, media) = (AssetId::new(), MediaRef(format!("file:{}", p.display())));
+    let r = Rate::FPS_30;
+    let mut native = 0;
+    for i in 0..120 {
+        let f = pool.frame_blocking(asset, &media, r.frame_to_time(i), Duration::from_secs(5)).unwrap();
+        assert_eq!(f.pts.to_frame(r), i);
+        native += matches!(f.data, ve_ports::FrameData::Native(_)) as usize;
+    }
+    eprintln!("{native}/120 frames stayed in GPU memory");
 }

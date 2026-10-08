@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ve_ports::{FrameData, PixelFormat, VideoFrame};
+use ve_ports::{CpuPlanes, FrameData, PixelFormat, VideoFrame};
 
 use crate::FramePlan;
 
@@ -34,11 +34,15 @@ pub const WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float
 /// What the monitor shows: display-encoded RGBA8.
 pub const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Turns a decoded frame into a GPU texture without the CPU path: a
-/// `CVPixelBuffer` → Metal texture on Apple. Platforms supply one; until
-/// then frames come as CPU planes.
+/// Turns a frame left in GPU memory by a hardware decoder into textures on
+/// the compositor's device without a copy: a `CVPixelBuffer` → Metal
+/// textures on Apple (unified memory, or a discrete GPU's VRAM via IOSurface).
+/// Platforms supply one; frames it cannot import take the CPU path.
 pub trait TextureImporter: Send + Sync {
-    fn import(&self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &VideoFrame) -> Option<wgpu::Texture>;
+    /// The frame's luma and chroma planes: `R8Unorm` + `Rg8Unorm` for NV12,
+    /// `R16Unorm` + `Rg16Unorm` for P010 (only on devices with
+    /// `TEXTURE_FORMAT_16BIT_NORM`). `None` if this frame is not one it reads.
+    fn import(&self, device: &wgpu::Device, frame: &VideoFrame) -> Option<[wgpu::Texture; 2]>;
 }
 
 /// Motion, in sequence pixels and degrees; crop in percent.
@@ -245,6 +249,16 @@ fn fs_display(i: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const MIP: &str = r#"
+@group(0) @binding(1) var above: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+@fragment
+fn fs_mip(i: VsOut) -> @location(0) vec4<f32> {
+    return textureSampleLevel(above, samp, i.uv, 0.0);
+}
+"#;
+
 /// Declarations every plugin shader sees (the contract in sdk/WGSL_CONTRACT.md).
 const EFFECT_HEADER: &str = r#"
 struct EffectIn {
@@ -338,11 +352,6 @@ fn texture(device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::Tex
     })
 }
 
-fn uniform(device: &wgpu::Device, bytes: &[u8]) -> wgpu::Buffer {
-    use wgpu::util::DeviceExt;
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("uniform"), contents: bytes, usage: wgpu::BufferUsages::UNIFORM })
-}
-
 fn floats(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
@@ -350,31 +359,120 @@ fn floats(v: &[f32]) -> Vec<u8> {
 struct Planes {
     luma: wgpu::Texture,
     chroma: wgpu::Texture,
+    luma_view: wgpu::TextureView,
+    chroma_view: wgpu::TextureView,
     key: (u32, u32, bool),
-    /// The frame these textures hold, so an unchanged frame is not re-uploaded.
-    holds: usize,
+    /// Imported from GPU memory (not ours to write into).
+    imported: bool,
+    /// The frame these textures hold, so an unchanged frame is not
+    /// re-uploaded. Held (not just its address) so it cannot be freed and
+    /// another frame take its place unnoticed.
+    holds: Option<Arc<VideoFrame>>,
 }
 
-/// Textures that keep their size between frames: target, display, planes.
-struct Sized {
+/// A texture that keeps its size between frames (the working target, the
+/// monitor), with its view.
+struct Target {
     tex: wgpu::Texture,
+    view: wgpu::TextureView,
     w: u32,
     h: u32,
+}
+
+/// One texture of a layer's ping-pong pair, with its mip chain.
+struct LayerTex {
+    /// Level 0 alone: what passes render into and effects read.
+    base: wgpu::TextureView,
+    /// Every level: what the composite samples.
+    all: wgpu::TextureView,
+    /// Levels 1.. alone: the targets of the mip passes.
+    levels: Vec<wgpu::TextureView>,
+}
+
+/// Everything one layer position keeps between frames, so a steady frame
+/// creates no GPU objects: textures, views, uniform buffers (rewritten in
+/// place) and bind groups (rebuilt only when their textures change).
+struct Slot {
+    planes: Option<Planes>,
+    pair: Option<[LayerTex; 2]>,
+    /// Width, height and mip levels of `pair`.
+    pair_key: (u32, u32, u32),
+    decode_buf: wgpu::Buffer,
+    quad_buf: wgpu::Buffer,
+    effect_bufs: Vec<wgpu::Buffer>,
+    decode_bg: Option<wgpu::BindGroup>,
+    /// By which texture of the pair is composited.
+    quad_bg: [Option<wgpu::BindGroup>; 2],
+    /// By effect index, then by source texture.
+    effect_bg: Vec<[Option<wgpu::BindGroup>; 2]>,
+    /// By texture, then by level (reading the level above).
+    mip_bg: [Vec<wgpu::BindGroup>; 2],
+}
+
+const DECODE_BYTES: u64 = 7 * 16;
+const QUAD_BYTES: u64 = 5 * 16;
+const EFFECT_BYTES: u64 = (64 * 4 + 4) * 4;
+const DISPLAY_BYTES: u64 = 3 * 16;
+
+fn uniform_buf(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("uniform"),
+        size,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+impl Slot {
+    fn new(device: &wgpu::Device) -> Self {
+        Slot {
+            planes: None,
+            pair: None,
+            pair_key: (0, 0, 0),
+            decode_buf: uniform_buf(device, DECODE_BYTES),
+            quad_buf: uniform_buf(device, QUAD_BYTES),
+            effect_bufs: Vec::new(),
+            decode_bg: None,
+            quad_bg: [None, None],
+            effect_bg: Vec::new(),
+            mip_bg: [Vec::new(), Vec::new()],
+        }
+    }
+}
+
+/// Mip levels worth having for a layer drawn at `scale` (target pixels per
+/// source pixel): enough that the composite never minifies by more than 2×.
+fn mip_levels(scale: f32, w: u32, h: u32) -> u32 {
+    let max = 32 - w.max(h).max(1).leading_zeros();
+    if !(scale > 0.0 && scale < 0.5) {
+        return 1;
+    }
+    ((1.0 / scale).log2().floor() as u32 + 1).min(max)
 }
 
 pub struct Compositor {
     sixteen_bit: bool,
     sampler: wgpu::Sampler,
     decode: wgpu::RenderPipeline,
+    decode_layout: wgpu::BindGroupLayout,
+    one_layout: wgpu::BindGroupLayout,
     composite: HashMap<Blend, wgpu::RenderPipeline>,
     display: wgpu::RenderPipeline,
+    mip: wgpu::RenderPipeline,
     effects: HashMap<String, Result<wgpu::RenderPipeline, String>>,
     effect_layout: wgpu::BindGroupLayout,
-    work: Option<Sized>,
-    out: Option<Sized>,
-    planes: Vec<Planes>,
-    layer_tex: Vec<Sized>,
-    dummy: wgpu::Texture,
+    work: Option<Target>,
+    out: Option<Target>,
+    slots: Vec<Slot>,
+    display_buf: wgpu::Buffer,
+    display_bg: Option<wgpu::BindGroup>,
+    /// Bound where a pass takes a uniform it does not use (mip passes).
+    empty_buf: wgpu::Buffer,
+    dummy_view: wgpu::TextureView,
+    /// Readback buffers returned by finished [`Readback`]s, for reuse: on a
+    /// GPU with its own memory each is a host-visible allocation.
+    readback_pool: Arc<std::sync::Mutex<Vec<wgpu::Buffer>>>,
+    importer: Option<Arc<dyn TextureImporter>>,
     /// Effects that failed to compile, for the UI to report.
     pub errors: Vec<String>,
 }
@@ -447,6 +545,7 @@ impl Compositor {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let mk_layout = |n| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries(n) });
@@ -459,22 +558,35 @@ impl Compositor {
             .map(|b| (b, pipeline(device, COMPOSITE, "vs_quad", "fs_quad", &one_layout, WORKING_FORMAT, Some(blend_state(b)))))
             .collect();
         let display = pipeline(device, &format!("{COMMON}{DISPLAY}"), "vs_full", "fs_display", &one_layout, DISPLAY_FORMAT, None);
+        let mip = pipeline(device, &format!("{COMMON}{MIP}"), "vs_full", "fs_mip", &one_layout, WORKING_FORMAT, None);
         let dummy = texture(device, "dummy", 1, 1, WORKING_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
         Compositor {
             sixteen_bit,
             sampler,
             decode,
+            decode_layout,
+            one_layout,
             composite,
             display,
+            mip,
             effects: HashMap::new(),
             effect_layout,
             work: None,
             out: None,
-            planes: Vec::new(),
-            layer_tex: Vec::new(),
-            dummy,
+            slots: Vec::new(),
+            display_buf: uniform_buf(device, DISPLAY_BYTES),
+            display_bg: None,
+            empty_buf: uniform_buf(device, 16),
+            dummy_view: dummy.create_view(&Default::default()),
+            readback_pool: Default::default(),
+            importer: None,
             errors: Vec::new(),
         }
+    }
+
+    /// Use `importer` for frames left in GPU memory by hardware decoders.
+    pub fn set_importer(&mut self, importer: Option<Arc<dyn TextureImporter>>) {
+        self.importer = importer;
     }
 
     /// The monitor texture (display-encoded RGBA8) from the last render.
@@ -482,10 +594,14 @@ impl Compositor {
         self.out.as_ref().map(|s| &s.tex)
     }
 
-    fn sized(slot: &mut Option<Sized>, device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages) {
-        if !matches!(slot, Some(s) if s.w == w && s.h == h) {
-            *slot = Some(Sized { tex: texture(device, label, w, h, format, usage), w, h });
+    /// Make `slot` hold a `w`×`h` texture; true if it was (re)made.
+    fn target(slot: &mut Option<Target>, device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages) -> bool {
+        if matches!(slot, Some(s) if s.w == w && s.h == h) {
+            return false;
         }
+        let tex = texture(device, label, w, h, format, usage);
+        *slot = Some(Target { view: tex.create_view(&Default::default()), tex, w, h });
+        true
     }
 
     fn bind(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout, buf: &wgpu::Buffer, views: &[&wgpu::TextureView]) -> wgpu::BindGroup {
@@ -522,44 +638,58 @@ impl Compositor {
         self.effects.get(&e.key).and_then(|r| r.as_ref().ok())
     }
 
-    /// Upload one frame's planes into slot `i`.
+    /// Upload one frame's planes into slot `i`. False if the frame is not in
+    /// memory (nothing to draw).
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, i: usize, frame: &Arc<VideoFrame>) -> bool {
         let f: &VideoFrame = frame;
-        let FrameData::Cpu { planes, strides } = &f.data else { return false };
+        let slot = &mut self.slots[i];
+        // The same frame as last time (video slower than the display): done.
+        if slot.planes.as_ref().is_some_and(|p| p.holds.as_ref().is_some_and(|h| Arc::ptr_eq(h, frame))) {
+            return true;
+        }
+        // In GPU memory: import it as it is, if the platform can.
+        if matches!(f.data, FrameData::Native(_)) {
+            if let Some([luma, chroma]) = self.importer.as_ref().and_then(|imp| imp.import(device, f)) {
+                let deep = luma.format() == wgpu::TextureFormat::R16Unorm;
+                slot.planes = Some(Planes {
+                    luma_view: luma.create_view(&Default::default()),
+                    chroma_view: chroma.create_view(&Default::default()),
+                    luma,
+                    chroma,
+                    key: (f.width, f.height, deep),
+                    imported: true,
+                    holds: Some(frame.clone()),
+                });
+                slot.decode_bg = None;
+                return true;
+            }
+        }
+        // In memory (or copied out of GPU memory): upload.
+        let Some(CpuPlanes { planes, strides }) = f.data.cpu() else { return false };
         let deep = f.format == PixelFormat::P010 && self.sixteen_bit;
         let key = (f.width, f.height, deep);
-        if self.planes.get(i).is_none_or(|p| p.key != key) {
+        if slot.planes.as_ref().is_none_or(|p| p.key != key || p.imported) {
             let (lf, cf) = if deep {
                 (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
             } else {
                 (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
             };
             let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
-            let p = Planes {
-                luma: texture(device, "luma", f.width, f.height, lf, usage),
-                chroma: texture(device, "chroma", f.width.div_ceil(2), f.height.div_ceil(2), cf, usage),
-                key,
-                holds: 0,
-            };
-            if i < self.planes.len() {
-                self.planes[i] = p;
-            } else {
-                self.planes.push(p);
-            }
+            let luma = texture(device, "luma", f.width, f.height, lf, usage);
+            let chroma = texture(device, "chroma", f.width.div_ceil(2), f.height.div_ceil(2), cf, usage);
+            slot.planes = Some(Planes { luma_view: luma.create_view(&Default::default()), chroma_view: chroma.create_view(&Default::default()), luma, chroma, key, imported: false, holds: None });
+            slot.decode_bg = None;
         }
-        // The same frame as last time (video slower than the display): done.
-        let id = Arc::as_ptr(frame) as usize;
-        if self.planes[i].holds == id {
-            return true;
-        }
-        self.planes[i].holds = id;
-        let p = &self.planes[i];
+        let p = slot.planes.as_mut().unwrap();
+        p.holds = Some(frame.clone());
         // 10-bit without 16-bit textures: keep the top 8 bits.
         let squash = |plane: &[u8]| -> Vec<u8> { plane.as_chunks::<2>().0.iter().map(|c| c[1]).collect() };
-        let (luma, chroma, ls, cs) = if f.format == PixelFormat::P010 && !deep {
-            (squash(&planes[0]), squash(&planes[1]), strides[0] / 2, strides[1] / 2)
+        // Borrowed straight from the frame unless it has to be narrowed.
+        let (luma, chroma, ls, cs): (std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>, usize, usize) = if f.format == PixelFormat::P010 && !deep {
+            (squash(&planes[0]).into(), squash(&planes[1]).into(), strides[0] / 2, strides[1] / 2)
         } else {
-            (planes[0].clone(), planes[1].clone(), strides[0], strides[1])
+            let mut p = planes.into_iter();
+            (p.next().unwrap(), p.next().unwrap(), strides[0], strides[1])
         };
         let write = |tex: &wgpu::Texture, data: &[u8], stride: usize, w: u32, h: u32| {
             queue.write_texture(
@@ -574,37 +704,64 @@ impl Compositor {
         true
     }
 
+    /// Make slot `i`'s layer pair `w`×`h` with `levels` mip levels.
+    fn layer_pair(&mut self, device: &wgpu::Device, i: usize, w: u32, h: u32, levels: u32) {
+        let slot = &mut self.slots[i];
+        if slot.pair.is_some() && slot.pair_key == (w, h, levels) {
+            return;
+        }
+        let make = || {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("layer"),
+                size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+                mip_level_count: levels,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: WORKING_FORMAT,
+                usage: LAYER_USAGE,
+                view_formats: &[],
+            });
+            let level = |l: u32| tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: l, mip_level_count: Some(1), ..Default::default() });
+            LayerTex { base: level(0), all: tex.create_view(&Default::default()), levels: (1..levels).map(level).collect() }
+        };
+        slot.pair = Some([make(), make()]);
+        slot.pair_key = (w, h, levels);
+        slot.quad_bg = [None, None];
+        slot.effect_bg.iter_mut().for_each(|b| *b = [None, None]);
+        slot.mip_bg = [Vec::new(), Vec::new()];
+    }
+
     /// Draw `layers` (bottom first) for `plan` and produce the monitor image.
     pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, plan: &FramePlan, layers: &[RenderLayer], seq_size: (u32, u32), space: WorkingSpace) {
         let (w, h) = (plan.width, plan.height);
         let target_usage = LAYER_USAGE | wgpu::TextureUsages::COPY_SRC;
-        Self::sized(&mut self.work, device, "work", w, h, WORKING_FORMAT, target_usage);
-        Self::sized(&mut self.out, device, "monitor", w, h, DISPLAY_FORMAT, target_usage);
+        if Self::target(&mut self.work, device, "work", w, h, WORKING_FORMAT, target_usage) {
+            self.display_bg = None;
+        }
+        Self::target(&mut self.out, device, "monitor", w, h, DISPLAY_FORMAT, target_usage);
+        while self.slots.len() < layers.len() {
+            self.slots.push(Slot::new(device));
+        }
         let mut enc = device.create_command_encoder(&Default::default());
-        let work_view = self.work.as_ref().unwrap().tex.create_view(&Default::default());
         {
-            let _clear = begin(&mut enc, &work_view, Some(wgpu::Color::TRANSPARENT));
+            let _clear = begin(&mut enc, &self.work.as_ref().unwrap().view, Some(wgpu::Color::TRANSPARENT));
         }
         for (i, layer) in layers.iter().enumerate() {
             let f = &layer.frame;
             if !self.upload(device, queue, i, f) {
                 continue;
             }
-            // Layer texture pair for decode + effect ping-pong.
-            while self.layer_tex.len() < 2 * (i + 1) {
-                self.layer_tex.push(Sized { tex: texture(device, "layer", 1, 1, WORKING_FORMAT, LAYER_USAGE), w: 1, h: 1 });
-            }
-            for k in [2 * i, 2 * i + 1] {
-                if self.layer_tex[k].w != f.width || self.layer_tex[k].h != f.height {
-                    self.layer_tex[k] = Sized { tex: texture(device, "layer", f.width, f.height, WORKING_FORMAT, LAYER_USAGE), w: f.width, h: f.height };
-                }
-            }
+            // Target pixels per source pixel decides the mip chain.
+            let scale = layer.motion.scale / 100.0 * plan.width as f32 / seq_size.0.max(1) as f32;
+            let levels = mip_levels(scale, f.width, f.height);
+            self.layer_pair(device, i, f.width, f.height, levels);
+
             // 1. Decode.
             let m = columns(ycbcr(&f.color.matrix, f.height));
             let deep = f.format == PixelFormat::P010;
             let (yo, ys, cs) = if f.color.full_range { (0.0, 1.0, 1.0) } else if deep { (64.0 / 1023.0, 1023.0 / 876.0, 1023.0 / 896.0) } else { (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0) };
             let pm = columns(primaries_to(space, &f.color.primaries));
-            let mut u = Vec::new();
+            let mut u = Vec::with_capacity(28);
             for c in m {
                 u.extend(c);
             }
@@ -612,54 +769,95 @@ impl Compositor {
             for c in pm {
                 u.extend(c);
             }
-            let buf = uniform(device, &floats(&u));
-            let (lv, cv) = (self.planes[i].luma.create_view(&Default::default()), self.planes[i].chroma.create_view(&Default::default()));
-            let bg = self.bind(device, &self.decode.get_bind_group_layout(0), &buf, &[&lv, &cv]);
-            let mut cur = 2 * i;
+            queue.write_buffer(&self.slots[i].decode_buf, 0, &floats(&u));
+            if self.slots[i].decode_bg.is_none() {
+                let s = &self.slots[i];
+                let p = s.planes.as_ref().unwrap();
+                let bg = self.bind(device, &self.decode_layout, &s.decode_buf, &[&p.luma_view, &p.chroma_view]);
+                self.slots[i].decode_bg = Some(bg);
+            }
+            let mut cur = 0;
             {
-                let view = self.layer_tex[cur].tex.create_view(&Default::default());
-                let mut pass = begin(&mut enc, &view, Some(wgpu::Color::TRANSPARENT));
+                let s = &self.slots[i];
+                let mut pass = begin(&mut enc, &s.pair.as_ref().unwrap()[cur].base, Some(wgpu::Color::TRANSPARENT));
                 pass.set_pipeline(&self.decode);
-                pass.set_bind_group(0, &bg, &[]);
+                pass.set_bind_group(0, s.decode_bg.as_ref(), &[]);
                 pass.draw(0..3, 0..1);
             }
+
             // 2. Effects.
-            for e in &layer.effects {
+            for (k, e) in layer.effects.iter().enumerate() {
                 if self.effect_pipeline(device, e).is_none() {
                     continue;
                 }
                 let mut vals = vec![0f32; 64 * 4 + 4];
-                for (k, p) in e.params.iter().take(64).enumerate() {
-                    vals[k * 4..k * 4 + 4].copy_from_slice(p);
+                for (n, p) in e.params.iter().take(64).enumerate() {
+                    vals[n * 4..n * 4 + 4].copy_from_slice(p);
                 }
                 vals[256] = e.time;
                 vals[258] = plan.width as f32 / seq_size.0.max(1) as f32;
-                let buf = uniform(device, &floats(&vals));
-                let src_view = self.layer_tex[cur].tex.create_view(&Default::default());
-                let dummy = self.dummy.create_view(&Default::default());
-                // Bindings: source, (unused slot), source_b.
-                let bg = self.bind(device, &self.effect_layout, &buf, &[&src_view, &dummy, &dummy]);
+                let s = &mut self.slots[i];
+                while s.effect_bufs.len() <= k {
+                    s.effect_bufs.push(uniform_buf(device, EFFECT_BYTES));
+                    s.effect_bg.push([None, None]);
+                }
+                queue.write_buffer(&s.effect_bufs[k], 0, &floats(&vals));
+                if self.slots[i].effect_bg[k][cur].is_none() {
+                    let s = &self.slots[i];
+                    // Bindings: source, (unused slot), source_b.
+                    let src = &s.pair.as_ref().unwrap()[cur].base;
+                    let bg = self.bind(device, &self.effect_layout, &s.effect_bufs[k], &[src, &self.dummy_view, &self.dummy_view]);
+                    self.slots[i].effect_bg[k][cur] = Some(bg);
+                }
+                let s = &self.slots[i];
                 let next = cur ^ 1;
-                let dst_view = self.layer_tex[next].tex.create_view(&Default::default());
                 let pipe = self.effects[&e.key].as_ref().unwrap();
-                let mut pass = begin(&mut enc, &dst_view, Some(wgpu::Color::TRANSPARENT));
+                let mut pass = begin(&mut enc, &s.pair.as_ref().unwrap()[next].base, Some(wgpu::Color::TRANSPARENT));
                 pass.set_pipeline(pipe);
-                pass.set_bind_group(0, &bg, &[]);
+                pass.set_bind_group(0, s.effect_bg[k][cur].as_ref(), &[]);
                 pass.draw(0..3, 0..1);
                 drop(pass);
                 cur = next;
             }
-            // 3. Composite.
+
+            // 3. Mip chain, when the layer is drawn below half size: each
+            // level a 2×2 average of the one above (bilinear at its centre).
+            if levels > 1 {
+                if self.slots[i].mip_bg[cur].is_empty() {
+                    let s = &self.slots[i];
+                    let t = &s.pair.as_ref().unwrap()[cur];
+                    let bgs = (1..levels as usize)
+                        .map(|l| {
+                            let above = if l == 1 { &t.base } else { &t.levels[l - 2] };
+                            self.bind(device, &self.one_layout, &self.empty_buf, &[above])
+                        })
+                        .collect();
+                    self.slots[i].mip_bg[cur] = bgs;
+                }
+                let s = &self.slots[i];
+                let t = &s.pair.as_ref().unwrap()[cur];
+                for (l, bg) in s.mip_bg[cur].iter().enumerate() {
+                    let mut pass = begin(&mut enc, &t.levels[l], Some(wgpu::Color::TRANSPARENT));
+                    pass.set_pipeline(&self.mip);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+
+            // 4. Composite.
             let corners = quad(&layer.motion, (f.width as f32, f.height as f32), (seq_size.0 as f32, seq_size.1 as f32));
             let mut u: Vec<f32> = corners.iter().flatten().copied().collect();
             u.extend([layer.opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0]);
-            let buf = uniform(device, &floats(&u));
-            let lview = self.layer_tex[cur].tex.create_view(&Default::default());
-            let pipe = &self.composite[&layer.blend];
-            let bg = self.bind(device, &pipe.get_bind_group_layout(0), &buf, &[&lview]);
-            let mut pass = begin(&mut enc, &work_view, None);
-            pass.set_pipeline(pipe);
-            pass.set_bind_group(0, &bg, &[]);
+            queue.write_buffer(&self.slots[i].quad_buf, 0, &floats(&u));
+            if self.slots[i].quad_bg[cur].is_none() {
+                let s = &self.slots[i];
+                let bg = self.bind(device, &self.one_layout, &s.quad_buf, &[&s.pair.as_ref().unwrap()[cur].all]);
+                self.slots[i].quad_bg[cur] = Some(bg);
+            }
+            let s = &self.slots[i];
+            let mut pass = begin(&mut enc, &self.work.as_ref().unwrap().view, None);
+            pass.set_pipeline(&self.composite[&layer.blend]);
+            pass.set_bind_group(0, s.quad_bg[cur].as_ref(), &[]);
             pass.draw(0..6, 0..1);
         }
         // Display.
@@ -668,28 +866,44 @@ impl Compositor {
             WorkingSpace::LinearRec709 => IDENTITY,
         };
         let u: Vec<f32> = columns(to_display).iter().flatten().copied().collect();
-        let buf = uniform(device, &floats(&u));
-        let bg = self.bind(device, &self.display.get_bind_group_layout(0), &buf, &[&work_view]);
-        let out_view = self.out.as_ref().unwrap().tex.create_view(&Default::default());
+        queue.write_buffer(&self.display_buf, 0, &floats(&u));
+        if self.display_bg.is_none() {
+            self.display_bg = Some(self.bind(device, &self.one_layout, &self.display_buf, &[&self.work.as_ref().unwrap().view]));
+        }
         {
-            let mut pass = begin(&mut enc, &out_view, Some(wgpu::Color::BLACK));
+            let mut pass = begin(&mut enc, &self.out.as_ref().unwrap().view, Some(wgpu::Color::BLACK));
             pass.set_pipeline(&self.display);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, self.display_bg.as_ref(), &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit([enc.finish()]);
     }
 
-    /// Copy the monitor image back as RGBA8 rows (export, tests).
+    /// Copy the monitor image back as RGBA8 rows (export, tests). Waits.
     pub fn read_output(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<(u32, u32, Vec<u8>)> {
+        self.start_readback(device, queue)?.finish(device)
+    }
+
+    /// Start copying the monitor image back without waiting for it, so the
+    /// next frame can be rendered meanwhile; [`Readback::finish`] collects
+    /// it. Later renders do not disturb it: the copy is queued first.
+    pub fn start_readback(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Readback> {
         let out = self.out.as_ref()?;
         let (w, h) = (out.w, out.h);
         let row = (w * 4).div_ceil(256) * 256;
-        let buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (row * h) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
+        let size = (row * h) as u64;
+        let pooled = {
+            let mut pool = self.readback_pool.lock().unwrap();
+            pool.retain(|b| b.size() == size); // a new output size: old ones go
+            pool.pop()
+        };
+        let buf = pooled.unwrap_or_else(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
         });
         let mut enc = device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
@@ -697,22 +911,45 @@ impl Compositor {
             wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
-        queue.submit([enc.finish()]);
-        let slice = buf.slice(..);
+        let index = queue.submit([enc.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
+        buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv().ok()?.ok()?;
-        let data = slice.get_mapped_range().ok()?;
-        let mut px = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h as usize {
-            px.extend_from_slice(&data[y * row as usize..y * row as usize + w as usize * 4]);
+        Some(Readback { buf, w, h, row, index, rx, pool: self.readback_pool.clone() })
+    }
+}
+
+/// A monitor image on its way back from the GPU.
+pub struct Readback {
+    buf: wgpu::Buffer,
+    w: u32,
+    h: u32,
+    row: u32,
+    index: wgpu::SubmissionIndex,
+    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    pool: Arc<std::sync::Mutex<Vec<wgpu::Buffer>>>,
+}
+
+impl Readback {
+    /// Wait for this copy (only this one, not work queued after it) and
+    /// return tightly packed RGBA8 rows.
+    pub fn finish(self, device: &wgpu::Device) -> Option<(u32, u32, Vec<u8>)> {
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(self.index), timeout: None });
+        self.rx.recv().ok()?.ok()?;
+        let (w, h, row) = (self.w as usize, self.h as usize, self.row as usize);
+        let data = self.buf.slice(..).get_mapped_range().ok()?;
+        let mut px = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            px.extend_from_slice(&data[y * row..y * row + w * 4]);
         }
         drop(data);
-        buf.unmap();
-        Some((w, h, px))
+        self.buf.unmap();
+        let mut pool = self.pool.lock().unwrap();
+        if pool.len() < 4 {
+            pool.push(self.buf);
+        }
+        Some((self.w, self.h, px))
     }
 }
 

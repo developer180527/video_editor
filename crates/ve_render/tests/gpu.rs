@@ -135,3 +135,59 @@ fn hdr_reference_white_is_display_white() {
     let bright = shade(hdr_gray(192, "smpte2084")).unwrap();
     assert!(bright >= 250, "PQ 1000 cd/m² shows as {bright}");
 }
+
+#[test]
+fn a_readback_is_not_disturbed_by_the_next_render() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let mut c = Compositor::new(&device);
+    c.render(&device, &queue, &plan(64, 36), &[layer(gray(64, 36, 16), 100.0, 1.0)], (64, 36), WorkingSpace::AcesCg);
+    let black = c.start_readback(&device, &queue).unwrap();
+    c.render(&device, &queue, &plan(64, 36), &[layer(gray(64, 36, 235), 100.0, 1.0)], (64, 36), WorkingSpace::AcesCg);
+    let white = c.start_readback(&device, &queue).unwrap();
+    assert!(px(&black.finish(&device).unwrap(), 32, 18)[0] < 5);
+    assert!(px(&white.finish(&device).unwrap(), 32, 18)[0] > 250);
+}
+
+/// A 1-pixel black/white checkerboard shrunk to a fifth: with a mip chain it
+/// averages to an even grey. Bilinear alone samples texel centres at 5× and
+/// aliases into a coarse black/white checker.
+#[test]
+fn downscaled_layers_are_filtered() {
+    let (w, h) = (320u32, 180u32);
+    let luma: Vec<u8> = (0..h).flat_map(|y| (0..w).map(move |x| if (x + y) % 2 == 0 { 16 } else { 235 })).collect();
+    let frame = Arc::new(VideoFrame {
+        pts: Time::ZERO,
+        duration: Time::from_seconds(1),
+        width: w,
+        height: h,
+        format: PixelFormat::Nv12,
+        color: ColorTags { primaries: "bt709".into(), transfer: "bt709".into(), matrix: "bt709".into(), full_range: false },
+        data: FrameData::Cpu { planes: vec![luma, vec![128; (w * h / 2) as usize]], strides: vec![w as usize, w as usize] },
+    });
+    let Some(img) = render(&[layer(frame, 20.0, 1.0)], WorkingSpace::LinearRec709) else { return eprintln!("skipped: no GPU") };
+    // Linear average of black and white is 0.5 → 0.5^(1/2.4) ≈ 191, everywhere.
+    for (x, y) in [(10, 10), (31, 17), (32, 18), (50, 30)] {
+        let c = px(&img, x, y)[0];
+        assert!((184..=198).contains(&c), "({x},{y}) = {c}");
+    }
+}
+
+/// Rendering again with nothing changed gives the same picture (cached
+/// buffers and bind groups are rewritten, not stale), and a new frame in
+/// the same slot shows.
+#[test]
+fn steady_and_changing_frames_render_right() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let mut c = Compositor::new(&device);
+    let mut shot = |l: &RenderLayer| {
+        c.render(&device, &queue, &plan(64, 36), std::slice::from_ref(l), (64, 36), WorkingSpace::AcesCg);
+        px(&c.read_output(&device, &queue).unwrap(), 32, 18)[0]
+    };
+    let dark = layer(gray(64, 36, 60), 100.0, 1.0);
+    let a = shot(&dark);
+    assert_eq!(shot(&dark), a);
+    let light = layer(gray(64, 36, 200), 100.0, 1.0);
+    assert!(shot(&light) > a + 50);
+    let half = RenderLayer { opacity: 0.5, ..light.clone() };
+    assert!(shot(&half) < shot(&light));
+}

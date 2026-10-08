@@ -76,7 +76,7 @@ fn import_place_decode_composite() {
 
 #[test]
 fn export_h264_with_audio() {
-    use ve_ports::{FrameData, MediaBackend, Resolved};
+    use ve_ports::{MediaBackend, Resolved};
     let src = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("export_src.mov");
     let made = Command::new("ffmpeg")
         .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "smptebars=size=640x360:rate=25:duration=2"])
@@ -109,7 +109,7 @@ fn export_h264_with_audio() {
 
     let out = dir.join("out.mp4");
     let client = e.spawn(Arc::new(|| {}));
-    let job = client.export(gpu, ExportPreset::H264Mp4, MediaRef(format!("file:{}", out.display())));
+    let job = client.export(gpu, ExportPreset::H264Mp4, MediaRef(format!("file:{}", out.display())), None);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let result = loop {
         if let Some(r) = job.result() {
@@ -118,6 +118,13 @@ fn export_h264_with_audio() {
         assert!(std::time::Instant::now() < deadline, "export hung at {:.0}%", job.progress() * 100.0);
         std::thread::sleep(Duration::from_millis(20));
     };
+    if let Err(e) = &result {
+        if e.contains("encoder works here") {
+            // No GPU media engine on this machine (a CI runner); the export
+            // pipeline itself is covered with ProRes by the next test.
+            return eprintln!("skipped: {e}");
+        }
+    }
     result.unwrap();
     assert_eq!(job.total, 48, "2 s at 24 fps");
 
@@ -132,7 +139,7 @@ fn export_h264_with_audio() {
     // The picture survived the round trip: the second bar is still yellow.
     let mut d = ff.open_video(&r).unwrap();
     let f = d.next_frame().unwrap().unwrap();
-    let FrameData::Cpu { planes, strides } = &f.data else { panic!() };
+    let ve_ports::CpuPlanes { planes, strides } = f.data.cpu().unwrap();
     let (x, y) = (60 + 276, 200);
     let luma = planes[0][y * strides[0] + x];
     let cb = planes[1][(y / 2) * strides[1] + (x / 2) * 2];
@@ -174,7 +181,8 @@ fn export_fails_on_missing_media_and_ignores_the_preview() {
     e.execute(edit::overwrite(&snap, seq.id, Time::ZERO, &items).unwrap()).unwrap();
     let client = e.spawn(Arc::new(|| {}));
     let run = |gpu, name: &str| {
-        let job = client.export(gpu, ExportPreset::H264Mp4, MediaRef(format!("file:{}", dir.join(name).display())));
+        // ProRes: encoded in software, so this runs on any machine.
+        let job = client.export(gpu, ExportPreset::ProResMov, MediaRef(format!("file:{}", dir.join(name).display())), None);
         loop {
             // The preview keeps asking for the frame at the playhead.
             client.seek(Time::from_seconds(1));
@@ -185,9 +193,9 @@ fn export_fails_on_missing_media_and_ignores_the_preview() {
             std::thread::sleep(Duration::from_millis(5));
         }
     };
-    run(gpu.clone(), "ok.mp4").unwrap();
+    run(gpu.clone(), "ok.mov").unwrap();
     std::fs::remove_file(&copy).unwrap();
-    let err = run(gpu, "bad.mp4").unwrap_err();
+    let err = run(gpu, "bad.mov").unwrap_err();
     assert!(err.contains("will_vanish.mov"), "{err}");
-    assert!(!dir.join("bad.mp4").exists(), "no half-written file");
+    assert!(!dir.join("bad.mov").exists(), "no half-written file");
 }

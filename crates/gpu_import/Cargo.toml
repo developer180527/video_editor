@@ -1,0 +1,23 @@
+[package]
+name = "gpu_import"
+description = "Platform GPU interop: frames left in GPU memory by hardware decoders become compositor textures without a copy (Apple: CVPixelBuffer → Metal)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_ports.workspace = true
+ve_render.workspace = true
+wgpu.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase", "CFDictionary"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLPixelFormat", "MTLResource", "MTLTypes"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-metal", "CVBase", "CVReturn", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVMetalTexture", "CVMetalTextureCache"] }
+
+[dev-dependencies]
+media_ffmpeg.workspace = true
+pollster.workspace = true
+ve_time.workspace = true

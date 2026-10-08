@@ -11,7 +11,7 @@ use std::ptr;
 use ve_ports::*;
 use ve_time::{Rate, Time, TICKS_PER_SECOND};
 
-use crate::{err, sys, to_time, Input};
+use crate::{built_hw_types, err, shared_device, sys, to_time, Input};
 
 /// `AV_NOPTS_VALUE` (a cast macro bindgen cannot evaluate).
 const NOPTS: i64 = i64::MIN;
@@ -55,16 +55,10 @@ impl Codec {
             (*ctx).thread_count = 0; // automatic
             let mut using_hw = false;
             if hw && (*par).codec_type == sys::AVMediaType::AVMEDIA_TYPE_VIDEO {
-                let mut dev = ptr::null_mut();
-                let r = sys::av_hwdevice_ctx_create(
-                    &mut dev,
-                    sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-                    ptr::null(),
-                    ptr::null_mut(),
-                    0,
-                );
-                if r >= 0 {
+                if let Some((dev, fmt)) = hw_device_for(codec) {
                     (*ctx).hw_device_ctx = dev;
+                    // `pick_hw_format` reads which format this device decodes to.
+                    (*ctx).opaque = fmt as i32 as isize as *mut std::ffi::c_void;
                     (*ctx).get_format = Some(pick_hw_format);
                     using_hw = true;
                 }
@@ -138,20 +132,158 @@ impl Drop for Codec {
     }
 }
 
-unsafe extern "C" fn pick_hw_format(_ctx: *mut sys::AVCodecContext, fmts: *const sys::AVPixelFormat) -> sys::AVPixelFormat {
-    let mut p = fmts;
-    let first = *fmts;
-    while *p != sys::AVPixelFormat::AV_PIX_FMT_NONE {
-        if *p == sys::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
-            return *p;
+/// Hardware decoders, best first. Each is tried only if this FFmpeg build
+/// includes it, the codec can use it, and the machine's driver opens it — so
+/// one list serves every platform: VideoToolbox on Apple; D3D12/D3D11 (any
+/// GPU) or NVDEC (CUDA) on Windows; VA-API (Intel/AMD), NVDEC or Vulkan Video
+/// on Linux; DXVA2 on old Windows. Decoded frames are copied to system memory
+/// (`av_hwframe_transfer_data`), which works the same with a discrete GPU's
+/// own memory or with unified memory.
+const HW_PREFERENCE: [sys::AVHWDeviceType; 7] = {
+    use sys::AVHWDeviceType::*;
+    [
+        AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+        AV_HWDEVICE_TYPE_D3D12VA,
+        AV_HWDEVICE_TYPE_D3D11VA,
+        AV_HWDEVICE_TYPE_CUDA,
+        AV_HWDEVICE_TYPE_VAAPI,
+        AV_HWDEVICE_TYPE_VULKAN,
+        AV_HWDEVICE_TYPE_DXVA2,
+    ]
+};
+
+/// The best hardware device that can decode with `codec`, and the pixel
+/// format it decodes to.
+unsafe fn hw_device_for(codec: *const sys::AVCodec) -> Option<(*mut sys::AVBufferRef, sys::AVPixelFormat)> {
+    let built = built_hw_types();
+    for t in HW_PREFERENCE.into_iter().filter(|t| built.contains(t)) {
+        let mut i = 0;
+        let fmt = loop {
+            let cfg = unsafe { sys::avcodec_get_hw_config(codec, i) };
+            if cfg.is_null() {
+                break None;
+            }
+            let cfg = unsafe { &*cfg };
+            if cfg.device_type == t && cfg.methods & sys::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as c_int != 0 {
+                break Some(cfg.pix_fmt);
+            }
+            i += 1;
+        };
+        if let (Some(fmt), Some(dev)) = (fmt, fmt.and_then(|_| shared_device(t))) {
+            return Some((dev, fmt));
         }
-        p = p.add(1);
     }
-    first // the decoder's own choice: software
+    None
+}
+
+/// The hardware format chosen in `hw_device_for` if offered; otherwise
+/// (a profile the hardware cannot do) the first software format.
+unsafe extern "C" fn pick_hw_format(ctx: *mut sys::AVCodecContext, fmts: *const sys::AVPixelFormat) -> sys::AVPixelFormat {
+    let wanted = unsafe { (*ctx).opaque as isize as i32 };
+    let mut p = fmts;
+    let mut software = None;
+    unsafe {
+        while *p != sys::AVPixelFormat::AV_PIX_FMT_NONE {
+            if *p as i32 == wanted {
+                return *p;
+            }
+            let d = sys::av_pix_fmt_desc_get(*p);
+            if software.is_none() && !d.is_null() && (*d).flags & sys::AV_PIX_FMT_FLAG_HWACCEL as u64 == 0 {
+                software = Some(*p);
+            }
+            p = p.add(1);
+        }
+        software.unwrap_or(*fmts)
+    }
 }
 
 fn first_stream(input: &Input, kind: sys::AVMediaType) -> Option<usize> {
     input.streams().iter().position(|&s| unsafe { (*(*s).codecpar).codec_type == kind })
+}
+
+/// A decoded frame's two planes, shared with FFmpeg: holds a reference to
+/// the frame's buffers and frees it when the engine is done with it.
+struct AvPlanes {
+    frame: *mut sys::AVFrame,
+    rows: [usize; 2],
+}
+
+// The frame is not touched after it is handed out (read-only), and FFmpeg's
+// buffer references are atomically counted.
+unsafe impl Send for AvPlanes {}
+unsafe impl Sync for AvPlanes {}
+
+impl AvPlanes {
+    /// `None` (and `frame` freed) when the frame cannot be shared as is.
+    unsafe fn new(frame: *mut sys::AVFrame, h: u32) -> Option<AvPlanes> {
+        if frame.is_null() {
+            return None;
+        }
+        let ok = unsafe { (0..2).all(|i| (*frame).linesize[i] > 0 && !(*frame).data[i].is_null() && !(*frame).buf[0].is_null()) };
+        if !ok {
+            let mut f = frame;
+            unsafe { sys::av_frame_free(&mut f) };
+            return None;
+        }
+        Some(AvPlanes { frame, rows: [h as usize, h.div_ceil(2) as usize] })
+    }
+}
+
+impl SharedPlanes for AvPlanes {
+    fn planes(&self) -> Vec<&[u8]> {
+        (0..2).map(|i| unsafe { std::slice::from_raw_parts((*self.frame).data[i], (*self.frame).linesize[i] as usize * self.rows[i]) }).collect()
+    }
+    fn strides(&self) -> Vec<usize> {
+        (0..2).map(|i| unsafe { (*self.frame).linesize[i] as usize }).collect()
+    }
+}
+
+impl Drop for AvPlanes {
+    fn drop(&mut self) {
+        unsafe { sys::av_frame_free(&mut self.frame) };
+    }
+}
+
+/// A VideoToolbox frame left in GPU memory: a reference to the decoder's
+/// `CVPixelBuffer` (`data[3]`), released when the engine drops the frame.
+struct AvNative {
+    frame: *mut sys::AVFrame,
+}
+
+// Read-only once handed out; CoreVideo buffers and FFmpeg references are
+// thread-safe.
+unsafe impl Send for AvNative {}
+unsafe impl Sync for AvNative {}
+
+impl NativeFrame for AvNative {
+    fn handle(&self) -> NativeHandle {
+        NativeHandle::CvPixelBuffer(unsafe { (*self.frame).data[3] } as *mut std::ffi::c_void)
+    }
+
+    fn to_cpu(&self) -> Option<(Vec<Vec<u8>>, Vec<usize>)> {
+        unsafe {
+            let mut sw = sys::av_frame_alloc();
+            let ok = sys::av_hwframe_transfer_data(sw, self.frame, 0) >= 0 && (0..2).all(|i| (*sw).linesize[i] > 0);
+            let out = ok.then(|| {
+                let h = (*sw).height as usize;
+                let rows = [h, h.div_ceil(2)];
+                (0..2)
+                    .map(|i| {
+                        let stride = (*sw).linesize[i] as usize;
+                        (std::slice::from_raw_parts((*sw).data[i], stride * rows[i]).to_vec(), stride)
+                    })
+                    .unzip()
+            });
+            sys::av_frame_free(&mut sw);
+            out
+        }
+    }
+}
+
+impl Drop for AvNative {
+    fn drop(&mut self) {
+        unsafe { sys::av_frame_free(&mut self.frame) };
+    }
 }
 
 pub struct VideoDec {
@@ -172,6 +304,9 @@ pub struct VideoDec {
     /// retry goes, while a seek is being made good (see `retry`).
     sought: Time,
     backoff: Time,
+    /// Hand hardware frames out as they are (in GPU memory) when the
+    /// consumer can import them; see [`AvNative`].
+    native: bool,
     pub hardware: bool,
 }
 
@@ -180,6 +315,12 @@ unsafe impl Send for VideoDec {}
 
 impl VideoDec {
     pub fn open(media: &Resolved, hw: bool) -> Result<VideoDec, MediaError> {
+        Self::open_with(media, hw, false)
+    }
+
+    /// `native`: leave hardware-decoded frames in GPU memory when they can be
+    /// imported as they are (4:2:0, 8 or 10 bit), instead of copying them out.
+    pub fn open_with(media: &Resolved, hw: bool, native: bool) -> Result<VideoDec, MediaError> {
         let input = Input::open(media)?;
         let stream = first_stream(&input, sys::AVMediaType::AVMEDIA_TYPE_VIDEO).ok_or_else(|| MediaError::Unsupported("no video stream".into()))?;
         let (codec, hardware) = match Codec::open(&input, stream, hw) {
@@ -204,12 +345,18 @@ impl VideoDec {
             held: unsafe { sys::av_frame_alloc() },
             sought: Time::ZERO,
             backoff: Time::ZERO,
+            native,
             hardware,
         })
     }
 
     /// Decoded frame `decoded` as NV12 or P010, copied out of FFmpeg.
     fn convert(&mut self, decoded: *mut sys::AVFrame) -> Result<VideoFrame, MediaError> {
+        if self.native {
+            if let Some(f) = unsafe { self.native_frame(decoded) } {
+                return Ok(f);
+            }
+        }
         unsafe {
             let mut src = decoded;
             if (*src).format == sys::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as c_int {
@@ -218,6 +365,8 @@ impl VideoDec {
                 if r < 0 {
                     return Err(MediaError::Other(format!("hardware frame transfer: {}", err(r))));
                 }
+                // The transfer moves pixels only: bring the colour tags along.
+                sys::av_frame_copy_props(self.sw, src);
                 src = self.sw;
             }
             let fmt: sys::AVPixelFormat = std::mem::transmute((*src).format);
@@ -264,14 +413,6 @@ impl VideoDec {
                 dst
             };
             let (w, h) = ((*ready).width as u32, (*ready).height as u32);
-            let rows = [h as usize, h.div_ceil(2) as usize];
-            let mut planes = Vec::with_capacity(2);
-            let mut strides = Vec::with_capacity(2);
-            for (i, &n) in rows.iter().enumerate() {
-                let stride = (*ready).linesize[i] as usize;
-                planes.push(std::slice::from_raw_parts((*ready).data[i], stride * n).to_vec());
-                strides.push(stride);
-            }
             let f = decoded;
             let pts = if (*f).best_effort_timestamp != NOPTS { (*f).best_effort_timestamp } else { (*f).pts };
             let dur = if (*f).duration > 0 { to_time((*f).duration, self.tb) } else { self.frame_dur };
@@ -284,6 +425,36 @@ impl VideoDec {
                 matrix: name(sys::av_color_space_name((*tagged).colorspace)),
                 full_range: (*tagged).color_range == sys::AVColorRange::AVCOL_RANGE_JPEG,
             };
+            // Hand the planes out without copying them: keep a reference to
+            // FFmpeg's (reference-counted) buffers for as long as the frame
+            // lives. A converted frame is ours already.
+            let owned = if !dst.is_null() {
+                std::mem::replace(&mut dst, ptr::null_mut())
+            } else {
+                let r = sys::av_frame_alloc();
+                if sys::av_frame_ref(r, ready) < 0 {
+                    let mut r = r;
+                    sys::av_frame_free(&mut r);
+                    ptr::null_mut()
+                } else {
+                    r
+                }
+            };
+            let data = match AvPlanes::new(owned, h) {
+                Some(p) => FrameData::Shared(Box::new(p)),
+                // Not shareable (no reference counting, bottom-up rows): copy.
+                None => {
+                    let rows = [h as usize, h.div_ceil(2) as usize];
+                    let mut planes = Vec::with_capacity(2);
+                    let mut strides = Vec::with_capacity(2);
+                    for (i, &n) in rows.iter().enumerate() {
+                        let stride = (*ready).linesize[i].unsigned_abs() as usize;
+                        planes.push(std::slice::from_raw_parts((*ready).data[i], stride * n).to_vec());
+                        strides.push(stride);
+                    }
+                    FrameData::Cpu { planes, strides }
+                }
+            };
             if !dst.is_null() {
                 sys::av_frame_free(&mut dst);
             }
@@ -294,13 +465,51 @@ impl VideoDec {
                 height: h,
                 format: out_fmt,
                 color,
-                data: FrameData::Cpu { planes, strides },
+                data,
             })
         }
     }
 }
 
 impl VideoDec {
+    /// `decoded` left where the hardware put it, if it is a picture the
+    /// compositor can import as is.
+    unsafe fn native_frame(&self, decoded: *mut sys::AVFrame) -> Option<VideoFrame> {
+        unsafe {
+            let f = decoded;
+            if (*f).format != sys::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as c_int || (*f).hw_frames_ctx.is_null() {
+                return None;
+            }
+            let fc = (*(*f).hw_frames_ctx).data as *const sys::AVHWFramesContext;
+            let format = match (*fc).sw_format {
+                sys::AVPixelFormat::AV_PIX_FMT_NV12 => PixelFormat::Nv12,
+                sys::AVPixelFormat::AV_PIX_FMT_P010LE => PixelFormat::P010,
+                _ => return None, // 4:2:2 / 4:4:4: the copy path converts it
+            };
+            let held = sys::av_frame_alloc();
+            if sys::av_frame_ref(held, f) < 0 {
+                let mut h = held;
+                sys::av_frame_free(&mut h);
+                return None;
+            }
+            let pts = if (*f).best_effort_timestamp != NOPTS { (*f).best_effort_timestamp } else { (*f).pts };
+            Some(VideoFrame {
+                pts: to_time(pts, self.tb) - self.origin,
+                duration: if (*f).duration > 0 { to_time((*f).duration, self.tb) } else { self.frame_dur },
+                width: (*f).width as u32,
+                height: (*f).height as u32,
+                format,
+                color: ColorTags {
+                    primaries: name(sys::av_color_primaries_name((*f).color_primaries)),
+                    transfer: name(sys::av_color_transfer_name((*f).color_trc)),
+                    matrix: name(sys::av_color_space_name((*f).colorspace)),
+                    full_range: (*f).color_range == sys::AVColorRange::AVCOL_RANGE_JPEG,
+                },
+                data: FrameData::Native(Box::new(AvNative { frame: held })),
+            })
+        }
+    }
+
     /// While a seek target has produced nothing at or before it, seek
     /// further back (1 s, 2 s, 4 s … down to the file's start) and decode
     /// forward again. Some demuxers (MPEG-TS) seek to any packet, not a key

@@ -31,6 +31,7 @@ platform_desktop = { path = "crates/platform_desktop" }
 platform_ios = { path = "crates/platform_ios" }
 platform_headless = { path = "crates/platform_headless" }
 audio_cpal = { path = "crates/audio_cpal" }
+gpu_import = { path = "crates/gpu_import" }
 
 # libgui, vendored at the commit in third_party/PINS
 libgui = { path = "third_party/libgui/crates/libgui" }

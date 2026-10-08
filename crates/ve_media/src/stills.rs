@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
 use ve_model::{AssetId, MediaRef};
-use ve_ports::{FrameData, MediaBackend, PixelFormat, Storage, VideoFrame};
+use ve_ports::{MediaBackend, PixelFormat, Storage, VideoFrame};
 use ve_time::Time;
 
 use crate::Waker;
@@ -20,6 +20,9 @@ pub const THUMB_H: u32 = 90;
 pub const PEAKS_PER_SECOND: u32 = 100;
 /// Thumbnails are made on a grid this coarse (seconds), to bound the work.
 const GRID: i64 = 1;
+/// Bytes of thumbnails kept here; the oldest go first. (The UI uploads them
+/// to textures as they arrive, so this only bounds the hand-over.)
+const THUMB_BUDGET: usize = 64 << 20;
 
 pub struct Thumb {
     pub width: u32,
@@ -38,6 +41,9 @@ struct State {
     queue: VecDeque<Job>,
     queued: HashSet<Job>,
     thumbs: HashMap<(AssetId, i64), Arc<Thumb>>,
+    /// Thumbnails in the order made, and their total size, for the budget.
+    order: VecDeque<(AssetId, i64)>,
+    thumb_bytes: usize,
     peaks: HashMap<AssetId, Arc<Vec<f32>>>,
     failed: HashSet<AssetId>,
     version: u64,
@@ -107,12 +113,14 @@ impl Stills {
     pub fn purge(&self) {
         let mut st = self.state.lock().unwrap();
         st.thumbs.clear();
+        st.order.clear();
+        st.thumb_bytes = 0;
     }
 }
 
 /// YCbCr (limited, BT.709) → display RGB, nearest-neighbour downscale.
 fn to_thumb(f: &VideoFrame) -> Option<Thumb> {
-    let FrameData::Cpu { planes, strides } = &f.data else { return None };
+    let ve_ports::CpuPlanes { planes, strides } = f.data.cpu()?;
     let h = THUMB_H.min(f.height);
     let w = ((f.width as u64 * h as u64) / f.height.max(1) as u64).max(1) as u32;
     let deep = f.format == PixelFormat::P010;
@@ -148,7 +156,27 @@ fn to_thumb(f: &VideoFrame) -> Option<Thumb> {
     Some(Thumb { width: w, height: h, rgba })
 }
 
+impl State {
+    fn add_thumb(&mut self, key: (AssetId, i64), t: Thumb) {
+        self.thumb_bytes += t.rgba.len();
+        if let Some(old) = self.thumbs.insert(key, Arc::new(t)) {
+            self.thumb_bytes -= old.rgba.len();
+        } else {
+            self.order.push_back(key);
+        }
+        while self.thumb_bytes > THUMB_BUDGET {
+            let Some(k) = self.order.pop_front() else { break };
+            if let Some(old) = self.thumbs.remove(&k) {
+                self.thumb_bytes -= old.rgba.len();
+            }
+        }
+    }
+}
+
 fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>) {
+    // The last asset's decoder stays open: thumbnails come in runs along a
+    // clip, and opening a file costs far more than seeking it.
+    let mut open: Option<(AssetId, ve_ports::Resolved, Box<dyn ve_ports::VideoDecoder>)> = None;
     loop {
         let Some(stills) = s.upgrade() else { return };
         let job = {
@@ -167,23 +195,23 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
         drop(stills);
         let result: Result<(), AssetId> = match &job {
             Job::Thumb(asset, m, slot) => {
-                let made = storage
-                    .resolve(m)
-                    .ok()
-                    .and_then(|r| media.open_video(&r).ok())
-                    .and_then(|mut d| {
-                        let t = Time::from_seconds(slot * GRID);
-                        if *slot > 0 {
-                            d.seek(t).ok()?;
-                        }
-                        d.next_frame().ok().flatten()
-                    })
-                    .and_then(|f| to_thumb(&f));
-                match made {
+                if open.as_ref().is_none_or(|(a, _, _)| a != asset) {
+                    drop(open.take()); // close the previous one first
+                    open = storage.resolve(m).ok().and_then(|r| media.open_video(&r).ok().map(|d| (*asset, r, d)));
+                }
+                let t = Time::from_seconds(slot * GRID);
+                let made = open.as_mut().and_then(|(_, _, d)| {
+                    d.seek(t).ok()?;
+                    d.next_frame().ok().flatten()
+                });
+                if made.is_none() {
+                    open = None; // may be broken; reopen next time
+                }
+                match made.and_then(|f| to_thumb(&f)) {
                     Some(t) => {
                         if let Some(stills) = s.upgrade() {
                             let mut st = stills.state.lock().unwrap();
-                            st.thumbs.insert((*asset, *slot), Arc::new(t));
+                            st.add_thumb((*asset, *slot), t);
                             st.version += 1;
                         }
                         Ok(())

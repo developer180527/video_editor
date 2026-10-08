@@ -107,5 +107,11 @@ impl DockHost for App {
 /// `touch` picks the tablet arrangement. Never returns on iPadOS.
 pub fn run(engine: Engine, touch: bool) {
     let cfg = ShellConfig { theme: ve_ui::theme(), ..ShellConfig::default() };
-    platform_winit::run(cfg, move |waker| App(EditorUi::new(engine.spawn(waker), touch)));
+    platform_winit::run(cfg, move |waker| {
+        let mut ui = EditorUi::new(engine.spawn(waker), touch);
+        // Hardware-decoded frames go to the compositor without a copy where
+        // the platform can import them.
+        ui.set_importer(gpu_import::importer());
+        App(ui)
+    });
 }

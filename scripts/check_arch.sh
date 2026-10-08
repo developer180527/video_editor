@@ -26,7 +26,7 @@ for c in "${core[@]}"; do
   fi
   for d in $(deps "$c"); do
     case "$d" in
-      platform_*|media_*|audio_*|ve_ui|ve_builtins|libgui*|winit)
+      platform_*|media_*|audio_*|gpu_*|ve_ui|ve_builtins|libgui*|winit)
         echo "✗ core crate $c depends on $d"; fail=1 ;;
     esac
   done
@@ -34,7 +34,7 @@ done
 
 for d in $(deps ve_ui); do
   case "$d" in
-    platform_*|media_*|audio_*|ve_command|ve_plugin_host|ve_playback|ve_media|winit)
+    platform_*|media_*|audio_*|gpu_*|ve_command|ve_plugin_host|ve_playback|ve_media|winit)
       echo "✗ ve_ui depends on $d (talk to ve_engine instead)"; fail=1 ;;
   esac
 done

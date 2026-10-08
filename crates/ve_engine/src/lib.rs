@@ -30,7 +30,7 @@ pub use ve_model::Snapshot;
 pub use ve_plugin_host::Registry as PluginRegistry;
 /// How plugins describe themselves, for frontends that build UI from it.
 pub use ve_plugin_host::{EffectInfo, EffectKind, Implementation, ParamInfo, ParamKind};
-pub use ve_render::{FramePlan, Quality};
+pub use ve_render::{FramePlan, Quality, TextureImporter};
 pub use frame::Frame;
 pub use export::{ExportPreset, ExportState};
 pub use ve_media::{Meters, Stills, Thumb, PEAKS_PER_SECOND};

@@ -1,4 +1,3 @@
-use std::any::Any;
 use thiserror::Error;
 use ve_model::MediaInfo;
 use ve_time::{Rate, Time};
@@ -42,13 +41,60 @@ pub struct ColorTags {
     pub full_range: bool,
 }
 
+/// Planes in system memory that belong to someone else — a decoder's
+/// buffer pool — and stay valid while this lives. Lets a decoder hand out a
+/// frame without copying it.
+pub trait SharedPlanes: Send + Sync {
+    fn planes(&self) -> Vec<&[u8]>;
+    fn strides(&self) -> Vec<usize>;
+}
+
+/// A frame's planes in system memory, however they are held: borrowed from
+/// the frame, or copied out of GPU memory for a consumer that needs bytes.
+pub struct CpuPlanes<'a> {
+    pub planes: Vec<std::borrow::Cow<'a, [u8]>>,
+    pub strides: Vec<usize>,
+}
+
+/// What a frame left in GPU memory is, for the importer that matches it.
+/// Each platform's GPU interop reads its own kind; the rest is reserved for
+/// the interop that discrete GPUs on Windows and Linux will use.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum NativeHandle {
+    /// A `CVPixelBufferRef` (Apple: VideoToolbox output, IOSurface-backed).
+    CvPixelBuffer(*mut std::ffi::c_void),
+}
+
+/// A decoded frame still in the decoder's GPU memory.
+pub trait NativeFrame: Send + Sync {
+    /// Valid while this frame lives.
+    fn handle(&self) -> NativeHandle;
+    /// The same picture as planes in memory (a copy), for consumers that
+    /// cannot import the handle. Same layout as the frame's `format`.
+    fn to_cpu(&self) -> Option<(Vec<Vec<u8>>, Vec<usize>)>;
+}
+
 pub enum FrameData {
-    /// Planes in system memory.
+    /// Planes in system memory, owned.
     Cpu { planes: Vec<Vec<u8>>, strides: Vec<usize> },
-    /// A frame still owned by a hardware decoder (a `CVPixelBuffer`, a D3D11
-    /// texture, a DMA-BUF). Only the matching GPU importer can read it, with
-    /// no copy.
-    Native(Box<dyn Any + Send + Sync>),
+    /// Planes in system memory, shared with the decoder (no copy).
+    Shared(Box<dyn SharedPlanes>),
+    /// A frame still owned by a hardware decoder, in GPU memory. The
+    /// matching importer reads it with no copy; anything else gets a copy
+    /// through [`FrameData::cpu`].
+    Native(Box<dyn NativeFrame>),
+}
+
+impl FrameData {
+    /// The planes, when they are in system memory (owned or shared).
+    pub fn cpu(&self) -> Option<CpuPlanes<'_>> {
+        match self {
+            FrameData::Cpu { planes, strides } => Some(CpuPlanes { planes: planes.iter().map(|p| p.as_slice().into()).collect(), strides: strides.clone() }),
+            FrameData::Shared(s) => Some(CpuPlanes { planes: s.planes().into_iter().map(Into::into).collect(), strides: s.strides() }),
+            FrameData::Native(n) => n.to_cpu().map(|(planes, strides)| CpuPlanes { planes: planes.into_iter().map(Into::into).collect(), strides }),
+        }
+    }
 }
 
 pub struct VideoFrame {
@@ -111,6 +157,12 @@ pub trait MediaBackend: Send + Sync {
     fn name(&self) -> &str;
     fn probe(&self, media: &Resolved) -> Result<MediaInfo, MediaError>;
     fn open_video(&self, media: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError>;
+    /// Like `open_video`, but frames may stay in GPU memory
+    /// ([`FrameData::Native`]) when the hardware decodes them: for a consumer
+    /// with a matching importer.
+    fn open_video_for_gpu(&self, media: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError> {
+        self.open_video(media)
+    }
     fn open_audio(&self, media: &Resolved, sample_rate: u32, channels: u16) -> Result<Box<dyn AudioDecoder>, MediaError>;
     /// `out` must be a reference the storage port can write.
     fn open_encoder(&self, out: &Resolved, settings: &EncoderSettings) -> Result<Box<dyn Encoder>, MediaError>;

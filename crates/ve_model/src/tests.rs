@@ -90,3 +90,39 @@ fn keyframes_interpolate() {
     assert_eq!(p.value_at(s(20)), Value::Float(100.0));
     assert_eq!(p.value_at(-s(1)), Value::Float(0.0));
 }
+
+/// `is_free` only looks at neighbours; it must agree with checking every clip.
+#[test]
+fn is_free_agrees_with_a_full_scan() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut rnd = |n: i64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as i64
+    };
+    let t = |x: i64| Time::from_ticks(x);
+    let mut track = Track::new(TrackKind::Video, "V1");
+    let mut at = 0;
+    for _ in 0..200 {
+        at += rnd(5);
+        let len = 1 + rnd(6);
+        track.clips.push_back(Arc::new(Clip {
+            id: ClipId::new(),
+            name: "c".into(),
+            source: ClipSource::Generator { plugin: PluginRef { api: PluginApi::Builtin, id: "g".into(), major_version: 1 } },
+            source_range: TimeRange::new(t(0), t(len)),
+            timeline_start: t(at),
+            enabled: true,
+            link: None,
+            effects: Default::default(),
+        }));
+        at += len;
+    }
+    for _ in 0..20_000 {
+        let range = TimeRange::new(t(rnd(at + 10) - 5), t(1 + rnd(12)));
+        let except = (rnd(3) == 0).then(|| track.clips[rnd(200) as usize].id);
+        let full = track.clips.iter().all(|c| Some(c.id) == except || !c.timeline_range().overlaps(range));
+        assert_eq!(track.is_free(range, except), full, "{range:?} except {except:?}");
+    }
+}

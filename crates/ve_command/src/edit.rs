@@ -14,19 +14,23 @@ use ve_time::Time;
 
 use crate::{shift_keyframes, Command, CommandError, Edge};
 
-/// Builds a batch by applying each step to a scratch project.
+/// Builds a batch by applying each step to a scratch project. Steps are not
+/// checked against the document rules one by one (that made long ripples
+/// quadratic); the finished batch is, when it is applied.
 pub struct Builder {
     p: Project,
     cmds: Vec<Command>,
+    loc: crate::Locator,
 }
 
 impl Builder {
     pub fn new(p: &Project) -> Self {
-        Builder { p: p.clone(), cmds: Vec::new() }
+        Builder { p: p.clone(), cmds: Vec::new(), loc: Default::default() }
     }
 
     pub fn push(&mut self, c: Command) -> Result<(), CommandError> {
-        self.p = c.apply(&self.p)?.project;
+        // A failed step may have moved the locator ahead of `p`: drop it.
+        self.p = c.apply_unchecked(&self.p, &mut self.loc).inspect_err(|_| self.loc = Default::default())?;
         self.cmds.push(c);
         Ok(())
     }

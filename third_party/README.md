@@ -8,6 +8,8 @@ goes to `_build/` (also not committed).
 |---|---|---|---|---|
 | libgui | `da04dc8` | MIT / Apache-2.0 | the UI | in use (path deps) |
 | ffmpeg | `n9.0.2` | **LGPL-2.1+** (built without GPL/nonfree) | demux, decode, encode | in use: `scripts/build_ffmpeg.sh` → `_build/ffmpeg/<target>` |
+| nv-codec-headers | `n12.2.72.0` | MIT | NVDEC/NVENC in FFmpeg (Windows, Linux; drivers ≥ 550 load at run time) | in use by the Windows and Linux FFmpeg builds |
+| vulkan-headers | `v1.4.365` | Apache-2.0 / MIT | Vulkan Video in FFmpeg (needs ≥ 1.3.277; distributions ship older) | in use by the Linux FFmpeg build |
 | opencolorio | `v2.6.0` | BSD-3 | colour management | Phase C |
 | opentimelineio | `v0.18.1` | Apache-2.0 | interchange (FCP XML, EDL, AAF via adapters) | Phase B/C |
 | openfx | `OFX_Release_1.5.1` | BSD-3 | OpenFX host headers | Phase D |
@@ -16,13 +18,21 @@ goes to `_build/` (also not committed).
 ## Building FFmpeg
 
 ```bash
-scripts/build_ffmpeg.sh macos-arm64      # desktop dev
+scripts/build_ffmpeg.sh macos-arm64      # Apple silicon Mac
+scripts/build_ffmpeg.sh macos-x86_64     # Intel Mac (discrete AMD GPUs); cross-builds on Apple silicon
 scripts/build_ffmpeg.sh ios-sim-arm64    # iPad simulator
 scripts/build_ffmpeg.sh ios-arm64        # iPad device
+scripts/build_ffmpeg.sh linux-x86_64     # on Linux: VA-API, NVDEC/NVENC, Vulkan Video
+scripts/build_ffmpeg.sh linux-arm64      # on ARM Linux: the same
+scripts/build_ffmpeg.sh windows-x86_64   # in MSYS2 with MSVC: D3D12VA/D3D11VA, NVDEC/NVENC, Media Foundation
+scripts/build_ffmpeg.sh windows-arm64    # Windows on ARM: D3D12VA/D3D11VA, Media Foundation
 ```
 
-Static, LGPL, VideoToolbox/AudioToolbox on, zlib on, nothing else
-autodetected. `crates/media_ffmpeg/build.rs` links whichever matches the
+Static, LGPL, nothing autodetected: each target turns on exactly the GPU
+video APIs listed in the script (decode and encode on the GPU's media
+engines, discrete or integrated). Prerequisites for Linux and Windows are
+listed at the top of the script. Building the Rust side on Windows also needs
+LLVM (for bindgen's libclang) and pkg-config. `crates/media_ffmpeg/build.rs` links whichever matches the
 target (`FFMPEG_DIR` overrides).
 
 **Before shipping on iOS:** LGPL requires that users can relink against a

@@ -13,6 +13,8 @@ mod mixer;
 mod playback;
 mod stills;
 mod video;
+#[cfg(test)]
+mod fakes;
 
 pub use stills::{Stills, Thumb, PEAKS_PER_SECOND};
 

@@ -13,8 +13,13 @@ fn main() {
     let dir = env::var("FFMPEG_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         let name = match target.as_str() {
             "aarch64-apple-darwin" => "macos-arm64",
+            "x86_64-apple-darwin" => "macos-x86_64",
             "aarch64-apple-ios" => "ios-arm64",
             "aarch64-apple-ios-sim" => "ios-sim-arm64",
+            "x86_64-unknown-linux-gnu" => "linux-x86_64",
+            "aarch64-unknown-linux-gnu" => "linux-arm64",
+            "x86_64-pc-windows-msvc" => "windows-x86_64",
+            "aarch64-pc-windows-msvc" => "windows-arm64",
             t => panic!("no FFmpeg build mapping for {t}: set FFMPEG_DIR or extend scripts/build_ffmpeg.sh"),
         };
         root.join("third_party/_build/ffmpeg").join(name)
@@ -23,7 +28,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dir.join("lib").display());
     if !dir.join("include/libavformat/avformat.h").exists() {
         panic!(
-            "FFmpeg not built at {}.\nRun: scripts/build_ffmpeg.sh <macos-arm64|ios-arm64|ios-sim-arm64>",
+            "FFmpeg not built at {}.\nRun: scripts/build_ffmpeg.sh <target> (see the script for the list)",
             dir.display()
         );
     }
@@ -38,11 +43,24 @@ fn main() {
         .expect("pkg-config is needed to link FFmpeg");
     assert!(out.status.success(), "pkg-config failed: {}", String::from_utf8_lossy(&out.stderr));
     let flags = String::from_utf8(out.stdout).unwrap();
+    let msvc = target.ends_with("-msvc");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    if msvc {
+        // FFmpeg's MSVC static libraries are named libavcodec.a; rustc asks
+        // the linker for avcodec.lib. Same format, so copy them across.
+        for l in ["avformat", "avcodec", "swresample", "swscale", "avutil"] {
+            let a = dir.join(format!("lib/lib{l}.a"));
+            if a.exists() {
+                std::fs::copy(&a, out_dir.join(format!("{l}.lib"))).unwrap();
+            }
+        }
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+    }
     let mut words = flags.split_whitespace();
     let mut seen = std::collections::HashSet::new();
     while let Some(w) = words.next() {
         let line = if let Some(p) = w.strip_prefix("-L") {
-            format!("cargo:rustc-link-search=native={p}")
+            format!("cargo:rustc-link-search=native={}", native_path(p))
         } else if let Some(l) = w.strip_prefix("-l") {
             let kind = if l.starts_with("av") || l.starts_with("sw") { "static" } else { "dylib" };
             format!("cargo:rustc-link-lib={kind}={l}")
@@ -84,4 +102,15 @@ fn main() {
     }
     let bindings = b.generate().expect("bindgen over FFmpeg headers");
     bindings.write_to_file(PathBuf::from(env::var("OUT_DIR").unwrap()).join("ffmpeg.rs")).unwrap();
+}
+
+/// MSYS2's pkg-config speaks `/c/Users/...`; the MSVC linker wants
+/// `C:/Users/...`. Other paths pass through.
+fn native_path(p: &str) -> String {
+    let b = p.as_bytes();
+    if cfg!(windows) && b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b'/' {
+        format!("{}:{}", (b[1] as char).to_ascii_uppercase(), &p[2..])
+    } else {
+        p.to_string()
+    }
 }

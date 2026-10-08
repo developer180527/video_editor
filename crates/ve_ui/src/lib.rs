@@ -100,6 +100,8 @@ pub struct EditorUi {
     pub view: View,
     dock: DockState<Tab>,
     compositor: Option<Compositor>,
+    /// The platform's importer for frames left in GPU memory, if any.
+    importer: Option<std::sync::Arc<dyn ve_render::TextureImporter>>,
     /// The monitor shows a frame still being decoded: keep drawing.
     catching_up: bool,
     /// Meter levels with fall-off, dBFS.
@@ -155,6 +157,7 @@ impl EditorUi {
             },
             dock,
             compositor: None,
+            importer: None,
             catching_up: false,
             meter_db: [-96.0; 2],
             gpu: None,
@@ -196,6 +199,17 @@ impl EditorUi {
     }
 
     /// Render the program monitor and hand its texture to the UI renderer.
+    /// Hand hardware-decoded frames to the compositor as they are, through
+    /// the platform's `importer` (frames are copied through memory without
+    /// one). Call before the first frame is drawn.
+    pub fn set_importer(&mut self, importer: Option<std::sync::Arc<dyn ve_render::TextureImporter>>) {
+        self.engine.video().set_gpu_frames(importer.is_some());
+        if let Some(c) = &mut self.compositor {
+            c.set_importer(importer.clone());
+        }
+        self.importer = importer;
+    }
+
     pub fn prepare_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui_wgpu::Renderer) {
         let quality = [ve_render::Quality::FULL, ve_render::Quality::PREVIEW, ve_render::Quality { scale: 0.25, use_proxies: true }]
             [self.view.quality.min(2)];
@@ -226,7 +240,12 @@ impl EditorUi {
             self.thumbs.insert(key, (tex, id));
         }
         let Some(frame) = self.engine.frame(quality) else { return };
-        let comp = self.compositor.get_or_insert_with(|| Compositor::new(device));
+        let importer = &self.importer;
+        let comp = self.compositor.get_or_insert_with(|| {
+            let mut c = Compositor::new(device);
+            c.set_importer(importer.clone());
+            c
+        });
         comp.render(device, queue, &frame.plan, &frame.layers, frame.seq_size, frame.space);
         self.catching_up = !frame.complete;
         self.errors.append(&mut comp.errors);
@@ -276,7 +295,7 @@ impl EditorUi {
         if p.extension().is_none() {
             p.set_extension(preset.extension());
         }
-        self.export = Some(self.engine.export(gpu, preset, MediaRef(format!("file:{}", p.display()))));
+        self.export = Some(self.engine.export(gpu, preset, MediaRef(format!("file:{}", p.display())), self.importer.clone()));
     }
 
     /// The export dialog, and the end of a finished export.

@@ -143,6 +143,10 @@ impl MediaBackend for Ffmpeg {
         Ok(Box::new(VideoDec::open(media, true)?))
     }
 
+    fn open_video_for_gpu(&self, media: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError> {
+        Ok(Box::new(VideoDec::open_with(media, true, true)?))
+    }
+
     fn open_audio(&self, media: &Resolved, sample_rate: u32, channels: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
         Ok(Box::new(AudioDec::open(media, sample_rate, channels)?))
     }
@@ -150,4 +154,36 @@ impl MediaBackend for Ffmpeg {
     fn open_encoder(&self, out: &Resolved, settings: &EncoderSettings) -> Result<Box<dyn Encoder>, MediaError> {
         Ok(Box::new(FfEncoder::open(out, settings)?))
     }
+}
+
+/// Hardware device types in this FFmpeg build.
+pub(crate) fn built_hw_types() -> Vec<sys::AVHWDeviceType> {
+    let mut v = Vec::new();
+    let mut t = sys::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+    loop {
+        t = unsafe { sys::av_hwdevice_iterate_types(t) };
+        if t == sys::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
+            return v;
+        }
+        v.push(t);
+    }
+}
+
+/// One device per type for the whole process, shared by every decoder
+/// (creating one — a CUDA context, say — can take a tenth of a second).
+/// `None` once a type has failed to open, so it is not retried per clip.
+pub(crate) fn shared_device(t: sys::AVHWDeviceType) -> Option<*mut sys::AVBufferRef> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // Pointers as integers: the device contexts are thread-safe and live
+    // for the whole process.
+    static DEVICES: OnceLock<Mutex<HashMap<i32, Option<usize>>>> = OnceLock::new();
+    let mut devices = DEVICES.get_or_init(Default::default).lock().unwrap();
+    let dev = *devices.entry(t as i32).or_insert_with(|| {
+        let mut dev = ptr::null_mut();
+        let r = unsafe { sys::av_hwdevice_ctx_create(&mut dev, t, ptr::null(), ptr::null_mut(), 0) };
+        (r >= 0).then_some(dev as usize)
+    });
+    // A new reference for the caller.
+    dev.map(|d| unsafe { sys::av_buffer_ref(d as *mut sys::AVBufferRef) }).filter(|r| !r.is_null())
 }

@@ -69,7 +69,7 @@ fn decode_video_frames_and_seek() {
     let f = d.next_frame().unwrap().unwrap();
     assert_eq!((f.width, f.height, f.format), (320, 180, ve_ports::PixelFormat::Nv12));
     assert_eq!(f.pts, Time::ZERO);
-    let ve_ports::FrameData::Cpu { planes, strides } = &f.data else { panic!("cpu frame") };
+    let ve_ports::CpuPlanes { planes, strides } = f.data.cpu().expect("cpu frame");
     assert_eq!(planes.len(), 2);
     assert!(strides[0] >= 320 && planes[0].len() >= 320 * 180);
     // Seek to frame 30 (1.2 s): the next frame returned is that one.
@@ -108,7 +108,9 @@ fn decode_audio_resampled() {
     assert_eq!(b.pts, Time::from_seconds(1));
 }
 
-fn encode(codec: &str, container: &str) -> ve_model::MediaInfo {
+/// `None` (and a note) when this machine has no encoder for `codec`: CI
+/// runners have no GPU media engine, and H.264/HEVC are only encoded there.
+fn encode(codec: &str, container: &str) -> Option<ve_model::MediaInfo> {
     use ve_ports::*;
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("encode_test.{container}"));
     let settings = EncoderSettings {
@@ -124,7 +126,13 @@ fn encode(codec: &str, container: &str) -> ve_model::MediaInfo {
         prefer_hardware: true,
     };
     let out = Resolved { path: Some(path.clone()), guard: Box::new(()) };
-    let mut enc = Ffmpeg::new().open_encoder(&out, &settings).unwrap();
+    let mut enc = match Ffmpeg::new().open_encoder(&out, &settings) {
+        Err(MediaError::Unsupported(m)) if m.contains("encoder works here") => {
+            eprintln!("skipped: {m}");
+            return None;
+        }
+        r => r.unwrap(),
+    };
     for i in 0..50u32 {
         let px: Vec<u8> = (0..320 * 180).flat_map(|p| [(p % 320) as u8, (i * 5) as u8, 128, 255]).collect();
         enc.push_video(VideoFrame {
@@ -144,12 +152,12 @@ fn encode(codec: &str, container: &str) -> ve_model::MediaInfo {
     }).collect();
     enc.push_audio(AudioBlock { pts: Time::ZERO, sample_rate: 48_000, channels: 2, samples }).unwrap();
     enc.finish().unwrap();
-    Ffmpeg::new().probe(&Resolved { path: Some(path), guard: Box::new(()) }).unwrap()
+    Some(Ffmpeg::new().probe(&Resolved { path: Some(path), guard: Box::new(()) }).unwrap())
 }
 
 #[test]
 fn encode_h264_mp4_round_trips() {
-    let info = encode("h264", "mp4");
+    let Some(info) = encode("h264", "mp4") else { return };
     let v = info.video.unwrap();
     assert_eq!((v.width, v.height, v.rate, v.codec.as_str()), (320, 180, Rate::FPS_25, "h264"));
     assert_eq!(info.audio.unwrap().codec, "aac");
@@ -159,7 +167,7 @@ fn encode_h264_mp4_round_trips() {
 
 #[test]
 fn encode_prores_mov_round_trips() {
-    let info = encode("prores", "mov");
+    let info = encode("prores", "mov").expect("ProRes is encoded in software everywhere");
     assert_eq!(info.video.unwrap().codec, "prores");
 }
 
@@ -173,7 +181,7 @@ fn made(name: &str, args: &[&str]) -> Option<Resolved> {
 fn first_yuv(r: Resolved) -> (u8, u8, u8, ve_ports::ColorTags) {
     let mut d = Ffmpeg::new().open_video(&r).unwrap();
     let f = d.next_frame().unwrap().unwrap();
-    let ve_ports::FrameData::Cpu { planes, strides } = &f.data else { panic!() };
+    let ve_ports::CpuPlanes { planes, strides } = f.data.cpu().unwrap();
     let (x, y) = (100, 100);
     (planes[0][y * strides[0] + x], planes[1][(y / 2) * strides[1] + x], planes[1][(y / 2) * strides[1] + x + 1], f.color)
 }
@@ -233,4 +241,20 @@ fn full_range_survives_conversion() {
     let (y, _, _, tags) = first_yuv(r);
     assert!(tags.full_range, "{tags:?}");
     assert!(y >= 250, "white is {y} in a full-range frame");
+}
+
+/// Hardware decode (VideoToolbox here) keeps the stream's colour tags: they
+/// do not travel with the pixels when frames are copied off the hardware.
+#[test]
+fn hardware_decode_keeps_colour_tags() {
+    let Some(r) = made("hlg.mp4", &["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=0.4", "-c:v", "h264", "-pix_fmt", "yuv420p", "-bsf:v", "h264_metadata=colour_primaries=9:transfer_characteristics=18:matrix_coefficients=9"]) else {
+        return eprintln!("skipped: no ffmpeg CLI");
+    };
+    let d = media_ffmpeg::VideoDec::open(&r, true).unwrap();
+    let hardware = d.hardware;
+    let mut d: Box<dyn ve_ports::VideoDecoder> = Box::new(d);
+    let f = d.next_frame().unwrap().unwrap();
+    assert_eq!((f.color.primaries.as_str(), f.color.transfer.as_str(), f.color.matrix.as_str()), ("bt2020", "arib-std-b67", "bt2020nc"), "hardware={hardware}");
+    // And the planes are handed over, not copied.
+    assert!(matches!(f.data, ve_ports::FrameData::Shared(_)));
 }

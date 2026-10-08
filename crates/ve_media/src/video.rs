@@ -3,7 +3,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use ve_model::{AssetId, MediaRef};
-use ve_ports::{FrameData, MediaBackend, Storage, VideoDecoder, VideoFrame};
+use ve_ports::{FrameData, MediaBackend, Resolved, Storage, VideoDecoder, VideoFrame};
 use ve_time::Time;
 
 use crate::Waker;
@@ -14,6 +14,15 @@ const AHEAD: Time = Time::from_seconds(1);
 const BEHIND: Time = Time::from_ticks(254_016_000_000 / 2);
 /// A request this far beyond the decoder seeks instead of decoding through.
 const SEEK_GAP: Time = Time::from_seconds(2);
+/// How much of an upcoming clip is decoded before the playhead gets there.
+const PREFETCH: Time = Time::from_ticks(254_016_000_000 / 2);
+/// A prefetch hint not renewed for this long is forgotten (playback stopped,
+/// the playhead moved).
+const HINT_LIFE: Duration = Duration::from_secs(2);
+/// A source nobody has asked for in this long closes its decoder (its
+/// frames stay cached). Decoders hold threads, memory and, on Apple, a
+/// limited number of hardware sessions.
+const IDLE: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(30) };
 
 /// The result of asking for a frame.
 pub enum Lookup {
@@ -38,8 +47,10 @@ impl Lookup {
 
 fn frame_bytes(f: &VideoFrame) -> usize {
     match &f.data {
-        FrameData::Cpu { planes, .. } => planes.iter().map(|p| p.len()).sum(),
-        FrameData::Native(_) => 1 << 20,
+        FrameData::Cpu { .. } | FrameData::Shared(_) => f.data.cpu().map_or(0, |c| c.planes.iter().map(|p| p.len()).sum()),
+        // Held by the hardware: count what the same picture would take in
+        // memory (8- or 10-bit 4:2:0), so the budget still means something.
+        FrameData::Native(_) => f.width as usize * f.height as usize * 3 / 2 * if f.format == ve_ports::PixelFormat::P010 { 2 } else { 1 },
     }
 }
 
@@ -53,6 +64,11 @@ struct State {
     /// Where the stream ended, once the decoder has run off its end (until
     /// the next seek). Times past it show the last frame.
     end: Option<Time>,
+    /// Where a clip of this source will start soon, and when that was said:
+    /// decoded when the wanted time needs nothing, and kept from eviction.
+    upcoming: Option<(Time, std::time::Instant)>,
+    /// When a frame was last asked for.
+    asked: Option<std::time::Instant>,
     error: Option<String>,
     closed: bool,
 }
@@ -89,13 +105,31 @@ impl State {
         end - t
     }
 
-    /// Whether decoding one more frame ahead of `t` would overflow the
-    /// budget with frames that are still wanted (those in `[t, t + AHEAD]`).
-    /// Without this check a budget smaller than the look-ahead window makes
-    /// the worker decode and immediately evict, forever.
+    /// The upcoming start, while its hint is fresh.
+    fn upcoming(&self) -> Option<Time> {
+        self.upcoming.filter(|(_, at)| at.elapsed() < HINT_LIFE).map(|(u, _)| u)
+    }
+
+    /// Frames kept for an upcoming clip.
+    fn protected(&self, k: Time) -> bool {
+        self.upcoming().is_some_and(|u| k >= u && k < u + PREFETCH)
+    }
+
+    /// Bytes of frames still wanted: `[t, t + AHEAD]` and the upcoming window.
+    fn wanted_bytes(&self, t: Time) -> usize {
+        self.frames
+            .iter()
+            .filter(|(k, f)| self.protected(**k) || (**k <= t + AHEAD && f.pts + f.duration > t))
+            .map(|(_, f)| frame_bytes(f))
+            .sum()
+    }
+
+    /// Whether decoding one more frame would overflow the budget with frames
+    /// that are still wanted. Without this check a budget smaller than the
+    /// look-ahead window makes the worker decode and immediately evict,
+    /// forever.
     fn ahead_full(&self, t: Time, budget: usize) -> bool {
-        let wanted: usize = self.frames.range(..=t + AHEAD).filter(|(_, f)| f.pts + f.duration > t).map(|(_, f)| frame_bytes(f)).sum();
-        wanted + self.frame_bytes > budget
+        self.wanted_bytes(t) + self.frame_bytes > budget
     }
 
     fn remove(&mut self, k: Time) {
@@ -106,24 +140,21 @@ impl State {
 
     fn evict(&mut self, budget: usize) {
         let Some(t) = self.want else { return };
-        // Behind the window: drop.
-        let old: Vec<Time> = self.frames.range(..t - BEHIND).map(|(k, _)| *k).collect();
+        // Behind the window: drop (unless kept for an upcoming clip).
+        let old: Vec<Time> = self.frames.range(..t - BEHIND).map(|(k, _)| *k).filter(|k| !self.protected(*k)).collect();
         for k in old {
             self.remove(k);
         }
         // Over budget: frames already shown go first (oldest first), then
-        // the farthest ahead. The frame showing at `t` is never dropped.
+        // the farthest ahead. The frame showing at `t` and frames kept for
+        // an upcoming clip are never dropped.
         while self.bytes > budget {
-            let (&first, f) = self.frames.iter().next().unwrap();
-            if f.pts + f.duration <= t {
-                self.remove(first);
-                continue;
+            let behind = self.frames.iter().find(|(k, f)| !self.protected(**k) && f.pts + f.duration <= t).map(|(k, _)| *k);
+            let victim = behind.or_else(|| self.frames.iter().rev().find(|(k, f)| **k > t && f.pts > t && !self.protected(**k)).map(|(k, _)| *k));
+            match victim {
+                Some(k) => self.remove(k),
+                None => break,
             }
-            let (&last, f) = self.frames.iter().next_back().unwrap();
-            if last <= t || (f.pts <= t && t < f.pts + f.duration) {
-                break;
-            }
-            self.remove(last);
         }
     }
 }
@@ -141,15 +172,32 @@ pub struct VideoPool {
     /// Bytes of decoded frames each source may hold.
     budget: usize,
     waker: Mutex<Option<Waker>>,
+    /// Ask decoders to leave hardware frames in GPU memory: set by a
+    /// consumer whose compositor can import them. Applies to decoders opened
+    /// from then on.
+    gpu_frames: std::sync::atomic::AtomicBool,
 }
 
 impl VideoPool {
     pub fn new(storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>, budget_per_source: usize) -> Arc<Self> {
-        Arc::new(VideoPool { storage, media, sources: Mutex::new(HashMap::new()), budget: budget_per_source, waker: Mutex::new(None) })
+        Arc::new(VideoPool {
+            storage,
+            media,
+            sources: Mutex::new(HashMap::new()),
+            budget: budget_per_source,
+            waker: Mutex::new(None),
+            gpu_frames: Default::default(),
+        })
     }
 
     pub fn set_waker(&self, w: Waker) {
         *self.waker.lock().unwrap() = Some(w);
+    }
+
+    /// Whoever draws this pool's frames can import frames left in GPU
+    /// memory (see `MediaBackend::open_video_for_gpu`).
+    pub fn set_gpu_frames(&self, on: bool) {
+        self.gpu_frames.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn source(self: &Arc<Self>, asset: AssetId, media: &MediaRef) -> Arc<Source> {
@@ -172,6 +220,7 @@ impl VideoPool {
     pub fn frame(self: &Arc<Self>, asset: AssetId, media: &MediaRef, t: Time) -> Lookup {
         let src = self.source(asset, media);
         let mut st = src.state.lock().unwrap();
+        st.asked = Some(std::time::Instant::now());
         if let Some(e) = &st.error {
             return Lookup::Failed(e.clone());
         }
@@ -179,9 +228,26 @@ impl VideoPool {
             st.want = Some(t);
             src.wake.notify_all();
         }
+        if st.upcoming().is_some_and(|u| t >= u) {
+            st.upcoming = None; // arrived
+        }
         match st.covering(t).or_else(|| st.past_end(t)) {
             Some(f) => Lookup::Exact(f.clone()),
             None => st.nearest(t).map_or(Lookup::Pending, |f| Lookup::Nearest(f.clone())),
+        }
+    }
+
+    /// A clip of `asset` will start showing source time `t` soon: decode its
+    /// first frames ahead of time, without disturbing the frames wanted now.
+    /// Renew the hint while it holds; it lapses after a couple of seconds.
+    pub fn prefetch(self: &Arc<Self>, asset: AssetId, media: &MediaRef, t: Time) {
+        let src = self.source(asset, media);
+        let mut st = src.state.lock().unwrap();
+        let fresh = st.upcoming() != Some(t);
+        st.upcoming = Some((t, std::time::Instant::now()));
+        st.asked = st.upcoming.map(|(_, at)| at);
+        if fresh {
+            src.wake.notify_all();
         }
     }
 
@@ -191,6 +257,7 @@ impl VideoPool {
         let deadline = std::time::Instant::now() + timeout;
         let mut st = src.state.lock().unwrap();
         st.want = Some(t);
+        st.asked = Some(std::time::Instant::now());
         src.wake.notify_all();
         loop {
             if let Some(e) = &st.error {
@@ -248,16 +315,12 @@ fn worker(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef) {
         src.wake.notify_all();
     };
     let Some(p) = pool.upgrade() else { return };
-    let resolved = match p.storage.resolve(&media) {
-        Ok(r) => r,
-        Err(e) => return fail(e.to_string()),
-    };
-    let mut dec: Box<dyn VideoDecoder> = match p.media.open_video(&resolved) {
-        Ok(d) => d,
-        Err(e) => return fail(e.to_string()),
-    };
-    let budget = p.budget;
+    let (storage, backend, budget) = (p.storage.clone(), p.media.clone(), p.budget);
+    let gpu = pool.clone();
     drop(p);
+    // Opened when there is work, closed when idle. The `Resolved` keeps the
+    // file reachable (a security scope on iPadOS) while the decoder reads.
+    let mut dec: Option<(Resolved, Box<dyn VideoDecoder>)> = None;
     // Where the decoder will continue from (the end of its last frame).
     let mut pos: Option<Time> = None;
     // A wanted time the decoder cannot reach by decoding on: before it, or far ahead.
@@ -279,17 +342,55 @@ fn worker(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef) {
                     if seek || (missing && st.end.is_none()) || more {
                         break (t, seek);
                     }
+                    // Nothing needed now: get the next clip's head ready.
+                    if let Some(u) = st.upcoming() {
+                        let needed = st.ready_ahead(u) < PREFETCH && st.past_end(u).is_none() && !st.ahead_full(t, budget);
+                        if needed && !(st.end.is_some() && pos.is_some_and(|p| u >= p)) {
+                            let seek = st.covering(u).is_none() && must_seek(u, pos);
+                            if seek {
+                                st.end = None;
+                            }
+                            break (u, seek);
+                        }
+                    }
                 }
-                st = src.wake.wait(st).unwrap();
+                // Hints lapse on their own: wake to notice.
+                if st.upcoming.is_some() && st.upcoming().is_none() {
+                    st.upcoming = None;
+                }
+                // Nobody has asked for a while: close the decoder.
+                if dec.is_some() && st.asked.is_none_or(|a| a.elapsed() >= IDLE) {
+                    dec = None;
+                    pos = None;
+                }
+                st = match (&st.upcoming, &dec) {
+                    (Some(_), _) => src.wake.wait_timeout(st, HINT_LIFE).unwrap().0,
+                    (None, Some(_)) => src.wake.wait_timeout(st, IDLE).unwrap().0,
+                    (None, None) => src.wake.wait(st).unwrap(),
+                };
             }
         };
-        if seek {
-            if let Err(e) = dec.seek(target) {
+        if dec.is_none() {
+            let for_gpu = gpu.upgrade().is_some_and(|p| p.gpu_frames.load(std::sync::atomic::Ordering::Relaxed));
+            let opened = storage.resolve(&media).map_err(|e| e.to_string()).and_then(|r| {
+                let d = if for_gpu { backend.open_video_for_gpu(&r) } else { backend.open_video(&r) };
+                d.map(|d| (r, d)).map_err(|e| e.to_string())
+            });
+            match opened {
+                Ok(d) => dec = Some(d),
+                Err(e) => return fail(e),
+            }
+        }
+        let (_, d) = dec.as_mut().unwrap();
+        // A freshly opened decoder is at its start: position it.
+        if seek || pos.is_none() {
+            if let Err(e) = d.seek(target) {
                 return fail(e.to_string());
             }
             pos = None;
         }
-        match dec.next_frame() {
+        let seek = seek || pos.is_none();
+        match d.next_frame() {
             Ok(Some(f)) => {
                 pos = Some(f.pts + f.duration);
                 // The first frame after a seek starts after the target only
@@ -347,13 +448,21 @@ mod tests {
         first: i64,
         count: i64,
         decoded: Arc<AtomicUsize>,
+        alive: Arc<AtomicUsize>,
     }
 
     struct FakeDec {
+        alive: Arc<AtomicUsize>,
         first: i64,
         next: i64,
         end: i64,
         decoded: Arc<AtomicUsize>,
+    }
+
+    impl Drop for FakeDec {
+        fn drop(&mut self) {
+            self.alive.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     impl VideoDecoder for FakeDec {
@@ -389,7 +498,8 @@ mod tests {
             unimplemented!()
         }
         fn open_video(&self, _: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError> {
-            Ok(Box::new(FakeDec { first: self.first, next: self.first, end: self.first + self.count, decoded: self.decoded.clone() }))
+            self.alive.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeDec { alive: self.alive.clone(), first: self.first, next: self.first, end: self.first + self.count, decoded: self.decoded.clone() }))
         }
         fn open_audio(&self, _: &Resolved, _: u32, _: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
             unimplemented!()
@@ -399,34 +509,11 @@ mod tests {
         }
     }
 
-    struct AnyFile;
-    impl Storage for AnyFile {
-        fn make_ref(&self, p: &str) -> Result<MediaRef, StorageError> {
-            Ok(MediaRef(p.into()))
-        }
-        fn resolve(&self, _: &MediaRef) -> Result<Resolved, StorageError> {
-            Ok(Resolved { path: None, guard: Box::new(()) })
-        }
-        fn resolve_new(&self, r: &MediaRef) -> Result<Resolved, StorageError> {
-            self.resolve(r)
-        }
-        fn open_read(&self, r: &MediaRef) -> Result<Box<dyn ReadSeek>, StorageError> {
-            Err(StorageError::NotFound(r.0.clone()))
-        }
-        fn open_write(&self, r: &MediaRef) -> Result<Box<dyn std::io::Write + Send>, StorageError> {
-            Err(StorageError::NotFound(r.0.clone()))
-        }
-        fn location(&self, _: Location, name: &str) -> Result<MediaRef, StorageError> {
-            Ok(MediaRef(name.into()))
-        }
-        fn display_name(&self, r: &MediaRef) -> String {
-            r.0.clone()
-        }
-    }
+    use crate::fakes::AnyFile;
 
     fn pool(first: i64, count: i64, budget_frames: usize) -> (Arc<VideoPool>, Arc<AtomicUsize>) {
         let decoded = Arc::new(AtomicUsize::new(0));
-        let media = Arc::new(Fake { first, count, decoded: decoded.clone() });
+        let media = Arc::new(Fake { first, count, decoded: decoded.clone(), alive: Arc::new(AtomicUsize::new(0)) });
         (VideoPool::new(Arc::new(AnyFile), media, budget_frames * FRAME), decoded)
     }
 
@@ -474,6 +561,39 @@ mod tests {
         let f = pool.frame_blocking(AssetId::new(), &MediaRef("x".into()), RATE.frame_to_time(60), WAIT).unwrap();
         assert_eq!(f.pts, RATE.frame_to_time(49));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_next_clip_is_ready_before_the_cut() {
+        // Playing at 2 s; a clip of the same source starting at 30 s is next.
+        let (pool, _) = pool(0, 10_000, 200);
+        let (a, m) = (AssetId::new(), MediaRef("x".into()));
+        let now = Time::from_seconds(2);
+        pool.frame_blocking(a, &m, now, WAIT).unwrap();
+        pool.prefetch(a, &m, Time::from_seconds(30));
+        std::thread::sleep(Duration::from_millis(300));
+        // The playing clip kept its own look-ahead…
+        assert!(matches!(pool.frame(a, &m, now + RATE.frame_to_time(10)), Lookup::Exact(_)));
+        // …and at the cut the incoming frame is already there, without
+        // waiting. (Asked last: asking moves the wanted time to the cut.)
+        assert!(matches!(pool.frame(a, &m, Time::from_seconds(30)), Lookup::Exact(_)), "next clip's head was decoded");
+    }
+
+    #[test]
+    fn idle_sources_close_their_decoders() {
+        let alive = Arc::new(AtomicUsize::new(0));
+        let media = Arc::new(Fake { first: 0, count: 10_000, decoded: Arc::new(AtomicUsize::new(0)), alive: alive.clone() });
+        let pool = VideoPool::new(Arc::new(AnyFile), media, 1000 * FRAME);
+        let (a, m) = (AssetId::new(), MediaRef("x".into()));
+        pool.frame_blocking(a, &m, Time::ZERO, WAIT).unwrap();
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
+        std::thread::sleep(IDLE * 3);
+        assert_eq!(alive.load(Ordering::SeqCst), 0, "closed when idle");
+        // Cached frames are still there; new ones reopen it.
+        assert!(matches!(pool.frame(a, &m, RATE.frame_to_time(3)), Lookup::Exact(_)));
+        let f = pool.frame_blocking(a, &m, Time::from_seconds(100), WAIT).unwrap();
+        assert_eq!(f.pts, Time::from_seconds(100));
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
     }
 
     #[test]

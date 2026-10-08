@@ -191,9 +191,15 @@ impl Track {
         i.checked_sub(1).map(|i| &self.clips[i]).filter(|c| c.timeline_range().contains(t))
     }
 
-    /// Whether `range` is free of clips, ignoring `except`.
+    /// Whether `range` is free of clips, ignoring `except`. O(log n): the
+    /// clips are sorted and do not overlap, so only the neighbours of where
+    /// `range` would go can touch it.
     pub fn is_free(&self, range: TimeRange, except: Option<ClipId>) -> bool {
-        self.clips.iter().all(|c| Some(c.id) == except || !c.timeline_range().overlaps(range))
+        let i = self.insertion_index(range.start);
+        // Up to two on each side, in case one of them is `except`.
+        (i.saturating_sub(2)..(i + 2).min(self.clips.len()))
+            .map(|j| &self.clips[j])
+            .all(|c| Some(c.id) == except || !c.timeline_range().overlaps(range))
     }
 
     /// Index at which a clip starting at `start` keeps the track sorted.
