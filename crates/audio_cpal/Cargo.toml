@@ -1,0 +1,15 @@
+[package]
+name = "audio_cpal"
+description = "The AudioOutput port on cpal (CoreAudio, WASAPI, ALSA/PipeWire, AAudio)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_ports.workspace = true
+cpal.workspace = true
+
+[dev-dependencies]
+ve_playback.workspace = true
+ve_time.workspace = true

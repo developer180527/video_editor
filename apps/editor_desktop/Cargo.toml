@@ -1,0 +1,19 @@
+[package]
+name = "editor_desktop"
+description = "The editor on macOS, Windows and Linux: wires the desktop adapters to the engine and UI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "video-editor"
+path = "src/main.rs"
+
+[dependencies]
+ve_engine.workspace = true
+ve_model.workspace = true
+ve_builtins.workspace = true
+media_ffmpeg.workspace = true
+platform_desktop.workspace = true
+editor_app = { path = "../../crates/editor_app" }

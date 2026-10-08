@@ -1,0 +1,11 @@
+[package]
+name = "platform_headless"
+description = "Ports with no OS beyond std: tests, the CLI, render farms. Also the portable building blocks other adapters reuse."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_model.workspace = true
+ve_ports.workspace = true

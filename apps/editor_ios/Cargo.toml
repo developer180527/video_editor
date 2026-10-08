@@ -1,0 +1,18 @@
+[package]
+name = "editor_ios"
+description = "The editor on iPadOS: wires the iOS adapters to the engine and UI. Bundle with scripts/ios_bundle.sh."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "VideoEditor"
+path = "src/main.rs"
+
+[dependencies]
+ve_engine.workspace = true
+ve_builtins.workspace = true
+media_ffmpeg.workspace = true
+platform_ios.workspace = true
+editor_app = { path = "../../crates/editor_app" }

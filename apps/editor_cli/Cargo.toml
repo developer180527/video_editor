@@ -1,0 +1,19 @@
+[package]
+name = "editor_cli"
+description = "The engine without a UI: probe media, create and inspect projects, list plugins. The same engine API the UI uses."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ve"
+path = "src/main.rs"
+
+[dependencies]
+ve_engine.workspace = true
+ve_model.workspace = true
+ve_time.workspace = true
+ve_builtins.workspace = true
+media_ffmpeg.workspace = true
+platform_desktop.workspace = true

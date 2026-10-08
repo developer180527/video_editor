@@ -1,0 +1,23 @@
+[package]
+name = "platform_winit"
+description = "The UI shell: a window, input, clipboard and a wgpu surface for libgui, on desktop and iPadOS."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libgui.workspace = true
+libgui_keymap.workspace = true
+libgui_wgpu.workspace = true
+libgui_winit.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2.workspace = true
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+arboard.workspace = true
+rfd.workspace = true

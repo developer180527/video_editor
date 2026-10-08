@@ -1,0 +1,6 @@
+# Minimum OS versions, shared by Rust, the cc crate and the linker. Keep in
+# step with apps/editor_ios/ios/Info.plist (MinimumOSVersion) and
+# scripts/build_ffmpeg.sh.
+[env]
+IPHONEOS_DEPLOYMENT_TARGET = "17.0"
+MACOSX_DEPLOYMENT_TARGET = "12.0"

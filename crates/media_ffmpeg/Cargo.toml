@@ -1,0 +1,15 @@
+[package]
+name = "media_ffmpeg"
+description = "The MediaBackend port implemented with FFmpeg (LGPL build from third_party/ffmpeg)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_time.workspace = true
+ve_model.workspace = true
+ve_ports.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true

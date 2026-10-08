@@ -1,0 +1,15 @@
+[package]
+name = "platform_ios"
+description = "Ports for iPadOS (and iOS): sandbox storage, linked-only plugins, no processes, no JIT."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_ports.workspace = true
+platform_headless.workspace = true
+audio_cpal.workspace = true
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2.workspace = true

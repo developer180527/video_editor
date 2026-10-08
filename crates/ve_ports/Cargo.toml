@@ -1,0 +1,12 @@
+[package]
+name = "ve_ports"
+description = "The traits the engine needs from the outside world. Traits only: no OS code, no implementations."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_time.workspace = true
+ve_model.workspace = true
+thiserror.workspace = true

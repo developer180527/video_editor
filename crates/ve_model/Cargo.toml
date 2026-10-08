@@ -1,0 +1,17 @@
+[package]
+name = "ve_model"
+description = "The document: project, media, sequences, tracks, clips, effects. Immutable snapshots."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_time.workspace = true
+serde.workspace = true
+imbl.workspace = true
+ulid.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

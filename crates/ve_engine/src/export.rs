@@ -1,0 +1,184 @@
+//! Export: render every frame of the active sequence, mix its audio, encode.
+//!
+//! Runs on its own thread with its own compositor on the shared GPU device.
+//! Frames are waited for (exact, never "nearest"); audio is mixed offline,
+//! sample-accurately, frame by frame, so picture and sound cannot drift.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use ve_media::{Mixer, VideoPool};
+use ve_model::{MediaRef, Snapshot};
+use ve_plugin_host::Registry;
+use ve_ports::{AudioBlock, ColorTags, EncoderSettings, FrameData, PixelFormat, Platform, VideoFrame};
+use ve_render::{Compositor, Quality};
+use ve_time::Time;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportPreset {
+    H264Mp4,
+    HevcMp4,
+    ProResMov,
+}
+
+impl ExportPreset {
+    pub const ALL: [ExportPreset; 3] = [ExportPreset::H264Mp4, ExportPreset::HevcMp4, ExportPreset::ProResMov];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ExportPreset::H264Mp4 => "H.264 (MP4)",
+            ExportPreset::HevcMp4 => "HEVC (MP4)",
+            ExportPreset::ProResMov => "Apple ProRes 422 HQ (MOV)",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportPreset::ProResMov => "mov",
+            _ => "mp4",
+        }
+    }
+
+    fn codec(self) -> &'static str {
+        match self {
+            ExportPreset::H264Mp4 => "h264",
+            ExportPreset::HevcMp4 => "hevc",
+            ExportPreset::ProResMov => "prores",
+        }
+    }
+}
+
+/// A running export, shared with whoever shows its progress.
+pub struct ExportState {
+    pub name: String,
+    pub total: u64,
+    done: AtomicU64,
+    cancel: AtomicBool,
+    result: Mutex<Option<Result<(), String>>>,
+}
+
+impl ExportState {
+    pub fn progress(&self) -> f32 {
+        self.done.load(Ordering::Relaxed) as f32 / self.total.max(1) as f32
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// `Some` once finished (or failed, or cancelled).
+    pub fn result(&self) -> Option<Result<(), String>> {
+        self.result.lock().unwrap().clone()
+    }
+}
+
+const SAMPLE_RATE: u32 = 48_000;
+
+/// Start exporting `project`'s active sequence to `out`.
+pub fn start(
+    project: Snapshot,
+    platform: Platform,
+    registry: Arc<Registry>,
+    pool: Arc<VideoPool>,
+    gpu: (wgpu::Device, wgpu::Queue),
+    preset: ExportPreset,
+    out: MediaRef,
+) -> Arc<ExportState> {
+    let seq = project.active().cloned();
+    let rate = seq.as_ref().map(|s| s.format.rate).unwrap_or(ve_time::Rate::FPS_24);
+    let duration = seq.as_ref().map(|s| s.duration()).unwrap_or(Time::ZERO);
+    // Every frame that starts before the end.
+    let last = duration - Time(1);
+    let total = if duration > Time::ZERO { last.to_frame(rate) as u64 + 1 } else { 0 };
+    let state = Arc::new(ExportState {
+        name: platform.storage.display_name(&out),
+        total,
+        done: AtomicU64::new(0),
+        cancel: AtomicBool::new(false),
+        result: Mutex::new(None),
+    });
+    let st = state.clone();
+    std::thread::Builder::new()
+        .name("ve-export".into())
+        .spawn(move || {
+            let r = run(&project, &platform, &registry, &pool, &gpu, preset, &out, &st);
+            if r.is_err() || st.cancel.load(Ordering::Relaxed) {
+                // Leave no half-written file behind.
+                if let Ok(res) = platform.storage.resolve_new(&out) {
+                    if let Some(p) = res.path {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
+            let r = if st.cancel.load(Ordering::Relaxed) { Err("cancelled".into()) } else { r };
+            *st.result.lock().unwrap() = Some(r);
+        })
+        .expect("export thread");
+    state
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    project: &Snapshot,
+    platform: &Platform,
+    registry: &Registry,
+    pool: &Arc<VideoPool>,
+    (device, queue): &(wgpu::Device, wgpu::Queue),
+    preset: ExportPreset,
+    out: &MediaRef,
+    state: &ExportState,
+) -> Result<(), String> {
+    let seq = project.active().cloned().ok_or("no sequence to export")?;
+    if state.total == 0 {
+        return Err("the sequence is empty".into());
+    }
+    let _awake = platform.system.begin_background_task("Exporting");
+    let f = &seq.format;
+    let settings = EncoderSettings {
+        video_codec: preset.codec().into(),
+        audio_codec: "aac".into(),
+        container: preset.extension().into(),
+        width: f.width,
+        height: f.height,
+        rate: f.rate,
+        sample_rate: SAMPLE_RATE,
+        channels: 2,
+        video_bitrate: None,
+        prefer_hardware: true,
+    };
+    let target = platform.storage.resolve_new(out).map_err(|e| e.to_string())?;
+    let mut enc = platform.media.open_encoder(&target, &settings).map_err(|e| e.to_string())?;
+    let mut comp = Compositor::new(device);
+    let mut mixer = Mixer::new(platform.storage.clone(), platform.media.clone(), SAMPLE_RATE);
+    let samples_at = |t: Time| (t.ticks() as i128 * SAMPLE_RATE as i128 / ve_time::TICKS_PER_SECOND as i128) as usize;
+    let mut audio = Vec::new();
+    for i in 0..state.total {
+        if state.cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let t = f.rate.frame_to_time(i as i64);
+        let plan = ve_render::evaluate(&seq, t, Quality::FULL);
+        let frame = crate::frame::resolve(project, plan, registry, pool, Some(Duration::from_secs(20)));
+        comp.render(device, queue, &frame.plan, &frame.layers, frame.seq_size, frame.space);
+        let (w, h, px) = comp.read_output(device, queue).ok_or("could not read the rendered frame")?;
+        enc.push_video(VideoFrame {
+            pts: t,
+            duration: f.rate.frame_duration(),
+            width: w,
+            height: h,
+            format: PixelFormat::Rgba8,
+            color: ColorTags::default(),
+            data: FrameData::Cpu { planes: vec![px], strides: vec![w as usize * 4] },
+        })
+        .map_err(|e| e.to_string())?;
+        // This frame's share of the audio, counted in whole samples from zero.
+        let next = f.rate.frame_to_time(i as i64 + 1);
+        let n = samples_at(next) - samples_at(t);
+        audio.resize(n * 2, 0.0);
+        mixer.render(project, &seq, t, &mut audio);
+        enc.push_audio(AudioBlock { pts: t, sample_rate: SAMPLE_RATE, channels: 2, samples: audio.clone() }).map_err(|e| e.to_string())?;
+        state.done.store(i + 1, Ordering::Relaxed);
+    }
+    enc.finish().map_err(|e| e.to_string())
+}

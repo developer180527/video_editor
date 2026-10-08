@@ -1,0 +1,11 @@
+[package]
+name = "ve_plugin_abi"
+description = "The native plugin C ABI (include/ve_plugin.h) and its Rust mirror."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+links = "ve_abi_layout"
+
+[build-dependencies]
+cc = "1"

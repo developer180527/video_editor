@@ -1,0 +1,7 @@
+/target
+.DS_Store
+# Third-party sources are fetched by scripts/fetch_third_party.sh at the
+# commits in third_party/PINS; build output goes to third_party/_build.
+/third_party/*
+!/third_party/PINS
+!/third_party/README.md

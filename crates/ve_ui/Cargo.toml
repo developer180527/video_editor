@@ -1,0 +1,21 @@
+[package]
+name = "ve_ui"
+description = "The editor's panels, built on libgui. A client of ve_engine; knows nothing of the OS."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_time.workspace = true
+ve_model.workspace = true
+ve_engine.workspace = true
+ve_render.workspace = true
+libgui.workspace = true
+libgui_wgpu.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+platform_headless.workspace = true
+libgui_soft = { path = "../../third_party/libgui/crates/libgui_soft" }
+png = "0.18"

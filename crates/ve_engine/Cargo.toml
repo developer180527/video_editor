@@ -1,0 +1,28 @@
+[package]
+name = "ve_engine"
+description = "The engine's one public door: commands in; snapshots, frames and events out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_time.workspace = true
+ve_model.workspace = true
+ve_command.workspace = true
+ve_ports.workspace = true
+ve_render.workspace = true
+ve_playback.workspace = true
+ve_plugin_host.workspace = true
+ve_media.workspace = true
+wgpu.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+platform_headless.workspace = true
+media_ffmpeg.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+png = "0.18"

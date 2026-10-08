@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+# Vendored sources keep their own workspaces.
+exclude = ["third_party"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# libgui's GPU crates need 1.90.
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Ours
+ve_time = { path = "crates/ve_time" }
+ve_model = { path = "crates/ve_model" }
+ve_command = { path = "crates/ve_command" }
+ve_ports = { path = "crates/ve_ports" }
+ve_render = { path = "crates/ve_render" }
+ve_playback = { path = "crates/ve_playback" }
+ve_plugin_abi = { path = "crates/ve_plugin_abi" }
+ve_plugin_host = { path = "crates/ve_plugin_host" }
+ve_engine = { path = "crates/ve_engine" }
+ve_builtins = { path = "crates/ve_builtins" }
+ve_media = { path = "crates/ve_media" }
+ve_ui = { path = "crates/ve_ui" }
+media_ffmpeg = { path = "crates/media_ffmpeg" }
+platform_winit = { path = "crates/platform_winit" }
+platform_desktop = { path = "crates/platform_desktop" }
+platform_ios = { path = "crates/platform_ios" }
+platform_headless = { path = "crates/platform_headless" }
+audio_cpal = { path = "crates/audio_cpal" }
+
+# libgui, vendored at the commit in third_party/PINS
+libgui = { path = "third_party/libgui/crates/libgui" }
+libgui_keymap = { path = "third_party/libgui/crates/libgui_keymap" }
+libgui_wgpu = { path = "third_party/libgui/crates/libgui_wgpu" }
+libgui_winit = { path = "third_party/libgui/crates/libgui_winit" }
+
+# Versions follow libgui's workspace so there is one wgpu and one winit.
+wgpu = "30"
+winit = "0.30"
+pollster = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+crossbeam-channel = "0.5"
+libloading = "0.9"
+cpal = "0.18"
+dirs = "7"
+arboard = { version = "3", default-features = false }
+objc2 = "0.5"
+rfd = "0.17"
+rtrb = "0.4"
+bindgen = "0.72"
+imbl = { version = "7", features = ["serde"] }
+ulid = { version = "3", features = ["serde", "std"] }
+
+[profile.dev.package."*"]
+opt-level = 2

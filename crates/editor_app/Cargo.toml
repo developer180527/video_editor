@@ -1,0 +1,15 @@
+[package]
+name = "editor_app"
+description = "Glue between the editor UI and the shell: dialogs, docking windows, the engine waker. Shared by the desktop and iPad apps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_engine.workspace = true
+ve_model.workspace = true
+ve_ui.workspace = true
+platform_winit.workspace = true
+libgui.workspace = true
+libgui_wgpu.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "ve_playback"
+description = "Transport and the playback clock, slaved to the audio device."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_time.workspace = true

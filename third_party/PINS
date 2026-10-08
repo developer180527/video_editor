@@ -1,0 +1,7 @@
+# name          url                                                         ref
+libgui          https://github.com/developer180527/libgui                   da04dc826772e0cdfff5287b395a5af377dfc4ff
+ffmpeg          https://github.com/FFmpeg/FFmpeg                            n9.0.2
+opencolorio     https://github.com/AcademySoftwareFoundation/OpenColorIO    v2.6.0
+opentimelineio  https://github.com/AcademySoftwareFoundation/OpenTimelineIO v0.18.1
+openfx          https://github.com/AcademySoftwareFoundation/openfx         OFX_Release_1.5.1
+clap            https://github.com/free-audio/clap                          1.2.10

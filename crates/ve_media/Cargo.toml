@@ -1,0 +1,17 @@
+[package]
+name = "ve_media"
+description = "The media engine: background video decode with a frame cache, and the audio mixer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_time.workspace = true
+ve_model.workspace = true
+ve_ports.workspace = true
+rtrb.workspace = true
+
+[dev-dependencies]
+media_ffmpeg.workspace = true
+platform_headless.workspace = true

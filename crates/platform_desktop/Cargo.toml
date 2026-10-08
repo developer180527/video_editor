@@ -1,0 +1,14 @@
+[package]
+name = "platform_desktop"
+description = "Ports for macOS, Windows and Linux: files, plugin folders, dlopen, child processes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_ports.workspace = true
+platform_headless.workspace = true
+audio_cpal.workspace = true
+libloading.workspace = true
+dirs.workspace = true

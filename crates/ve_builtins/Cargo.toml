@@ -1,0 +1,15 @@
+[package]
+name = "ve_builtins"
+description = "Plugins that ship inside the app, linked statically through the public plugin ABI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_ports.workspace = true
+ve_plugin_abi.workspace = true
+ve_plugin_host.workspace = true
+
+[build-dependencies]
+cc = "1"

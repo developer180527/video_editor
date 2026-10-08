@@ -1,0 +1,16 @@
+[package]
+name = "ve_plugin_host"
+description = "Finds, loads and runs plugins: native ve ABI, OpenFX, CLAP, WASM add-ons, out-of-process add-ons."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_model.workspace = true
+ve_ports.workspace = true
+ve_plugin_abi.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ve_builtins.workspace = true

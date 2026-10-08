@@ -1,0 +1,18 @@
+[package]
+name = "ve_render"
+description = "What a frame is made of (evaluation) and how it is drawn (the wgpu compositor)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ve_time.workspace = true
+ve_model.workspace = true
+ve_ports.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+
+[dev-dependencies]
+ve_builtins.workspace = true
+ve_plugin_host.workspace = true
