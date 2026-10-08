@@ -162,3 +162,75 @@ fn encode_prores_mov_round_trips() {
     let info = encode("prores", "mov");
     assert_eq!(info.video.unwrap().codec, "prores");
 }
+
+/// A clip made by the `ffmpeg` CLI into the test temp dir, or `None`.
+fn made(name: &str, args: &[&str]) -> Option<Resolved> {
+    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let ok = Command::new("ffmpeg").args(["-y", "-loglevel", "error"]).args(args).arg(&p).status().is_ok_and(|s| s.success());
+    ok.then(|| Resolved { path: Some(p), guard: Box::new(()) })
+}
+
+fn first_yuv(r: Resolved) -> (u8, u8, u8, ve_ports::ColorTags) {
+    let mut d = Ffmpeg::new().open_video(&r).unwrap();
+    let f = d.next_frame().unwrap().unwrap();
+    let ve_ports::FrameData::Cpu { planes, strides } = &f.data else { panic!() };
+    let (x, y) = (100, 100);
+    (planes[0][y * strides[0] + x], planes[1][(y / 2) * strides[1] + x], planes[1][(y / 2) * strides[1] + x + 1], f.color)
+}
+
+/// An MPEG-TS starts its clock at 1.4 s: source time 0 is still its first
+/// frame and first sound, and the whole duration is reachable.
+#[test]
+fn timestamps_start_at_the_file_start() {
+    let Some(r) = made("start.ts", &["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=4", "-f", "lavfi", "-i", "sine=duration=4", "-c:v", "mpeg2video", "-c:a", "mp2"]) else {
+        return eprintln!("skipped: no ffmpeg CLI");
+    };
+    let ff = Ffmpeg::new();
+    let mut v = ff.open_video(&r).unwrap();
+    let first = v.next_frame().unwrap().unwrap().pts;
+    assert!(first.as_seconds_f64().abs() < 0.05, "first frame at {:.3} s", first.as_seconds_f64());
+    // Every time in the clip, near its end too, finds the frame showing then.
+    for t in [Time::from_seconds(2), Rate::FPS_25.frame_to_time(99)] {
+        v.seek(t).unwrap();
+        let f = v.next_frame().unwrap().unwrap();
+        assert!(f.pts <= t && t < f.pts + f.duration, "{:.3} s for {:.3} s", f.pts.as_seconds_f64(), t.as_seconds_f64());
+    }
+    let mut a = ff.open_audio(&r, 48_000, 2).unwrap();
+    let b = a.next_block().unwrap().unwrap();
+    assert!(b.pts.as_seconds_f64().abs() < 0.1, "first sound at {:.3} s", b.pts.as_seconds_f64());
+}
+
+/// Seeking past the end gives the last frame, not nothing.
+#[test]
+fn seek_past_the_end_gives_the_last_frame() {
+    let Some(r) = made("short.mov", &["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=1", "-c:v", "mpeg4"]) else {
+        return eprintln!("skipped: no ffmpeg CLI");
+    };
+    let mut v = Ffmpeg::new().open_video(&r).unwrap();
+    v.seek(Time::from_seconds(5)).unwrap();
+    assert_eq!(v.next_frame().unwrap().unwrap().pts.to_frame(Rate::FPS_25), 24);
+}
+
+/// RGB sources are converted with, and tagged as, BT.709 limited range.
+#[test]
+fn rgb_sources_are_tagged_as_converted() {
+    let Some(r) = made("red.mov", &["-f", "lavfi", "-i", "color=c=red:size=1920x1080:rate=25:duration=0.2", "-c:v", "qtrle", "-pix_fmt", "rgb24"]) else {
+        return eprintln!("skipped: no ffmpeg CLI");
+    };
+    let (y, cb, cr, tags) = first_yuv(r);
+    assert_eq!(tags.matrix, "bt709");
+    assert!(!tags.full_range);
+    // BT.709 limited-range red is 63/102/240 (BT.601 would be 81/90/240).
+    assert!((y as i32 - 63).abs() <= 1 && (cb as i32 - 102).abs() <= 1 && (cr as i32 - 240).abs() <= 1, "{y}/{cb}/{cr}");
+}
+
+/// A full-range source converted to NV12 stays full range, and says so.
+#[test]
+fn full_range_survives_conversion() {
+    let Some(r) = made("full.mov", &["-f", "lavfi", "-i", "color=c=white:size=320x180:rate=25:duration=0.2", "-c:v", "mjpeg", "-pix_fmt", "yuvj422p"]) else {
+        return eprintln!("skipped: no ffmpeg CLI");
+    };
+    let (y, _, _, tags) = first_yuv(r);
+    assert!(tags.full_range, "{tags:?}");
+    assert!(y >= 250, "white is {y} in a full-range frame");
+}

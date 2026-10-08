@@ -67,6 +67,39 @@ impl Storage for FileStorage {
         Ok(Box::new(File::create(p)?))
     }
 
+    /// Write a temporary file beside the target, flush it to disk, then
+    /// rename it over the target (atomic on one file system).
+    fn write_atomic(&self, r: &MediaRef, data: &[u8]) -> Result<(), StorageError> {
+        let p = Self::path_of(r)?;
+        let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
+        std::fs::create_dir_all(&dir)?;
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+        let written = (|| -> std::io::Result<()> {
+            let mut f = File::create(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &p)?;
+            // Make the rename itself durable (best effort: not every
+            // platform can open a directory).
+            if let Ok(d) = File::open(&dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Ok(written?)
+    }
+
+    fn remove(&self, r: &MediaRef) -> Result<(), StorageError> {
+        match std::fs::remove_file(Self::path_of(r)?) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
     fn location(&self, loc: Location, name: &str) -> Result<MediaRef, StorageError> {
         let dir = match loc {
             Location::Cache => &self.cache,

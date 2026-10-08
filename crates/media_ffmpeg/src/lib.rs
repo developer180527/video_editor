@@ -67,6 +67,19 @@ impl Input {
         Ok(input)
     }
 
+    /// Where the file's timeline starts. Stream timestamps are measured from
+    /// here, so source time 0 is the first picture or sound in the file
+    /// (an MPEG-TS often starts at 1.4 s; a camera file at its timecode),
+    /// and audio and video keep their offset to each other.
+    fn origin(&self) -> ve_time::Time {
+        let start = unsafe { (*self.0).start_time };
+        if start == i64::MIN {
+            ve_time::Time::ZERO // AV_NOPTS_VALUE
+        } else {
+            to_time(start, sys::AVRational { num: 1, den: sys::AV_TIME_BASE as i32 })
+        }
+    }
+
     fn streams(&self) -> &[*mut sys::AVStream] {
         unsafe { std::slice::from_raw_parts((*self.0).streams, (*self.0).nb_streams as usize) }
     }

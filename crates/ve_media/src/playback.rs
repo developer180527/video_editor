@@ -5,6 +5,11 @@
 //! locks, no allocation, no decoding on the real-time thread. Restarting
 //! (play from elsewhere, an edit) bumps a generation number; the callback
 //! drops samples of an old generation.
+//!
+//! [`Playback::clock`] counts only the mixed samples the callback actually
+//! delivered — not the silence it plays while the mixer starts up or falls
+//! behind. That count is the playhead's clock, so the picture waits for the
+//! sound instead of running ahead of it.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,7 +17,7 @@ use std::time::Duration;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 use ve_model::{SequenceId, Snapshot};
-use ve_ports::RenderCallback;
+use ve_ports::{AudioClock, RenderCallback};
 use ve_time::Time;
 
 use crate::Mixer;
@@ -43,6 +48,7 @@ struct Shared {
 pub struct Playback {
     shared: Arc<Shared>,
     pub meters: Arc<Meters>,
+    clock: Arc<AudioClock>,
     rate: u32,
 }
 
@@ -56,21 +62,28 @@ impl Playback {
         let (prod, cons) = RingBuffer::<(u64, [f32; 2])>::new(rate as usize / 2);
         let shared = Arc::new(Shared { job: Mutex::new(None), generation: AtomicU64::new(0), playing: AtomicBool::new(false), quit: AtomicBool::new(false) });
         let meters = Arc::new(Meters::default());
+        let clock = Arc::new(AudioClock::new());
         let s = shared.clone();
         std::thread::Builder::new().name("ve-mixer".into()).spawn(move || mix_thread(mixer, prod, s)).expect("mixer thread");
-        let callback = make_callback(cons, shared.clone(), meters.clone(), channels as usize);
-        (Playback { shared, meters, rate }, callback)
+        let callback = make_callback(cons, shared.clone(), meters.clone(), clock.clone(), channels as usize);
+        (Playback { shared, meters, clock, rate }, callback)
     }
 
     pub fn rate(&self) -> u32 {
         self.rate
     }
 
+    /// Mixed frames heard so far: the clock the playhead follows.
+    pub fn clock(&self) -> Arc<AudioClock> {
+        self.clock.clone()
+    }
+
     /// Play `seq` of `project` from `at` (restarts if already playing).
     pub fn play(&self, project: Snapshot, seq: SequenceId, at: Time) {
         let g = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.shared.job.lock().unwrap() = Some((project, seq, at, g));
+        // `playing` first: the mixer drops a job it finds while not playing.
         self.shared.playing.store(true, Ordering::SeqCst);
+        *self.shared.job.lock().unwrap() = Some((project, seq, at, g));
     }
 
     pub fn stop(&self) {
@@ -118,19 +131,25 @@ fn mix_thread(mut mixer: Mixer, mut prod: Producer<(u64, [f32; 2])>, s: Arc<Shar
     }
 }
 
-fn make_callback(mut cons: Consumer<(u64, [f32; 2])>, s: Arc<Shared>, meters: Arc<Meters>, channels: usize) -> RenderCallback {
+fn make_callback(mut cons: Consumer<(u64, [f32; 2])>, s: Arc<Shared>, meters: Arc<Meters>, clock: Arc<AudioClock>, channels: usize) -> RenderCallback {
     Box::new(move |out: &mut [f32]| {
         let g = s.generation.load(Ordering::Relaxed);
         let playing = s.playing.load(Ordering::Relaxed);
         let (mut pl, mut pr) = (0f32, 0f32);
+        let mut heard = 0u64;
         for frame in out.chunks_mut(channels) {
             let mut sample = [0f32; 2];
             if playing {
-                // Skip samples from before the last restart.
+                // Skip samples from before the last restart; keep any from
+                // a restart newer than this callback's view.
                 while let Ok((sg, v)) = cons.peek().copied() {
+                    if sg > g {
+                        break;
+                    }
                     let _ = cons.pop();
                     if sg == g {
                         sample = v;
+                        heard += 1;
                         break;
                     }
                 }
@@ -148,6 +167,8 @@ fn make_callback(mut cons: Consumer<(u64, [f32; 2])>, s: Arc<Shared>, meters: Ar
                 }
             }
         }
+        let frames = (out.len() / channels.max(1)) as u64;
+        clock.tick(heard, frames > 0 && heard == frames);
         meters.left.store(pl.to_bits(), Ordering::Relaxed);
         meters.right.store(pr.to_bits(), Ordering::Relaxed);
     })

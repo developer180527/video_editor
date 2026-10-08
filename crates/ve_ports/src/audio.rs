@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -19,6 +19,10 @@ pub fn clock_now() -> Duration {
 pub struct AudioClock {
     frames: AtomicU64,
     stamp_ns: AtomicU64,
+    /// The last callback was full of counted frames, so the count is moving
+    /// and may be extrapolated. A stalled count (an underrun, a restart
+    /// filling up) must not be: extrapolating it would run ahead of the sound.
+    live: AtomicBool,
 }
 
 impl AudioClock {
@@ -28,14 +32,27 @@ impl AudioClock {
 
     /// The device took `n` more frames, now. Real-time safe.
     pub fn advance(&self, n: u64) {
-        self.stamp_ns.store(clock_now().as_nanos() as u64, Ordering::Release);
-        self.frames.fetch_add(n, Ordering::AcqRel);
+        self.tick(n, true);
     }
 
-    /// Frames so far, and when the count last moved (on [`clock_now`]'s epoch).
+    /// A callback counted `n` frames; `live` when that was the whole buffer.
+    /// Real-time safe.
+    pub fn tick(&self, n: u64, live: bool) {
+        self.stamp_ns.store(clock_now().as_nanos() as u64, Ordering::Release);
+        self.frames.fetch_add(n, Ordering::AcqRel);
+        self.live.store(live, Ordering::Release);
+    }
+
+    /// Frames so far, and when the count last moved (on [`clock_now`]'s
+    /// epoch). A stalled count is stamped "now", so readers do not
+    /// extrapolate it.
     pub fn read(&self) -> (u64, Duration) {
         let frames = self.frames.load(Ordering::Acquire);
-        let at = Duration::from_nanos(self.stamp_ns.load(Ordering::Acquire));
+        let at = if self.live.load(Ordering::Acquire) {
+            Duration::from_nanos(self.stamp_ns.load(Ordering::Acquire))
+        } else {
+            clock_now()
+        };
         (frames, at)
     }
 }

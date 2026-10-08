@@ -1,8 +1,11 @@
 //! Export: render every frame of the active sequence, mix its audio, encode.
 //!
-//! Runs on its own thread with its own compositor on the shared GPU device.
-//! Frames are waited for (exact, never "nearest"); audio is mixed offline,
-//! sample-accurately, frame by frame, so picture and sound cannot drift.
+//! Runs on its own thread with its own compositor on the shared GPU device,
+//! and its own decoders: sharing the preview's would make the two fight over
+//! where each source is positioned. Frames are waited for (exact, never
+//! "nearest") and a frame that cannot be made fails the export rather than
+//! leaving a hole; audio is mixed offline, sample-accurately, frame by frame,
+//! so picture and sound cannot drift.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,12 +78,14 @@ impl ExportState {
 
 const SAMPLE_RATE: u32 = 48_000;
 
+/// How long to wait for one decoded frame before giving up.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Start exporting `project`'s active sequence to `out`.
 pub fn start(
     project: Snapshot,
     platform: Platform,
     registry: Arc<Registry>,
-    pool: Arc<VideoPool>,
     gpu: (wgpu::Device, wgpu::Queue),
     preset: ExportPreset,
     out: MediaRef,
@@ -102,7 +107,10 @@ pub fn start(
     std::thread::Builder::new()
         .name("ve-export".into())
         .spawn(move || {
+            let budget = (platform.capabilities().memory_budget / 8) as usize;
+            let pool = VideoPool::new(platform.storage.clone(), platform.media.clone(), budget);
             let r = run(&project, &platform, &registry, &pool, &gpu, preset, &out, &st);
+            drop(pool);
             if r.is_err() || st.cancel.load(Ordering::Relaxed) {
                 // Leave no half-written file behind.
                 if let Ok(res) = platform.storage.resolve_new(&out) {
@@ -159,7 +167,11 @@ fn run(
         }
         let t = f.rate.frame_to_time(i as i64);
         let plan = ve_render::evaluate(&seq, t, Quality::FULL);
-        let frame = crate::frame::resolve(project, plan, registry, pool, Some(Duration::from_secs(20)));
+        let frame = crate::frame::resolve(project, plan, registry, pool, Some(FRAME_TIMEOUT));
+        if let Some(why) = frame.missing.first() {
+            let tc = ve_time::Timecode::from_time(t, f.rate, f.rate.is_drop_frame_rate());
+            return Err(format!("frame {tc}: {why}"));
+        }
         comp.render(device, queue, &frame.plan, &frame.layers, frame.seq_size, frame.space);
         let (w, h, px) = comp.read_output(device, queue).ok_or("could not read the rendered frame")?;
         enc.push_video(VideoFrame {

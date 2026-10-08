@@ -180,3 +180,62 @@ fn snap_points_skip_dragged_clips() {
     let pts = snap_points(f.p.sequence(f.seq).unwrap(), &[b.id], s(9));
     assert_eq!(pts, [s(0), s(3), s(9)]);
 }
+
+/// A clip of source [10, 30) at 0 with an opacity ramp keyed 0→100 over
+/// clip time [2 s, 6 s) — source [12, 16).
+fn keyed(f: &F, start: i64) -> Arc<Clip> {
+    let mut c = (*clip(f, start, 10, 20)).clone();
+    let key = |t: i64, v: f64| Keyframe { time: s(t), value: Value::Float(v), interp: Interp::Linear };
+    let mut params = OrdMap::new();
+    params.insert("opacity".to_string(), Param::Animated(vec![key(2, 0.0), key(6, 100.0)]));
+    let plugin = PluginRef { api: PluginApi::Builtin, id: "ve.opacity".into(), major_version: 1 };
+    c.effects.push_back(Arc::new(Effect { id: EffectId::new(), plugin, enabled: true, params }));
+    Arc::new(c)
+}
+
+/// Opacity of `id` at source time `src` (seconds).
+fn opacity_at_source(p: &Project, id: ClipId, src: i64) -> Value {
+    let (_, _, c) = p.find_clip(id).unwrap();
+    c.effects[0].params["opacity"].value_at(s(src) - c.source_range.start)
+}
+
+#[test]
+fn keyframes_stay_on_their_source_frames_through_head_trims() {
+    let mut f = fixture();
+    let c = keyed(&f, 0);
+    put(&mut f, true, &c);
+    let before: Vec<Value> = (12..=16).map(|src| opacity_at_source(&f.p, c.id, src)).collect();
+    // Plain head trim, ripple head trim, and a roll that moves the right
+    // clip's head: every source frame keeps its value.
+    let trims = [
+        Command::TrimClip { clip: c.id, edge: Edge::Start, delta: s(1) },
+        ripple_trim(&f.p, c.id, Edge::Start, s(1), false).unwrap(),
+    ];
+    for cmd in trims {
+        let p = run(&f, cmd);
+        let after: Vec<Value> = (12..=16).map(|src| opacity_at_source(&p, c.id, src)).collect();
+        assert_eq!(after, before);
+    }
+    let mut g = fixture();
+    let left = clip(&g, 0, 0, 5);
+    put(&mut g, true, &left);
+    let right = keyed(&g, 5);
+    put(&mut g, true, &right);
+    let before: Vec<Value> = (12..=16).map(|src| opacity_at_source(&g.p, right.id, src)).collect();
+    let p = run(&g, roll(&g.p, left.id, right.id, s(1)).unwrap());
+    let after: Vec<Value> = (12..=16).map(|src| opacity_at_source(&p, right.id, src)).collect();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn razor_and_head_trim_agree() {
+    // Razor at clip time 3 s, or trim the head by 3 s: same keys either way.
+    let mut f = fixture();
+    let c = keyed(&f, 0);
+    put(&mut f, true, &c);
+    let cut = run(&f, razor(&f.p, &[c.id], s(3), false).unwrap());
+    let right = cut.sequence(f.seq).unwrap().track(f.v1).unwrap().1.clips[1].clone();
+    let trimmed = run(&f, Command::TrimClip { clip: c.id, edge: Edge::Start, delta: s(3) });
+    let (_, _, t) = trimmed.find_clip(c.id).unwrap();
+    assert_eq!(right.effects[0].params, t.effects[0].params);
+}

@@ -107,3 +107,31 @@ fn quad_maths() {
     let r = quad(&Motion { rotation: 90.0, anchor: [540.0, 540.0], ..m }, (1080.0, 1080.0), (1920.0, 1080.0));
     assert!((r[0][1] - 1.0).abs() < 1e-4);
 }
+
+/// A full-range NV12 grey at `code`/255 with the given transfer, in BT.2020.
+fn hdr_gray(code: u8, transfer: &str) -> Arc<VideoFrame> {
+    let (w, h) = (64u32, 36u32);
+    Arc::new(VideoFrame {
+        pts: Time::ZERO,
+        duration: Time::from_seconds(1),
+        width: w,
+        height: h,
+        format: PixelFormat::Nv12,
+        color: ColorTags { primaries: "bt2020".into(), transfer: transfer.into(), matrix: "bt2020nc".into(), full_range: true },
+        data: FrameData::Cpu { planes: vec![vec![code; (w * h) as usize], vec![128; (w * h / 2) as usize]], strides: vec![w as usize, w as usize] },
+    })
+}
+
+#[test]
+fn hdr_reference_white_is_display_white() {
+    let shade = |f| render(&[layer(f, 100.0, 1.0)], WorkingSpace::AcesCg).map(|img| px(&img, 32, 18)[1]);
+    // HLG 75% is reference white: near the top, not two stops down (~146).
+    let Some(hlg) = shade(hdr_gray(191, "arib-std-b67")) else { return eprintln!("skipped: no GPU") };
+    assert!((238..=252).contains(&hlg), "HLG reference white shows as {hlg}");
+    // PQ 100 cd/m² is half of reference white: mid-grey, not clipped (255).
+    let pq = shade(hdr_gray(130, "smpte2084")).unwrap();
+    assert!((185..=197).contains(&pq), "PQ 100 cd/m² shows as {pq}");
+    // PQ 1000 cd/m² highlights roll off into range rather than clip hard.
+    let bright = shade(hdr_gray(192, "smpte2084")).unwrap();
+    assert!(bright >= 250, "PQ 1000 cd/m² shows as {bright}");
+}

@@ -159,10 +159,19 @@ pub struct VideoDec {
     input: Input,
     stream: usize,
     tb: sys::AVRational,
+    /// The file's start: subtracted from every timestamp.
+    origin: Time,
     frame_dur: Time,
     sw: *mut sys::AVFrame,
     sws: *mut sys::SwsContext,
     skip_until: Option<Time>,
+    /// The last frame skipped on the way to a seek target, kept so a seek
+    /// past the end still yields a picture (the last one).
+    held: *mut sys::AVFrame,
+    /// Where the last seek went in the file, and how far back the next
+    /// retry goes, while a seek is being made good (see `retry`).
+    sought: Time,
+    backoff: Time,
     pub hardware: bool,
 }
 
@@ -181,23 +190,28 @@ impl VideoDec {
         let st = input.streams()[stream];
         let (tb, r) = unsafe { ((*st).time_base, if (*st).avg_frame_rate.num > 0 { (*st).avg_frame_rate } else { (*st).r_frame_rate }) };
         let rate = if r.num > 0 && r.den > 0 { Rate::new(r.num as u32, r.den as u32) } else { Rate::FPS_24 };
+        let origin = input.origin();
         Ok(VideoDec {
             codec,
             input,
             stream,
             tb,
+            origin,
             frame_dur: rate.frame_duration(),
             sw: unsafe { sys::av_frame_alloc() },
             sws: ptr::null_mut(),
             skip_until: None,
+            held: unsafe { sys::av_frame_alloc() },
+            sought: Time::ZERO,
+            backoff: Time::ZERO,
             hardware,
         })
     }
 
-    /// The decoded frame as NV12 or P010, copied out of FFmpeg.
-    fn convert(&mut self) -> Result<VideoFrame, MediaError> {
+    /// Decoded frame `decoded` as NV12 or P010, copied out of FFmpeg.
+    fn convert(&mut self, decoded: *mut sys::AVFrame) -> Result<VideoFrame, MediaError> {
         unsafe {
-            let mut src = self.codec.frame;
+            let mut src = decoded;
             if (*src).format == sys::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as c_int {
                 sys::av_frame_unref(self.sw);
                 let r = sys::av_hwframe_transfer_data(self.sw, src, 0);
@@ -209,6 +223,7 @@ impl VideoDec {
             let fmt: sys::AVPixelFormat = std::mem::transmute((*src).format);
             let desc = sys::av_pix_fmt_desc_get(fmt);
             let deep = !desc.is_null() && (*desc).comp[0].depth > 8;
+            let rgb = !desc.is_null() && (*desc).flags & sys::AV_PIX_FMT_FLAG_RGB as u64 != 0;
             let (want, out_fmt) = if deep {
                 (sys::AVPixelFormat::AV_PIX_FMT_P010LE, PixelFormat::P010)
             } else {
@@ -225,6 +240,22 @@ impl VideoDec {
                 (*dst).width = (*src).width;
                 (*dst).height = (*src).height;
                 (*dst).format = want as c_int;
+                // Say exactly what the YUV should be, so the tags handed on
+                // describe the pixels: RGB becomes BT.709 limited range;
+                // YUV keeps its matrix and range (a full-range source stays
+                // full range). Primaries and transfer are never converted.
+                (*dst).color_primaries = (*src).color_primaries;
+                (*dst).color_trc = (*src).color_trc;
+                if rgb {
+                    (*dst).colorspace = sys::AVColorSpace::AVCOL_SPC_BT709;
+                    (*dst).color_range = sys::AVColorRange::AVCOL_RANGE_MPEG;
+                } else {
+                    (*dst).colorspace = (*src).colorspace;
+                    (*dst).color_range = match (*src).color_range {
+                        sys::AVColorRange::AVCOL_RANGE_UNSPECIFIED => sys::AVColorRange::AVCOL_RANGE_MPEG,
+                        r => r,
+                    };
+                }
                 let r = sys::sws_scale_frame(self.sws, dst, src);
                 if r < 0 {
                     sys::av_frame_free(&mut dst);
@@ -241,20 +272,23 @@ impl VideoDec {
                 planes.push(std::slice::from_raw_parts((*ready).data[i], stride * n).to_vec());
                 strides.push(stride);
             }
-            let f = self.codec.frame;
+            let f = decoded;
             let pts = if (*f).best_effort_timestamp != NOPTS { (*f).best_effort_timestamp } else { (*f).pts };
             let dur = if (*f).duration > 0 { to_time((*f).duration, self.tb) } else { self.frame_dur };
+            // The tags of the pixels handed out: the converted frame's when
+            // there was a conversion.
+            let tagged = ready;
             let color = ColorTags {
-                primaries: name(sys::av_color_primaries_name((*f).color_primaries)),
-                transfer: name(sys::av_color_transfer_name((*f).color_trc)),
-                matrix: name(sys::av_color_space_name((*f).colorspace)),
-                full_range: (*f).color_range == sys::AVColorRange::AVCOL_RANGE_JPEG,
+                primaries: name(sys::av_color_primaries_name((*tagged).color_primaries)),
+                transfer: name(sys::av_color_transfer_name((*tagged).color_trc)),
+                matrix: name(sys::av_color_space_name((*tagged).colorspace)),
+                full_range: (*tagged).color_range == sys::AVColorRange::AVCOL_RANGE_JPEG,
             };
             if !dst.is_null() {
                 sys::av_frame_free(&mut dst);
             }
             Ok(VideoFrame {
-                pts: to_time(pts, self.tb),
+                pts: to_time(pts, self.tb) - self.origin,
                 duration: dur,
                 width: w,
                 height: h,
@@ -266,10 +300,28 @@ impl VideoDec {
     }
 }
 
+impl VideoDec {
+    /// While a seek target has produced nothing at or before it, seek
+    /// further back (1 s, 2 s, 4 s … down to the file's start) and decode
+    /// forward again. Some demuxers (MPEG-TS) seek to any packet, not a key
+    /// frame, so decoding from there yields nothing until the next one.
+    fn retry(&mut self) -> Result<bool, MediaError> {
+        let Some(target) = self.skip_until else { return Ok(false) };
+        if unsafe { !(*self.held).buf[0].is_null() } || self.sought <= Time::ZERO {
+            return Ok(false);
+        }
+        self.sought = (target - self.backoff).max(Time::ZERO);
+        self.backoff = self.backoff + self.backoff;
+        self.codec.seek(&self.input, self.stream, self.sought + self.origin)?;
+        Ok(true)
+    }
+}
+
 impl Drop for VideoDec {
     fn drop(&mut self) {
         unsafe {
             sys::av_frame_free(&mut self.sw);
+            sys::av_frame_free(&mut self.held);
             if !self.sws.is_null() {
                 sys::sws_free_context(&mut self.sws);
             }
@@ -279,28 +331,50 @@ impl Drop for VideoDec {
 
 impl VideoDecoder for VideoDec {
     fn seek(&mut self, t: Time) -> Result<(), MediaError> {
-        self.codec.seek(&self.input, self.stream, t)?;
+        self.codec.seek(&self.input, self.stream, t + self.origin)?;
         self.skip_until = Some(t);
+        self.sought = t;
+        self.backoff = Time::from_seconds(1);
+        unsafe { sys::av_frame_unref(self.held) };
         Ok(())
     }
 
     fn next_frame(&mut self) -> Result<Option<VideoFrame>, MediaError> {
         loop {
             if !self.codec.next(&self.input, self.stream)? {
+                if self.retry()? {
+                    continue;
+                }
+                // Sought past the end: the last frame there is.
+                if self.skip_until.take().is_some() && unsafe { !(*self.held).buf[0].is_null() } {
+                    let out = self.convert(self.held);
+                    unsafe { sys::av_frame_unref(self.held) };
+                    return out.map(Some);
+                }
                 return Ok(None);
             }
             let f = self.codec.frame;
             let pts = unsafe { if (*f).best_effort_timestamp != NOPTS { (*f).best_effort_timestamp } else { (*f).pts } };
-            let start = to_time(pts, self.tb);
+            let start = to_time(pts, self.tb) - self.origin;
             if let Some(target) = self.skip_until {
-                // Frames that end before the target are decoded but not returned.
-                if start + self.frame_dur <= target {
+                // The seek landed after the target (a container that does
+                // not seek to key frames): go back further and decode on.
+                if start > target && self.retry()? {
                     unsafe { sys::av_frame_unref(f) };
                     continue;
                 }
+                // Frames that end before the target are decoded but not returned.
+                if start + self.frame_dur <= target {
+                    unsafe {
+                        sys::av_frame_unref(self.held);
+                        sys::av_frame_move_ref(self.held, f);
+                    }
+                    continue;
+                }
                 self.skip_until = None;
+                unsafe { sys::av_frame_unref(self.held) };
             }
-            let out = self.convert();
+            let out = self.convert(f);
             unsafe { sys::av_frame_unref(f) };
             return out.map(Some);
         }
@@ -316,9 +390,14 @@ pub struct AudioDec {
     rate: u32,
     channels: u16,
     skip_until: Option<Time>,
+    /// The file's start: subtracted from every timestamp.
+    origin: Time,
 }
 
 unsafe impl Send for AudioDec {}
+
+/// Longest silence put before audio that starts after a seek target.
+const MAX_LEAD_IN: Time = Time::from_seconds(10);
 
 impl AudioDec {
     pub fn open(media: &Resolved, rate: u32, channels: u16) -> Result<AudioDec, MediaError> {
@@ -326,7 +405,8 @@ impl AudioDec {
         let stream = first_stream(&input, sys::AVMediaType::AVMEDIA_TYPE_AUDIO).ok_or_else(|| MediaError::Unsupported("no audio stream".into()))?;
         let (codec, _) = Codec::open(&input, stream, false)?;
         let tb = unsafe { (*input.streams()[stream]).time_base };
-        Ok(AudioDec { codec, input, stream, tb, swr: ptr::null_mut(), rate, channels, skip_until: None })
+        let origin = input.origin();
+        Ok(AudioDec { codec, input, stream, tb, swr: ptr::null_mut(), rate, channels, skip_until: None, origin })
     }
 
     fn resampler(&mut self) -> Result<(), MediaError> {
@@ -365,7 +445,7 @@ impl Drop for AudioDec {
 
 impl AudioDecoder for AudioDec {
     fn seek(&mut self, t: Time) -> Result<(), MediaError> {
-        self.codec.seek(&self.input, self.stream, t)?;
+        self.codec.seek(&self.input, self.stream, t + self.origin)?;
         unsafe { sys::swr_free(&mut self.swr) }; // drop buffered samples
         self.skip_until = Some(t);
         Ok(())
@@ -381,7 +461,7 @@ impl AudioDecoder for AudioDec {
             let ch = self.channels as usize;
             let (pts, n) = unsafe {
                 let ts = if (*f).best_effort_timestamp != NOPTS { (*f).best_effort_timestamp } else { (*f).pts };
-                (to_time(ts, self.tb), (*f).nb_samples)
+                (to_time(ts, self.tb) - self.origin, (*f).nb_samples)
             };
             let cap = unsafe { sys::swr_get_out_samples(self.swr, n) }.max(0) as usize;
             let mut samples = vec![0f32; cap * ch];
@@ -400,10 +480,15 @@ impl AudioDecoder for AudioDec {
                 if pts + block_len <= target {
                     continue;
                 }
-                // Trim the part of this block before the target.
-                let skip = ((target - pts).as_seconds_f64() * self.rate as f64).round().max(0.0) as usize;
-                let skip = skip.min(got as usize);
-                samples.drain(..skip * ch);
+                if pts < target {
+                    // Trim the part of this block before the target.
+                    let skip = ((target - pts).as_seconds_f64() * self.rate as f64).round() as usize;
+                    samples.drain(..skip.min(got as usize) * ch);
+                } else {
+                    // The sound starts after the target: silence until it does.
+                    let lead = ((pts - target).min(MAX_LEAD_IN).as_seconds_f64() * self.rate as f64).round() as usize;
+                    samples.splice(0..0, std::iter::repeat_n(0.0, lead * ch));
+                }
                 pts = target;
                 self.skip_until = None;
             }

@@ -16,6 +16,8 @@ pub struct Frame {
     pub space: WorkingSpace,
     /// Every layer shows its exact frame (false while decoding catches up).
     pub complete: bool,
+    /// Layers that could not be shown at all, and why ("clip.mov: not found").
+    pub missing: Vec<String>,
 }
 
 fn as_vec4(v: &Value) -> [f32; 4] {
@@ -43,12 +45,19 @@ pub fn resolve(project: &Project, plan: FramePlan, registry: &Registry, pool: &A
     let seq_size = seq.map(|s| (s.format.width, s.format.height)).unwrap_or((1920, 1080));
     let space = WorkingSpace::from_name(seq.map(|s| s.format.working_space.as_str()).unwrap_or("ACEScg"));
     let mut complete = true;
+    let mut missing = Vec::new();
     let mut layers = Vec::new();
     for l in &plan.layers {
         let ClipSource::Asset { asset } = &l.source else { continue };
         let Some(asset) = project.assets.get(asset) else { continue };
         let frame = match wait {
-            Some(timeout) => pool.frame_blocking(asset.id, &asset.media, l.source_time, timeout).ok(),
+            Some(timeout) => match pool.frame_blocking(asset.id, &asset.media, l.source_time, timeout) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    missing.push(format!("{}: {e}", asset.name));
+                    None
+                }
+            },
             None => match pool.frame(asset.id, &asset.media, l.source_time) {
                 Lookup::Exact(f) => Some(f),
                 Lookup::Nearest(f) => {
@@ -59,7 +68,10 @@ pub fn resolve(project: &Project, plan: FramePlan, registry: &Registry, pool: &A
                     complete = false;
                     None
                 }
-                Lookup::Failed(_) => None,
+                Lookup::Failed(e) => {
+                    missing.push(format!("{}: {e}", asset.name));
+                    None
+                }
             },
         };
         let Some(frame) = frame else { continue };
@@ -83,5 +95,5 @@ pub fn resolve(project: &Project, plan: FramePlan, registry: &Registry, pool: &A
             .collect();
         layers.push(RenderLayer { frame, motion, opacity, blend, effects });
     }
-    Frame { plan, layers, seq_size, space, complete }
+    Frame { plan, layers, seq_size, space, complete, missing }
 }

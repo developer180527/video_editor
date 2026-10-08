@@ -12,7 +12,7 @@ use std::sync::Arc;
 use ve_model::*;
 use ve_time::Time;
 
-use crate::{Command, CommandError, Edge};
+use crate::{shift_keyframes, Command, CommandError, Edge};
 
 /// Builds a batch by applying each step to a scratch project.
 pub struct Builder {
@@ -95,30 +95,6 @@ fn shift_track(b: &mut Builder, seq: SequenceId, tr: TrackId, from: Time, delta:
         b.push(Command::MoveClip { clip: c.id, track: tr, start: c.timeline_start + delta })?;
     }
     Ok(())
-}
-
-/// Keyframes are clip-relative: the right half of a split sees them shifted.
-fn shift_keyframes(effects: &Vector<Arc<Effect>>, by: Time) -> Vector<Arc<Effect>> {
-    effects
-        .iter()
-        .map(|e| {
-            let mut e = (**e).clone();
-            e.params = e
-                .params
-                .iter()
-                .map(|(k, p)| {
-                    let p = match p {
-                        Param::Animated(keys) => Param::Animated(
-                            keys.iter().map(|kf| Keyframe { time: kf.time - by, ..kf.clone() }).collect(),
-                        ),
-                        other => other.clone(),
-                    };
-                    (k.clone(), p)
-                })
-                .collect();
-            Arc::new(e)
-        })
-        .collect()
 }
 
 /// Split `clip` at sequence time `at`. Returns the new right-hand clip's id.
@@ -211,6 +187,7 @@ pub fn ripple_trim(p: &Project, clip: ClipId, edge: Edge, delta: Time, follow_li
             Edge::Start => {
                 new.source_range.start += delta;
                 new.source_range.duration -= delta;
+                new.effects = shift_keyframes(&old.effects, delta);
                 -delta
             }
         };
@@ -246,6 +223,7 @@ pub fn roll(p: &Project, left: ClipId, right: ClipId, delta: Time) -> Result<Com
 }
 
 /// Slip: show different frames through the same window on the timeline.
+/// Keyframes stay with the window (a fade-in stays at the clip's head).
 pub fn slip(p: &Project, clip: ClipId, delta: Time, follow_links: bool) -> Result<Command, CommandError> {
     let mut b = Builder::new(p);
     for c in with_linked(p, &[clip], follow_links) {

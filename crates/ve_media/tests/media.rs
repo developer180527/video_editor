@@ -213,3 +213,70 @@ fn realtime_playback_keeps_up() {
     }
     println!("exact {exact}, missed {miss}, slowest lookup {worst:?}");
 }
+
+/// Storage whose `resolve` waits until the gate opens: holds the mixer
+/// while it opens a clip.
+struct Gated {
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl ve_ports::Storage for Gated {
+    fn make_ref(&self, p: &str) -> Result<MediaRef, ve_ports::StorageError> {
+        Ok(MediaRef(p.into()))
+    }
+    fn resolve(&self, r: &MediaRef) -> Result<ve_ports::Resolved, ve_ports::StorageError> {
+        let _g = self.cv.wait_while(self.open.lock().unwrap(), |o| !*o).unwrap();
+        Err(ve_ports::StorageError::NotFound(r.0.clone()))
+    }
+    fn resolve_new(&self, r: &MediaRef) -> Result<ve_ports::Resolved, ve_ports::StorageError> {
+        self.resolve(r)
+    }
+    fn open_read(&self, r: &MediaRef) -> Result<Box<dyn ve_ports::ReadSeek>, ve_ports::StorageError> {
+        Err(ve_ports::StorageError::NotFound(r.0.clone()))
+    }
+    fn open_write(&self, r: &MediaRef) -> Result<Box<dyn std::io::Write + Send>, ve_ports::StorageError> {
+        Err(ve_ports::StorageError::NotFound(r.0.clone()))
+    }
+    fn location(&self, _: ve_ports::Location, n: &str) -> Result<MediaRef, ve_ports::StorageError> {
+        Ok(MediaRef(n.into()))
+    }
+    fn display_name(&self, r: &MediaRef) -> String {
+        r.0.clone()
+    }
+}
+
+/// The playhead clock counts sound actually delivered: nothing while the
+/// mixer is still opening its sources, whole buffers once it runs.
+#[test]
+fn playback_clock_waits_for_the_mixer() {
+    let gate = Arc::new(Gated { open: std::sync::Mutex::new(false), cv: std::sync::Condvar::new() });
+    let mixer = Mixer::new(gate.clone(), Arc::new(platform_headless::NoMedia), 48_000);
+    let (pb, mut callback) = Playback::new(mixer, 2);
+    let clock = pb.clock();
+    let mut buf = vec![0f32; 512 * 2];
+    let (p, seq) = project(&PathBuf::from("/nowhere.mov"));
+    // Stopped: silence, and the clock stands still.
+    callback(&mut buf);
+    assert_eq!(clock.read().0, 0);
+    // Started, but the mixer is stuck opening the clip: device silence is
+    // not playback.
+    pb.play(Arc::new(p), seq, Time::ZERO);
+    std::thread::sleep(Duration::from_millis(50));
+    callback(&mut buf);
+    assert_eq!(clock.read().0, 0, "silence before the mixer delivers is not playback");
+    // Once the mixer runs, whole buffers count.
+    *gate.open.lock().unwrap() = true;
+    gate.cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while clock.read().0 == 0 {
+        assert!(std::time::Instant::now() < deadline, "mixer never delivered");
+        std::thread::sleep(Duration::from_millis(5));
+        callback(&mut buf);
+    }
+    assert_eq!(clock.read().0 % 512, 0);
+    let n = clock.read().0;
+    pb.stop();
+    callback(&mut buf);
+    assert_eq!(clock.read().0, n, "stopped: the clock stands still");
+}

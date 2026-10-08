@@ -20,6 +20,9 @@ use ve_time::Time;
 
 use crate::{Command, Engine, Event, PluginRegistry};
 
+/// How often unsaved changes are written to the autosave file.
+const AUTOSAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Called by the engine thread after it publishes, so a sleeping UI wakes.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
@@ -107,8 +110,22 @@ impl Engine {
                 // takes a moment, and the clock should not change basis mid-play.
                 self.prepare_audio();
                 flush(&mut self, None);
-                // Ends when the client is dropped.
-                for req in rx {
+                // Ends when the client is dropped. Between requests (and at
+                // least every AUTOSAVE_EVERY) unsaved changes are autosaved.
+                let mut last_autosave = std::time::Instant::now();
+                loop {
+                    let req = match rx.recv_timeout(AUTOSAVE_EVERY) {
+                        Ok(r) => Some(r),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    if last_autosave.elapsed() >= AUTOSAVE_EVERY {
+                        last_autosave = std::time::Instant::now();
+                        if let Err(err) = self.autosave() {
+                            let _ = etx.send(Event::Error(format!("Autosave failed: {err}")));
+                        }
+                    }
+                    let Some(req) = req else { continue };
                     match req {
                         Request::Execute(c) => {
                             if let Err(err) = self.execute(c) {
@@ -271,7 +288,7 @@ impl EngineClient {
     /// rendering on `gpu`.
     pub fn export(&self, gpu: (wgpu::Device, wgpu::Queue), preset: crate::ExportPreset, out: MediaRef) -> Arc<crate::ExportState> {
         let p = self.published();
-        crate::export::start(p.snapshot, self.platform.clone(), p.plugins, self.video.clone(), gpu, preset, out)
+        crate::export::start(p.snapshot, self.platform.clone(), p.plugins, gpu, preset, out)
     }
 
     pub fn drain_events(&self) -> Vec<Event> {

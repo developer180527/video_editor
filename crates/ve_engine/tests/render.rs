@@ -145,3 +145,49 @@ fn export_h264_with_audio() {
     }
     assert!(peak > 0.05, "audio peak {peak}");
 }
+
+/// Media gone by export time: the export fails and says which, instead of
+/// writing black frames. And it is not disturbed by the preview reading the
+/// same source at the same time.
+#[test]
+fn export_fails_on_missing_media_and_ignores_the_preview() {
+    let Some(file) = clip() else { return eprintln!("skipped: no ffmpeg CLI") };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("skipped: no GPU") };
+    let gpu = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("export_missing");
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join("will_vanish.mov");
+    std::fs::copy(&file, &copy).unwrap();
+    let mut e = Engine::new(platform_headless::platform(&dir, Arc::new(media_ffmpeg::Ffmpeg::new())));
+    e.new_project("t");
+    let keep = e.import(file.to_str().unwrap()).unwrap();
+    let gone = e.import(copy.to_str().unwrap()).unwrap();
+    let snap = e.snapshot();
+    let seq = snap.active().unwrap().clone();
+    let len = Time::from_seconds(2);
+    let items = [
+        (seq.tracks[0].id, Arc::new(make_clip(e.plugins(), &seq.format, &snap.assets[&keep], TrackKind::Video, len, None))),
+        (seq.tracks[1].id, Arc::new(make_clip(e.plugins(), &seq.format, &snap.assets[&gone], TrackKind::Video, len, None))),
+    ];
+    e.execute(edit::overwrite(&snap, seq.id, Time::ZERO, &items).unwrap()).unwrap();
+    let client = e.spawn(Arc::new(|| {}));
+    let run = |gpu, name: &str| {
+        let job = client.export(gpu, ExportPreset::H264Mp4, MediaRef(format!("file:{}", dir.join(name).display())));
+        loop {
+            // The preview keeps asking for the frame at the playhead.
+            client.seek(Time::from_seconds(1));
+            let _ = client.frame(Quality::FULL);
+            if let Some(r) = job.result() {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    run(gpu.clone(), "ok.mp4").unwrap();
+    std::fs::remove_file(&copy).unwrap();
+    let err = run(gpu, "bad.mp4").unwrap_err();
+    assert!(err.contains("will_vanish.mov"), "{err}");
+    assert!(!dir.join("bad.mp4").exists(), "no half-written file");
+}

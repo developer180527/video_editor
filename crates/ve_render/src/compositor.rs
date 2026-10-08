@@ -15,6 +15,12 @@
 //!
 //! Colour here is built-in maths for the common spaces. OpenColorIO replaces
 //! the transfer/primaries tables when it is wired in; the passes stay.
+//!
+//! Scale: 1.0 is SDR reference white. HDR sources (PQ, HLG) are placed so
+//! their reference white (203 cd/m², BT.2408) lands there too, and — while
+//! the only output is SDR — their highlights are rolled off into range in
+//! the decode pass, so an HDR clip looks right next to an SDR one instead of
+//! dark (HLG) or blown out (PQ).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,24 +141,40 @@ fn srgb(v: f32) -> f32 {
     if (v <= 0.04045) { return v / 12.92; }
     return pow((v + 0.055) / 1.055, 2.4);
 }
+// HDR reference white, cd/m² (BT.2408): maps to 1.0.
+const REF_WHITE: f32 = 203.0;
 fn pq(v: f32) -> f32 {
     let m1 = 0.1593017578125; let m2 = 78.84375;
     let c1 = 0.8359375; let c2 = 18.8515625; let c3 = 18.6875;
     let p = pow(max(v, 0.0), 1.0 / m2);
-    // 10 000 nits, with 100 nits as 1.0 (SDR white).
-    return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1) * 100.0;
+    // Absolute: 1.0 is 10 000 cd/m².
+    return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1) * (10000.0 / REF_WHITE);
 }
-fn hlg(v: f32) -> f32 {
+fn hlg_scene(v: f32) -> f32 {
     let a = 0.17883277; let b = 0.28466892; let c = 0.55991073;
     if (v <= 0.5) { return v * v / 3.0; }
     return (exp((v - c) / a) + b) / 12.0;
+}
+// HLG: inverse OETF to scene light, then the BT.2100 OOTF for a 1000 cd/m²
+// display (system gamma 1.2, applied to BT.2020 luminance), in cd/m².
+fn hlg(v: vec3<f32>) -> vec3<f32> {
+    let e = vec3<f32>(hlg_scene(v.r), hlg_scene(v.g), hlg_scene(v.b));
+    let ys = dot(e, vec3<f32>(0.2627, 0.6780, 0.0593));
+    return e * pow(max(ys, 1e-6), 0.2) * (1000.0 / REF_WHITE);
 }
 fn to_linear(v: vec3<f32>, id: f32) -> vec3<f32> {
     if (id < 0.5) { return vec3<f32>(bt1886(v.r), bt1886(v.g), bt1886(v.b)); }
     if (id < 1.5) { return vec3<f32>(srgb(v.r), srgb(v.g), srgb(v.b)); }
     if (id < 2.5) { return vec3<f32>(pq(v.r), pq(v.g), pq(v.b)); }
-    if (id < 3.5) { return vec3<f32>(hlg(v.r), hlg(v.g), hlg(v.b)); }
+    if (id < 3.5) { return hlg(v); }
     return v; // already linear
+}
+// Highlight roll-off for HDR sources on an SDR output: identity up to
+// KNEE, then an exponential shoulder approaching 1.0 (slope-continuous).
+fn shoulder(x: f32) -> f32 {
+    let knee = 0.8;
+    if (x <= knee) { return x; }
+    return knee + (1.0 - knee) * (1.0 - exp(-(x - knee) / (1.0 - knee)));
 }
 
 @fragment
@@ -162,7 +184,11 @@ fn fs_decode(i: VsOut) -> @location(0) vec4<f32> {
     let m = mat3x3<f32>(d.m0.xyz, d.m1.xyz, d.m2.xyz);
     let encoded = clamp(m * vec3<f32>(y, c.x, c.y), vec3<f32>(0.0), vec3<f32>(1.0));
     let p = mat3x3<f32>(d.p0.xyz, d.p1.xyz, d.p2.xyz);
-    return vec4<f32>(p * to_linear(encoded, d.range.w), 1.0);
+    var lin = p * to_linear(encoded, d.range.w);
+    if (d.range.w > 1.5 && d.range.w < 3.5) {
+        lin = vec3<f32>(shoulder(lin.r), shoulder(lin.g), shoulder(lin.b));
+    }
+    return vec4<f32>(lin, 1.0);
 }
 "#;
 

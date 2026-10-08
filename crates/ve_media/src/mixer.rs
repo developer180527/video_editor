@@ -139,9 +139,9 @@ impl Mixer {
     fn open(&self, asset: &Asset, at: Time) -> Result<Stream, String> {
         let resolved = self.storage.resolve(&asset.media).map_err(|e| e.to_string())?;
         let mut dec = self.media.open_audio(&resolved, self.rate, 2).map_err(|e| e.to_string())?;
-        if at > Time::ZERO {
-            dec.seek(at).map_err(|e| e.to_string())?;
-        }
+        // Always seek, even to zero: the decoder then lines its first sample
+        // up with `at` by timestamp, exactly as when starting mid-clip.
+        dec.seek(at).map_err(|e| e.to_string())?;
         Ok(Stream { dec, buf: VecDeque::new(), at, ended: false })
     }
 }

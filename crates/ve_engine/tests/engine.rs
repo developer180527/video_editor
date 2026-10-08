@@ -149,3 +149,46 @@ fn make_clip_attaches_intrinsics() {
     assert_eq!(motion.params["position"], Param::Constant(Value::Vec2([960.0, 540.0])));
     assert_eq!(motion.params["anchor"], Param::Constant(Value::Vec2([640.0, 360.0])));
 }
+
+#[test]
+fn save_replaces_the_file_whole() {
+    let dir = tmp("atomic");
+    let mut e = engine(&dir);
+    let path = dir.join("p.veproj");
+    let file = MediaRef(format!("file:{}", path.display()));
+    add_generator_clip(&mut e, 0, 1);
+    e.save_as(file.clone()).unwrap();
+    add_generator_clip(&mut e, 2, 1);
+    e.save_as(file.clone()).unwrap();
+    // No temporary files left beside it, and it reads back as the latest.
+    let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names.iter().filter(|n| n.to_string_lossy().contains(".tmp")).count(), 0, "{names:?}");
+    let mut other = engine(&dir);
+    other.open(file).unwrap();
+    assert_eq!(*other.snapshot(), *e.snapshot());
+    // A save that cannot happen leaves the old file as it was.
+    let before = std::fs::read(&path).unwrap();
+    let blocked = MediaRef(format!("file:{}", path.join("inside-a-file.veproj").display()));
+    assert!(e.save_as(blocked).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn autosave_writes_unsaved_changes_only() {
+    let dir = tmp("autosave");
+    let mut e = engine(&dir);
+    assert!(!e.autosave().unwrap(), "nothing to autosave in a fresh project");
+    add_generator_clip(&mut e, 0, 2);
+    assert!(e.autosave().unwrap());
+    assert!(!e.autosave().unwrap(), "unchanged since the last autosave");
+    let auto = e.autosave_ref().unwrap();
+    let path = platform_headless::FileStorage::path_of(&auto).unwrap();
+    assert!(path.starts_with(dir.join("data/Autosave")), "{}", path.display());
+    // The autosave is a project file like any other.
+    let mut other = engine(&dir);
+    other.open(auto).unwrap();
+    assert_eq!(*other.snapshot(), *e.snapshot());
+    // Saving for real retires it.
+    e.save_as(MediaRef(format!("file:{}", dir.join("p.veproj").display()))).unwrap();
+    assert!(!path.exists());
+}

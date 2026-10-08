@@ -97,8 +97,10 @@ impl Transport {
     /// The playhead at `now`.
     pub fn position_at(&self, now: Clocks) -> Time {
         let (State::Playing { rate }, Some(a)) = (self.state, self.anchor) else { return self.position };
+        // The audio clock counts mixed sound, which only plays at normal
+        // speed; other speeds run on the monotonic clock.
         let elapsed = match (a.audio_frames, now.audio_frames(self.sample_rate)) {
-            (Some(f0), Some(f1)) => Time::from_seconds_f64((f1 - f0).max(0.0) / self.sample_rate as f64),
+            (Some(f0), Some(f1)) if rate == 1.0 => Time::from_seconds_f64((f1 - f0).max(0.0) / self.sample_rate as f64),
             _ => Time::from_seconds_f64((now.monotonic.saturating_sub(a.monotonic)).as_secs_f64()),
         };
         let t = a.position + Time((elapsed.ticks() as f64 * rate) as i64);
@@ -152,6 +154,14 @@ mod tests {
         let mut t = Transport::new(48_000);
         t.play(2.0, at(None, 0));
         assert_eq!(t.position_at(at(None, 500)), Time::from_seconds(1));
+    }
+
+    #[test]
+    fn other_speeds_ignore_the_audio_clock() {
+        // At 2x no sound is mixed, so the audio count stands still.
+        let mut t = Transport::new(48_000);
+        t.play(2.0, at(Some(0), 0));
+        assert_eq!(t.position_at(at(Some(0), 500)), Time::from_seconds(1));
     }
 
     #[test]

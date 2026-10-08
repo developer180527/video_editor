@@ -220,6 +220,7 @@ impl Command {
                         c.timeline_start += *delta;
                         c.source_range.start += *delta;
                         c.source_range.duration -= *delta;
+                        c.effects = shift_keyframes(&c.effects, *delta);
                     }
                     Edge::End => c.source_range.duration += *delta,
                 }
@@ -300,6 +301,36 @@ impl Command {
             }
         })
     }
+}
+
+/// Keyframe times are relative to the clip's start. When the start moves
+/// through the source by `by` (a head trim, a split's right half), keys move
+/// the other way, so each stays on the same source frame — a fade keyed on a
+/// shot stays on that shot however its head is trimmed. Keys that end up
+/// before the start are kept (and come back if the trim is undone).
+pub(crate) fn shift_keyframes(effects: &ve_model::Vector<Arc<Effect>>, by: Time) -> ve_model::Vector<Arc<Effect>> {
+    let animated = |e: &Effect| e.params.values().any(|p| matches!(p, Param::Animated(_)));
+    effects
+        .iter()
+        .map(|e| {
+            if by == Time::ZERO || !animated(e) {
+                return e.clone();
+            }
+            let mut e = (**e).clone();
+            e.params = e
+                .params
+                .iter()
+                .map(|(k, p)| {
+                    let p = match p {
+                        Param::Animated(keys) => Param::Animated(keys.iter().map(|kf| Keyframe { time: kf.time - by, ..kf.clone() }).collect()),
+                        other => other.clone(),
+                    };
+                    (k.clone(), p)
+                })
+                .collect();
+            Arc::new(e)
+        })
+        .collect()
 }
 
 fn batch(label: &str, mut v: Vec<Command>) -> Command {

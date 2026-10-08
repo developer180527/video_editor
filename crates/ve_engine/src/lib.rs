@@ -79,6 +79,10 @@ pub struct Engine {
     video: Arc<ve_media::VideoPool>,
     stills: Arc<ve_media::Stills>,
     file: Option<MediaRef>,
+    /// Identifies this editing session's autosave file.
+    session: SequenceId,
+    /// The snapshot last autosaved, to skip unchanged ones.
+    autosaved: Option<Snapshot>,
     events: Vec<Event>,
 }
 
@@ -101,6 +105,8 @@ impl Engine {
             video,
             stills,
             file: None,
+            session: SequenceId::new(),
+            autosaved: None,
             events: Vec::new(),
         };
         e.load_plugins();
@@ -177,6 +183,8 @@ impl Engine {
         self.history = History::default();
         self.history.mark_saved();
         self.file = file;
+        self.session = SequenceId::new();
+        self.autosaved = Some(self.project.clone());
         self.transport = Transport::new(MIX_RATE);
         self.events.push(Event::ProjectChanged);
     }
@@ -252,12 +260,46 @@ impl Engine {
         self.file.as_ref()
     }
 
+    /// Save to `to`. The file is replaced atomically: a crash or a full
+    /// disk mid-save leaves the previous version intact.
     pub fn save_as(&mut self, to: MediaRef) -> Result<(), EngineError> {
-        let mut w = self.platform.storage.open_write(&to)?;
-        project_file::write(&self.project, &mut w)?;
+        let mut bytes = Vec::new();
+        project_file::write(&self.project, &mut bytes)?;
+        self.platform.storage.write_atomic(&to, &bytes)?;
         self.history.mark_saved();
+        // Saved for real: this session's autosave is no longer needed.
+        if let Ok(a) = self.autosave_ref() {
+            let _ = self.platform.storage.remove(&a);
+        }
+        self.autosaved = Some(self.project.clone());
         self.file = Some(to);
         Ok(())
+    }
+
+    /// Where this session autosaves: `Autosave/<name>.<session>.veproj` in
+    /// the app's data folder. A file left there is unsaved work from a
+    /// session that ended without saving; it opens like any project.
+    pub fn autosave_ref(&self) -> Result<MediaRef, StorageError> {
+        let storage = &self.platform.storage;
+        let name = match &self.file {
+            Some(f) => storage.display_name(f).trim_end_matches(".veproj").to_string(),
+            None => self.project.name.clone(),
+        };
+        let name: String = name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
+        storage.location(ve_ports::Location::AppData, &format!("Autosave/{name}.{}.veproj", self.session))
+    }
+
+    /// Write the autosave if there are changes since the last save or
+    /// autosave. Returns whether it wrote.
+    pub fn autosave(&mut self) -> Result<bool, EngineError> {
+        if !self.is_dirty() || self.autosaved.as_ref().is_some_and(|a| Arc::ptr_eq(a, &self.project)) {
+            return Ok(false);
+        }
+        let mut bytes = Vec::new();
+        project_file::write(&self.project, &mut bytes)?;
+        self.platform.storage.write_atomic(&self.autosave_ref()?, &bytes)?;
+        self.autosaved = Some(self.project.clone());
+        Ok(true)
     }
 
     pub fn open(&mut self, from: MediaRef) -> Result<(), EngineError> {
@@ -270,7 +312,7 @@ impl Engine {
     // ---- playback --------------------------------------------------------
 
     fn clocks(&self) -> Clocks {
-        Clocks { audio: self.audio.as_ref().map(|a| a.clock().read()), monotonic: ve_ports::clock_now() }
+        Clocks { audio: self.audio_clock().map(|c| c.read()), monotonic: ve_ports::clock_now() }
     }
 
     /// Open the audio device now (the threaded client does this at start).
@@ -366,9 +408,10 @@ impl Engine {
         &self.transport
     }
 
-    /// The audio device's played-frames counter, once a stream is open.
+    /// The playhead's clock once audio is open: mixed frames the device has
+    /// been given (not the silence while the mixer catches up).
     pub fn audio_clock(&self) -> Option<Arc<ve_ports::AudioClock>> {
-        self.audio.as_ref().map(|a| a.clock())
+        self.audio.as_ref().and(self.playback.as_ref()).map(|p| p.clock())
     }
 
     pub fn platform(&self) -> &Platform {
