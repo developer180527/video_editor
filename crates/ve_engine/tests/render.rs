@@ -11,20 +11,35 @@ use ve_model::*;
 use ve_render::Compositor;
 use ve_time::Time;
 
-fn clip() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("render_src.mov");
-    if !p.exists() {
-        let ok = Command::new("ffmpeg")
-            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "smptebars=size=640x360:rate=25:duration=3"])
-            .args(["-c:v", "mpeg4", "-q:v", "2"])
-            .arg(&p)
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            return None;
-        }
+/// Make a test clip with the `ffmpeg` CLI, once. Tests run in parallel: a
+/// lock makes the others wait for the first, and ffmpeg writes to a
+/// temporary name that is renamed into place only when complete, so no test
+/// (or other test binary) ever opens a half-written file.
+fn generated(name: &str, args: &[&str]) -> Option<PathBuf> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    if p.exists() {
+        return Some(p);
     }
+    let ext = p.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let partial = p.with_extension(format!("partial.{}.{ext}", std::process::id()));
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error"])
+        .args(args)
+        .arg(&partial)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        let _ = std::fs::remove_file(&partial);
+        return None;
+    }
+    std::fs::rename(&partial, &p).ok()?;
     Some(p)
+}
+
+fn clip() -> Option<PathBuf> {
+    generated("render_src.mov", &["-f", "lavfi", "-i", "smptebars=size=640x360:rate=25:duration=3", "-c:v", "mpeg4", "-q:v", "2"])
 }
 
 #[test]

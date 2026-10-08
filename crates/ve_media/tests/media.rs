@@ -10,19 +10,42 @@ use ve_media::*;
 use ve_model::*;
 use ve_time::{Rate, Time, TimeRange};
 
-fn clip_file() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("media_test.mov");
+/// Make a test clip with the `ffmpeg` CLI, once. Tests run in parallel: a
+/// lock makes the others wait for the first, and ffmpeg writes to a
+/// temporary name that is renamed into place only when complete, so no test
+/// (or other test binary) ever opens a half-written file.
+fn generated(name: &str, args: &[&str]) -> Option<PathBuf> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     if p.exists() {
         return Some(p);
     }
+    let ext = p.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let partial = p.with_extension(format!("partial.{}.{ext}", std::process::id()));
     let ok = Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=4"])
-        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4"])
-        .args(["-c:v", "mpeg4", "-q:v", "3", "-c:a", "pcm_s16le", "-shortest"])
-        .arg(&p)
+        .args(["-y", "-loglevel", "error"])
+        .args(args)
+        .arg(&partial)
         .status()
         .is_ok_and(|s| s.success());
-    ok.then_some(p)
+    if !ok {
+        let _ = std::fs::remove_file(&partial);
+        return None;
+    }
+    std::fs::rename(&partial, &p).ok()?;
+    Some(p)
+}
+
+fn clip_file() -> Option<PathBuf> {
+    generated(
+        "media_test.mov",
+        &[
+            "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=4",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4",
+            "-c:v", "mpeg4", "-q:v", "3", "-c:a", "pcm_s16le", "-shortest",
+        ],
+    )
 }
 
 fn storage() -> Arc<FileStorage> {
@@ -200,18 +223,12 @@ fn stills_make_thumbnails_and_peaks() {
 #[test]
 #[ignore = "timing measurement; run with --ignored --nocapture"]
 fn realtime_playback_keeps_up() {
-    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("rt_1080.mp4");
-    if !p.exists() {
-        let ok = Command::new("ffmpeg")
-            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=24:duration=8"])
-            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "48"])
-            .arg(&p)
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            return eprintln!("skipped");
-        }
-    }
+    let Some(p) = generated(
+        "rt_1080.mp4",
+        &["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=24:duration=8", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "48"],
+    ) else {
+        return eprintln!("skipped");
+    };
     let pool = VideoPool::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()), 512 << 20);
     let (asset, media) = (AssetId::new(), MediaRef(format!("file:{}", p.display())));
     pool.frame_blocking(asset, &media, Time::ZERO, Duration::from_secs(5)).unwrap();

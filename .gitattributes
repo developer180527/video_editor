@@ -1,0 +1,11 @@
+# Scripts and the files they read must keep LF line endings on every OS:
+# Git for Windows would otherwise check them out with CRLF, and bash then
+# reads a stray carriage return into every value.
+*.sh            text eol=lf
+third_party/PINS text eol=lf
+*.rs            text eol=lf
+*.toml          text eol=lf
+*.yml           text eol=lf
+*.wgsl          text eol=lf
+*.c             text eol=lf
+*.h             text eol=lf

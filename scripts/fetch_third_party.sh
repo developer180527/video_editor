@@ -4,7 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/../third_party"
 
-while read -r name url ref; do
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line=${line%$'\r'}   # tolerate CRLF checkouts
+  read -r name url ref <<<"$line"
   [[ -z "$name" || "$name" == \#* ]] && continue
   if [[ -d "$name/.git" ]]; then
     git -C "$name" fetch -q --depth 1 origin "$ref"
