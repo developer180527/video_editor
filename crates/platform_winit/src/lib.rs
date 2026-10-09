@@ -504,9 +504,6 @@ impl<A: ShellApp> Shell<A> {
 
         let dock_wants = self.app.dock().is_some_and(|d| d.needs_frame(w.dock_id));
         let mut platform = PlatformOutput::default();
-        // Only a built frame has output to apply: re-presenting the last one
-        // must not reset the cursor (and the rest) to defaults.
-        let mut built = false;
         let chrome = if IOS {
             Chrome::Os
         } else if MAC {
@@ -523,7 +520,6 @@ impl<A: ShellApp> Shell<A> {
             self.app.ui(&mut w.ui, w.dock_id, &mut ctx);
             let out = w.ui.end_frame();
             platform = out.platform.clone();
-            built = true;
             w.clear = out.clear_color;
             w.renderer.prepare(&out);
             w.batches.clear();
@@ -564,9 +560,8 @@ impl<A: ShellApp> Shell<A> {
             w.window.pre_present_notify();
             g.gpu.queue.present(frame);
         }
-        if built {
-            w.platform.apply(&w.window, &platform);
-        }
+        // An output from a frame that was only re-presented is ignored.
+        w.platform.apply(&w.window, &platform);
         if let Some(dir) = w.resize {
             w.window.set_cursor(resize_cursor(dir));
         }
@@ -749,7 +744,7 @@ impl<A: ShellApp> ApplicationHandler<UserEvent> for Shell<A> {
                     let _ = w.window.drag_resize_window(dir);
                     return;
                 }
-                if w.pointer.y < w.strip && !w.ui.wants_pointer() {
+                if w.pointer.y < w.strip && w.ui.hit_test(w.pointer).is_none() {
                     let now = Instant::now();
                     let double = w.last_press.is_some_and(|t| (now - t).as_secs_f32() < DOUBLE_CLICK_S);
                     w.last_press = if double { None } else { Some(now) };

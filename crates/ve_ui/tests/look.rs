@@ -153,9 +153,9 @@ fn render_framed(app: &mut EditorUi, w: u32, h: u32, name: &str, frame: ve_ui::W
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(&img.data).unwrap();
     println!("{}", path.display());
-    // With a dialog open the last tree laid out is the modal's own.
-    let min = if app.view.dialog.is_some() { 10 } else { 100 };
-    assert!(ui.frame_cost().nodes > min, "the editor did not build ({} nodes)", ui.frame_cost().nodes);
+    // Everything the frame showed, cached subtrees and modals included.
+    let nodes = ui.frame_cost().described_nodes();
+    assert!(nodes > 120, "the editor did not build ({nodes} nodes)");
 }
 
 #[test]

@@ -116,7 +116,7 @@ fn title(ui: &mut Ui, app: &EditorUi) {
     let name = ui.frame_text(&app.snap().name);
     let state = ui.frame_text(if app.st.dirty { " - Edited" } else { "" });
     let size = 14.0;
-    let rect = Rect::new(0.0, 0.0, ui.input().screen_size.x, HEIGHT);
+    let rect = Rect::new(0.0, 0.0, ui.screen_size().x, HEIGHT);
     ui.add_leaf_at(id, rect, LeafOptions::default(), move |p, rect| {
         let (w, sw) = (p.measure(size, name).x, p.measure(size, state).x);
         let x = (rect.center().x - (w + sw) / 2.0).round();

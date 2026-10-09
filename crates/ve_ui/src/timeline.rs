@@ -549,7 +549,7 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
         ui.cursor = match (app.view.tool, under) {
             (_, Hit::Ruler) => Cursor::ResizeHorizontal,
             (Tool::Hand, _) => Cursor::Grab,
-            (Tool::Razor, Hit::Clip { .. }) => Cursor::Text, // libgui has no crosshair; the I-beam reads as "cut here"
+            (Tool::Razor, Hit::Clip { .. }) => Cursor::Crosshair,
             (Tool::Slip, Hit::Clip { .. }) => Cursor::ResizeHorizontal,
             (Tool::Select | Tool::Ripple, Hit::Clip { edge: Some(_), .. }) => Cursor::ResizeHorizontal,
             (_, Hit::Cut { .. }) => Cursor::ResizeHorizontal,

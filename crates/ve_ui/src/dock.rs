@@ -195,43 +195,18 @@ pub(crate) fn open_tabs(dock: &DockState<Tab>) -> Vec<Tab> {
     out
 }
 
-/// `node` without `tab`; panes left empty go, and a split left with one
-/// side becomes that side.
-fn without(dock: &mut DockState<Tab>, node: DockNode<Tab>, tab: Tab) -> Option<DockNode<Tab>> {
-    match node {
-        DockNode::Leaf(mut l) => {
-            l.tabs.retain(|t| *t != tab);
-            if l.tabs.is_empty() {
-                return None;
-            }
-            l.active = l.active.min(l.tabs.len() - 1);
-            Some(DockNode::Leaf(l))
-        }
-        DockNode::Split(s) => {
-            let (axis, fraction) = (s.axis, s.fraction);
-            match (without(dock, *s.first, tab), without(dock, *s.second, tab)) {
-                (Some(a), Some(b)) => Some(dock.split(axis, fraction, a, b)),
-                (Some(a), None) | (None, Some(a)) => Some(a),
-                (None, None) => None,
-            }
-        }
-    }
-}
-
 /// Close `tab` where it is open; open it in the main window where it is not.
 pub(crate) fn toggle_tab(dock: &mut DockState<Tab>, tab: Tab) {
-    if !open_tabs(dock).contains(&tab) {
-        dock.add_tab(SurfaceId::MAIN, tab);
-        return;
-    }
-    let ids: Vec<SurfaceId> = dock.surfaces().iter().map(|s| s.id).collect();
-    for id in ids {
-        let Some(root) = dock.take_root(id) else { continue };
-        match without(dock, root, tab) {
-            Some(r) => dock.set_root(id, r),
-            // A torn-off window with nothing left in it closes.
-            None if id != SurfaceId::MAIN => dock.close_surface(id),
-            None => {}
+    match dock.find_tab(|t| *t == tab) {
+        // Empty panes and emptied torn-off windows go with it.
+        Some(at) => {
+            dock.remove_tab(at);
+        }
+        None => {
+            dock.add_tab(SurfaceId::MAIN, tab);
+            if let Some(at) = dock.find_tab(|t| *t == tab) {
+                dock.focus_tab(at);
+            }
         }
     }
 }

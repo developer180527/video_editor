@@ -570,7 +570,7 @@ impl EditorUi {
         if surface != SurfaceId::MAIN {
             if let WindowControls::Drawn { maximized } = frame.controls {
                 let w = topbar::CONTROLS_W;
-                let rect = Rect::new(ui.input().screen_size.x - w, 0.0, w, self.tab_height);
+                let rect = Rect::new(ui.screen_size().x - w, 0.0, w, self.tab_height);
                 ui.container_at(Id::new(("window-controls", surface.0)), rect, Frame::none(), |ui| {
                     ui.container(Layout::row().width(Size::Grow(1.0)).height(Size::Grow(1.0)), Frame::none(), |ui| {
                         for a in topbar::window_controls(ui, maximized, self.tab_height) {
