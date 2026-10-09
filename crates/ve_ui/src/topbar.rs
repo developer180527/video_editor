@@ -34,7 +34,7 @@ pub fn bar(ui: &mut Ui, app: &mut EditorUi) {
         if !app.frame.system_menu {
             app.menu_bar(ui);
         }
-        ui.flex();
+        // The title is centred on the window, not between its neighbours.
         title(ui, app);
         ui.flex();
         if let Some(busy) = &app.st.busy {
@@ -59,7 +59,6 @@ pub fn bar(ui: &mut Ui, app: &mut EditorUi) {
         if share.clicked {
             app.show_export = true;
         }
-        let _ = icon_button(ui, "full", Icon::Expand, 24.0, false);
         if let WindowControls::Drawn { maximized } = controls {
             ui.space(4.0);
             for a in window_controls(ui, maximized, HEIGHT) {
@@ -117,9 +116,12 @@ fn title(ui: &mut Ui, app: &EditorUi) {
     let name = ui.frame_text(&app.snap().name);
     let state = ui.frame_text(if app.st.dirty { " - Edited" } else { "" });
     let size = 14.0;
-    ui.add_leaf(id, Layout::leaf(Size::Fit, Size::Fixed(20.0)), Vec2::new(150.0, 20.0), false, move |p, rect| {
-        let w = p.measure(size, name).x;
-        p.text_left(rect, size, REEL.bright, name);
-        p.text_left(rect.shrink(w, 0.0, 0.0, 0.0), size, t.palette.text_muted, state);
+    let rect = Rect::new(0.0, 0.0, ui.input().screen_size.x, HEIGHT);
+    ui.add_leaf_at(id, rect, LeafOptions::default(), move |p, rect| {
+        let (w, sw) = (p.measure(size, name).x, p.measure(size, state).x);
+        let x = (rect.center().x - (w + sw) / 2.0).round();
+        let line = Rect::new(x, rect.y, w + sw, rect.h);
+        p.text_left(line, size, REEL.bright, name);
+        p.text_left(line.shrink(w, 0.0, 0.0, 0.0), size, t.palette.text_muted, state);
     });
 }

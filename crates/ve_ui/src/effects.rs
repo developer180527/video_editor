@@ -83,7 +83,6 @@ fn chips(ui: &mut Ui, app: &EditorUi, clip: Option<&Clip>) {
         chip(ui, "src", Icon::Panel, &format!("Source • {name}"), false);
         chip(ui, "seq", Icon::Effects, &format!("{seq} • {name}"), true);
         ui.flex();
-        let _ = icon_button(ui, "split", Icon::Panel, 18.0, false);
     });
 }
 
@@ -654,8 +653,5 @@ fn footer(ui: &mut Ui, app: &mut EditorUi) {
     ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         ui.text_with(&app.timecode(app.playhead), 11.0, REEL.timecode);
         ui.flex();
-        let _ = icon_button(ui, "filter", Icon::Sort, 20.0, false);
-        let _ = icon_button(ui, "audio", Icon::Speaker, 20.0, false);
-        let _ = icon_button(ui, "export-fx", Icon::Export, 20.0, false);
     });
 }

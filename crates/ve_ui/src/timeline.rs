@@ -18,7 +18,7 @@ use ve_time::{Time, Timecode};
 use crate::features::{marker_color, GENERATOR_PAYLOAD, TRANSITION_PAYLOAD};
 use crate::project::{add_effect, EFFECT_PAYLOAD};
 use crate::theme::REEL;
-use crate::widgets::{divider, draw_icon, icon_button, Icon};
+use crate::widgets::{draw_icon, icon_button, Icon};
 use crate::{EditorUi, Tool, ASSET_PAYLOAD, FILES_PAYLOAD};
 
 const HEADER_W: f32 = 148.0;
@@ -132,9 +132,6 @@ fn toolbar(ui: &mut Ui, app: &mut EditorUi) {
         if marker.clicked {
             app.add_marker();
         }
-        divider(ui, "tb", true, 18.0);
-        let _ = icon_button(ui, "tl-wrench", Icon::Wrench, 22.0, false);
-        let _ = icon_button(ui, "tl-cc", Icon::Captions, 22.0, false);
         ui.flex();
         let tool = TOOLS.iter().find(|(_, t, _)| *t == app.view.tool).map(|x| x.2).unwrap_or("");
         ui.text_with(tool, 11.0, ui.theme.palette.text_faint);

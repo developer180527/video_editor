@@ -13,7 +13,7 @@ use crate::features::{GENERATOR_PAYLOAD, TRANSITION_PAYLOAD};
 use ve_time::{Rate, Time, Timecode};
 
 
-use crate::widgets::{divider, icon_button, Icon};
+use crate::widgets::{icon_button, Icon};
 use crate::{EditorUi, HostRequest, ASSET_PAYLOAD, FILES_PAYLOAD};
 
 /// Payload kind for an effect dragged from the Effects panel, carrying `PluginRef`.
@@ -306,15 +306,8 @@ fn footer(ui: &mut Ui, app: &mut EditorUi) {
         .gap(3.0)
         .align(Align::Start, Align::Center);
     ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
-        let _ = icon_button(ui, "pen", Icon::Pen, 20.0, true);
-        let _ = icon_button(ui, "list", Icon::List, 20.0, false);
-        let _ = icon_button(ui, "grid", Icon::Grid, 20.0, true);
-        let _ = icon_button(ui, "free", Icon::Freeform, 20.0, false);
-        divider(ui, "p1", true, 16.0);
         thumb_slider(ui, app);
         ui.flex();
-        let _ = icon_button(ui, "sortbin", Icon::Sort, 20.0, false);
-        let _ = icon_button(ui, "zoomin", Icon::Zoom, 20.0, false);
         let newbin = icon_button(ui, "newbin", Icon::NewBin, 20.0, false);
         ui.tooltip(&newbin, "Import…");
         if newbin.clicked {

@@ -200,10 +200,6 @@ fn transport(ui: &mut Ui, app: &mut EditorUi) {
                 app.place_asset(a, app.playhead, None, false);
             }
         }
-        let _ = icon_button(ui, "snapshot", Icon::Camera, 22.0, false);
-        let _ = icon_button(ui, "compare", Icon::Panel, 22.0, false);
-        let _ = icon_button(ui, "captions", Icon::Captions, 22.0, false);
         ui.flex();
-        let _ = icon_button(ui, "plus", Icon::AddTrack, 22.0, false);
     });
 }
