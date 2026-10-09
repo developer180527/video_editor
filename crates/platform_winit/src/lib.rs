@@ -504,6 +504,9 @@ impl<A: ShellApp> Shell<A> {
 
         let dock_wants = self.app.dock().is_some_and(|d| d.needs_frame(w.dock_id));
         let mut platform = PlatformOutput::default();
+        // Only a built frame has output to apply: re-presenting the last one
+        // must not reset the cursor (and the rest) to defaults.
+        let mut built = false;
         let chrome = if IOS {
             Chrome::Os
         } else if MAC {
@@ -520,6 +523,7 @@ impl<A: ShellApp> Shell<A> {
             self.app.ui(&mut w.ui, w.dock_id, &mut ctx);
             let out = w.ui.end_frame();
             platform = out.platform.clone();
+            built = true;
             w.clear = out.clear_color;
             w.renderer.prepare(&out);
             w.batches.clear();
@@ -560,7 +564,9 @@ impl<A: ShellApp> Shell<A> {
             w.window.pre_present_notify();
             g.gpu.queue.present(frame);
         }
-        w.platform.apply(&w.window, &platform);
+        if built {
+            w.platform.apply(&w.window, &platform);
+        }
         if let Some(dir) = w.resize {
             w.window.set_cursor(resize_cursor(dir));
         }
