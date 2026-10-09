@@ -66,11 +66,28 @@ fn main() {
             format!("cargo:rustc-link-lib={kind}={l}")
         } else if w == "-framework" {
             format!("cargo:rustc-link-lib=framework={}", words.next().unwrap())
+        } else if let Some(l) = w.strip_suffix(".lib").filter(|l| !l.contains(['/', '\\'])) {
+            // FFmpeg's MSVC build writes system libraries as `bcrypt.lib`,
+            // not `-lbcrypt`; dropping them leaves BCrypt* and the Media
+            // Foundation IIDs unresolved at link time.
+            format!("cargo:rustc-link-lib=dylib={l}")
         } else {
             continue;
         };
         if seen.insert(line.clone()) {
             println!("{line}");
+        }
+    }
+
+    // What FFmpeg's Windows code needs from the system whether or not its
+    // .pc file names it: CNG for random seeds (libavutil), Media Foundation
+    // and its interface IDs (the MF encoders), COM.
+    if target.contains("windows") {
+        for l in ["bcrypt", "mfplat", "mfuuid", "strmiids", "ole32", "user32"] {
+            let line = format!("cargo:rustc-link-lib=dylib={l}");
+            if seen.insert(line.clone()) {
+                println!("{line}");
+            }
         }
     }
 

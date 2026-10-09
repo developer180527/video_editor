@@ -543,8 +543,11 @@ mod tests {
         let (a, m) = (AssetId::new(), MediaRef("x".into()));
         pool.frame_blocking(a, &m, Time::ZERO, WAIT).unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        assert!(matches!(pool.frame(a, &m, RATE.frame_to_time(24)), Lookup::Exact(_)));
-        assert!(decoded.load(Ordering::SeqCst) <= 30);
+        // Count before asking for frame 24: asking moves the look-ahead
+        // window, and a fast machine starts on the next second at once.
+        let n = decoded.load(Ordering::SeqCst);
+        assert!(n <= 30, "decoded {n} frames for a one-second look-ahead");
+        assert!(matches!(pool.frame(a, &m, RATE.frame_to_time(24)), Lookup::Exact(_)), "frame 24 is within the second ahead");
     }
 
     #[test]
