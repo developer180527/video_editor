@@ -13,7 +13,7 @@ use ve_engine::{edit, intrinsic, Command, Edge, MarksOwner};
 use ve_model::*;
 use ve_time::Time;
 
-use crate::{EditorUi, HostRequest};
+use crate::EditorUi;
 
 /// A dialog in front of the editor.
 #[derive(Clone, Debug, PartialEq)]
@@ -69,7 +69,7 @@ impl EditorUi {
 
     /// The selected clip, else the clip under the playhead on a targeted
     /// video track, else on a targeted audio track.
-    fn subject_clip(&self) -> Option<Arc<Clip>> {
+    pub(crate) fn subject_clip(&self) -> Option<Arc<Clip>> {
         if let Some(c) = self.view.selection.first().and_then(|id| self.snap().find_clip(*id)).map(|(_, _, c)| c.clone()) {
             return Some(c);
         }
@@ -509,145 +509,6 @@ impl EditorUi {
                 }
             }
         }
-    }
-
-    // ---- the menu bar ------------------------------------------------------
-
-    pub(crate) fn menu_bar(&mut self, ui: &mut Ui) {
-        let has_clip = self.subject_clip().is_some();
-        let sel = !self.view.selection.is_empty();
-        ui.menu_button("File", |ui| {
-            if ui.menu_item_shortcut("Import…", "⌘I").clicked {
-                self.requests.push(HostRequest::ImportMedia);
-            }
-            if ui.menu_item_shortcut("Open Project…", "⌘O").clicked {
-                self.requests.push(HostRequest::OpenProject);
-            }
-            if ui.menu_item_shortcut("Save", "⌘S").clicked {
-                match self.st.file.clone() {
-                    Some(f) => self.engine.save_as(f),
-                    None => self.requests.push(HostRequest::SaveProjectAs),
-                }
-            }
-            if ui.menu_item_shortcut("Save As…", "⇧⌘S").clicked {
-                self.requests.push(HostRequest::SaveProjectAs);
-            }
-            ui.menu_separator();
-            // The selected bin item's media (also on its context menu; here
-            // so touch, with no right-click, reaches them too).
-            let asset = self.view.selected_asset.filter(|a| self.snap().assets.contains_key(a));
-            let has_proxy = asset.and_then(|a| self.snap().assets.get(&a)).is_some_and(|a| a.variants.iter().any(|v| v.kind == VariantKind::Proxy));
-            if ui.menu_item_ex("Attach Proxy…", None, asset.is_some()).clicked {
-                self.requests.extend(asset.map(HostRequest::AttachProxy));
-            }
-            if ui.menu_item_ex("Remove Proxy", None, has_proxy).clicked {
-                if let Some(a) = asset {
-                    self.remove_proxy(a);
-                }
-            }
-            if ui.menu_item_ex("Link Media…", None, asset.is_some()).clicked {
-                self.requests.extend(asset.map(HostRequest::RelinkMedia));
-            }
-            ui.menu_separator();
-            if ui.menu_item_shortcut("Export Media…", "⌘M").clicked {
-                self.show_export = true;
-            }
-        });
-        ui.menu_button("Edit", |ui| {
-            let undo = self.st.undo_label.clone().map(|l| format!("Undo {l}")).unwrap_or("Undo".into());
-            if ui.menu_item_ex(&undo, Some("⌘Z"), self.st.undo_label.is_some()).clicked {
-                self.engine.undo();
-            }
-            let redo = self.st.redo_label.clone().map(|l| format!("Redo {l}")).unwrap_or("Redo".into());
-            if ui.menu_item_ex(&redo, Some("⇧⌘Z"), self.st.redo_label.is_some()).clicked {
-                self.engine.redo();
-            }
-        });
-        ui.menu_button("Clip", |ui| {
-            if ui.menu_item_ex("Speed/Duration…", Some("⌘R"), has_clip).clicked {
-                self.open_speed_dialog();
-            }
-            if ui.menu_item_ex("Add Frame Hold", None, has_clip).clicked {
-                self.frame_hold();
-            }
-            ui.menu_separator();
-            if ui.menu_item_ex("Nest…", None, sel).clicked {
-                self.open_nest_dialog();
-            }
-            if ui.menu_item_ex("Audio Channels…", None, has_clip).clicked {
-                self.open_channels_dialog();
-            }
-        });
-        ui.menu_button("Sequence", |ui| {
-            if ui.menu_item_shortcut("Add Edit", "⌘K").clicked {
-                if let Some(seq) = self.active_seq() {
-                    let targets: Vec<TrackId> = self.view.targeted.iter().copied().collect();
-                    let r = edit::add_edit(self.snap(), seq.id, &targets, self.playhead);
-                    self.run_edit(r);
-                }
-            }
-            ui.menu_separator();
-            if ui.menu_item_shortcut("Apply Video Transition", "⌘D").clicked {
-                self.apply_default_transition(TrackKind::Video);
-            }
-            if ui.menu_item_shortcut("Apply Audio Transition", "⇧⌘D").clicked {
-                self.apply_default_transition(TrackKind::Audio);
-            }
-            ui.menu_separator();
-            let proxies = if self.view.proxies { "Use Original Media" } else { "Use Proxies" };
-            if ui.menu_item(proxies).clicked {
-                self.toggle_proxies();
-            }
-            let others: Vec<(SequenceId, String)> = self.snap().sequences.values().map(|s| (s.id, s.name.clone())).collect();
-            if others.len() > 1 {
-                ui.menu_separator();
-                for (id, name) in others {
-                    let here = self.snap().active_sequence == Some(id);
-                    if ui.menu_item_ex(&format!("Open {name}"), None, !here).clicked {
-                        self.open_sequence(id);
-                    }
-                }
-            }
-        });
-        ui.menu_button("Markers", |ui| {
-            if ui.menu_item_shortcut("Mark In", "I").clicked {
-                self.mark_in();
-            }
-            if ui.menu_item_shortcut("Mark Out", "O").clicked {
-                self.mark_out();
-            }
-            if ui.menu_item_shortcut("Clear In and Out", "⌥X").clicked {
-                self.clear_in_out();
-            }
-            ui.menu_separator();
-            if ui.menu_item_shortcut("Add Marker", "M").clicked {
-                self.add_marker();
-            }
-            if ui.menu_item_shortcut("Go to Next Marker", "⇧M").clicked {
-                self.go_to_marker(true);
-            }
-            if ui.menu_item_shortcut("Go to Previous Marker", "⌥⇧M").clicked {
-                self.go_to_marker(false);
-            }
-            let sel = self.view.selected_marker;
-            if ui.menu_item_ex("Edit Marker…", None, sel.is_some()).clicked {
-                if let Some(id) = sel {
-                    self.edit_marker(id);
-                }
-            }
-        });
-        ui.menu_button("Graphics", |ui| {
-            let at = self.playhead;
-            if ui.menu_item("New Title").clicked {
-                self.new_generator(intrinsic::TITLE, at, None);
-            }
-            if ui.menu_item("New Color Matte").clicked {
-                self.new_generator(intrinsic::COLOR_MATTE, at, None);
-            }
-            if ui.menu_item("New Bars").clicked {
-                self.new_generator(intrinsic::BARS, at, None);
-            }
-        });
     }
 }
 

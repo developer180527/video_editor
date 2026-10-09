@@ -11,6 +11,13 @@
 //! logic follows the `libgui_cut` demo host: swapchains are reconfigured once
 //! per drawn frame, and frames are gated on `needs_frame_for`.
 //!
+//! **Title bars.** On desktop the app draws the title bar: the OS's own is
+//! removed. On macOS the traffic lights stay native, moved onto the app's
+//! bar, and the menus go to the system menu bar; elsewhere the app draws
+//! minimize / maximize / close, and the shell resizes the borderless
+//! window from its edges. Pressing empty space in the bar's strip moves
+//! the window; double-clicking it maximizes.
+//!
 //! **Waking.** Other threads (the engine) wake the event loop through a
 //! [`Waker`], so an idle window redraws when there is news and otherwise
 //! sleeps.
@@ -19,18 +26,20 @@
 mod ios_scene;
 #[cfg(target_os = "ios")]
 mod ios_picker;
+#[cfg(target_os = "macos")]
+mod macos;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use libgui::{Backend, Batch, Color, FrameInfo, InputEvent, PlatformOutput, PointerButton, SurfaceId, Theme, Ui, Vec2};
+use libgui::{Backend, Batch, Color, FrameInfo, InputEvent, Key, Modifiers, PlatformOutput, PointerButton, Shortcut, SurfaceId, Theme, Ui, Vec2};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 pub use libgui_winit::FILES as FILES_PAYLOAD;
 
@@ -38,6 +47,13 @@ pub use libgui_winit::FILES as FILES_PAYLOAD;
 pub const DEFAULT_FONT: &[u8] = include_bytes!("../../../third_party/libgui/assets/Inter.ttf");
 
 const IOS: bool = cfg!(target_os = "ios");
+const MAC: bool = cfg!(target_os = "macos");
+/// The app draws the window buttons and the shell does the resizing.
+const BORDERLESS: bool = !IOS && !MAC;
+/// How close to a borderless window's edge (logical px) resizes it.
+const RESIZE_PX: f32 = 5.0;
+/// Two presses on the title strip this close together maximize.
+const DOUBLE_CLICK_S: f32 = 0.4;
 
 /// Wakes the shell from any thread.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -84,30 +100,103 @@ pub trait DockHost {
     fn needs_frame(&self, id: SurfaceId) -> bool;
 }
 
-/// Requests the app makes of the shell during a frame.
+/// One menu of the system menu bar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeMenu {
+    pub title: String,
+    pub entries: Vec<MenuEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuEntry {
+    /// Choosing it calls [`ShellApp::menu_action`] with `id` — or, with a
+    /// `shortcut`, presses that chord in the focused window, so the item
+    /// does exactly what its key does (text fields, dialogs and all).
+    Item { id: u32, label: String, shortcut: Option<Shortcut>, enabled: bool, checked: bool },
+    Separator,
+}
+
+/// Who draws a window's buttons, as the app needs to know to draw its bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Chrome {
+    /// The OS frames the window.
+    #[default]
+    Os,
+    /// The OS draws its buttons over the bar's left end: keep `inset`
+    /// logical px clear (macOS; 0 in full screen, where they are hidden).
+    Leading { inset: f32 },
+    /// The app draws minimize / maximize / close.
+    Drawn { maximized: bool },
+}
+
+/// A window button the app drew was pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowRequest {
+    Minimize,
+    ToggleMaximize,
+    Close,
+}
+
+/// What the shell tells the app about the window being built, and what the
+/// app asks of the shell during the frame.
 #[derive(Default)]
 pub struct ShellCtx {
     dialogs: Vec<FileDialog>,
+    chrome: Chrome,
+    menu: Option<Vec<NativeMenu>>,
+    windows: Vec<WindowRequest>,
+    strip: Option<f32>,
 }
 
 impl ShellCtx {
     pub fn file_dialog(&mut self, d: FileDialog) {
         self.dialogs.push(d);
     }
+
+    /// How this window is framed.
+    pub fn chrome(&self) -> Chrome {
+        self.chrome
+    }
+
+    /// The menus belong in the system menu bar ([`ShellCtx::set_menu`]),
+    /// not in the window.
+    pub fn system_menu(&self) -> bool {
+        MAC
+    }
+
+    /// The system menu bar's menus (macOS; ignored elsewhere). Cheap to call
+    /// every frame: the bar is rebuilt only when they change.
+    pub fn set_menu(&mut self, menus: Vec<NativeMenu>) {
+        self.menu = Some(menus);
+    }
+
+    /// Press a window button.
+    pub fn window(&mut self, r: WindowRequest) {
+        self.windows.push(r);
+    }
+
+    /// The height of the strip at the window's top that acts as its title
+    /// bar: empty space there moves the window.
+    pub fn set_title_strip(&mut self, height: f32) {
+        self.strip = Some(height);
+    }
 }
 
 pub trait ShellApp {
     /// Once, when the GPU is ready.
     fn gpu_ready(&mut self, _gpu: &Gpu, _renderer: &mut libgui_wgpu::Renderer) {}
-    /// Every drawn frame of the main window, before its UI is built: render
-    /// and register the textures the UI will show.
-    fn prepare(&mut self, _gpu: &Gpu, _renderer: &mut libgui_wgpu::Renderer) {}
+    /// Every drawn frame of every window, before its UI is built: render and
+    /// register the textures the UI will show (each window has its own
+    /// renderer).
+    fn prepare(&mut self, _gpu: &Gpu, _renderer: &mut libgui_wgpu::Renderer, _surface: SurfaceId) {}
     /// Build one window's UI. `surface` is `SurfaceId::MAIN` for the main window.
     fn ui(&mut self, ui: &mut Ui, surface: SurfaceId, shell: &mut ShellCtx);
     /// True while something changes every frame on its own (playback).
     fn animating(&self) -> bool {
         false
     }
+    /// A system menu item without a shortcut was chosen.
+    fn menu_action(&mut self, _id: u32) {}
     /// The user answered a [`FileDialog`]; empty when cancelled.
     fn dialog_result(&mut self, _dialog: FileDialog, _paths: Vec<PathBuf>) {}
     /// The app's dock, for tear-off windows. `None`: one window only.
@@ -162,6 +251,18 @@ struct Win {
     clear: Color,
     /// Woken by another thread: rebuild the UI on the next draw.
     rebuild: bool,
+    /// The title strip's height (logical px), as the app last said.
+    strip: f32,
+    /// How far right the OS's window buttons reach (macOS).
+    inset: f32,
+    /// The pointer, logical px in the window.
+    pointer: Vec2,
+    /// The edge a press would resize from (borderless windows).
+    resize: Option<ResizeDirection>,
+    last_press: Option<Instant>,
+    mods: Modifiers,
+    /// A key pressed on a menu item's behalf, to release after a frame.
+    release: Option<Key>,
 }
 
 struct Shell<A: ShellApp> {
@@ -175,6 +276,10 @@ struct Shell<A: ShellApp> {
     /// Inner minus outer position: what `set_outer_position` has to undo.
     decoration: Vec2,
     left_down: bool,
+    /// The system menu bar's menus as last set.
+    menu: Vec<NativeMenu>,
+    focused: Option<WindowId>,
+    exit: bool,
 }
 
 /// OS clipboard where there is one in reach (desktop).
@@ -224,6 +329,20 @@ impl<A: ShellApp> Shell<A> {
     fn create_window(&mut self, el: &ActiveEventLoop, dock_id: SurfaceId, title: &str, size: Vec2, inner_pos: Option<Vec2>) -> WindowId {
         let main = dock_id == SurfaceId::MAIN;
         let mut attrs = Window::default_attributes().with_title(title).with_active(main);
+        // The app draws the title bar.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs.with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true);
+        }
+        if BORDERLESS {
+            attrs = attrs.with_decorations(false);
+        }
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_undecorated_shadow(true);
+        }
         if !IOS {
             attrs = attrs.with_inner_size(LogicalSize::new(size.x, size.y));
         }
@@ -277,6 +396,11 @@ impl<A: ShellApp> Shell<A> {
         libgui_keymap::Keymap::<u8>::for_current_platform().install(&mut ui);
         ui.reserve(8_000);
         let clear = ui.theme.palette.bg_app;
+        let strip = if main { 38.0 } else { ui.theme.tab.height };
+        #[cfg(target_os = "macos")]
+        let inset = macos::place_traffic_lights(&window, strip as f64);
+        #[cfg(not(target_os = "macos"))]
+        let inset = 0.0;
         let id = window.id();
         self.wins.insert(
             id,
@@ -296,6 +420,13 @@ impl<A: ShellApp> Shell<A> {
                 batches: Vec::new(),
                 clear,
                 rebuild: true,
+                strip,
+                inset,
+                pointer: Vec2::ZERO,
+                resize: None,
+                last_press: None,
+                mods: Modifiers::NONE,
+                release: None,
             },
         );
         id
@@ -371,16 +502,20 @@ impl<A: ShellApp> Shell<A> {
             dt: w.idle,
         };
 
-        let main = w.dock_id == SurfaceId::MAIN;
         let dock_wants = self.app.dock().is_some_and(|d| d.needs_frame(w.dock_id));
         let mut platform = PlatformOutput::default();
-        let mut ctx = ShellCtx::default();
+        let chrome = if IOS {
+            Chrome::Os
+        } else if MAC {
+            Chrome::Leading { inset: if w.window.fullscreen().is_some() { 0.0 } else { w.inset } }
+        } else {
+            Chrome::Drawn { maximized: w.window.is_maximized() }
+        };
+        let mut ctx = ShellCtx { chrome, ..ShellCtx::default() };
         if w.rebuild || self.app.animating() || dock_wants || w.ui.needs_frame_for(&info, w.idle) {
             w.idle = 0.0;
             w.rebuild = false;
-            if main {
-                self.app.prepare(&g.gpu, &mut w.renderer);
-            }
+            self.app.prepare(&g.gpu, &mut w.renderer, w.dock_id);
             w.ui.begin_frame(info);
             self.app.ui(&mut w.ui, w.dock_id, &mut ctx);
             let out = w.ui.end_frame();
@@ -426,6 +561,14 @@ impl<A: ShellApp> Shell<A> {
             g.gpu.queue.present(frame);
         }
         w.platform.apply(&w.window, &platform);
+        if let Some(dir) = w.resize {
+            w.window.set_cursor(resize_cursor(dir));
+        }
+        if let Some(key) = w.release.take() {
+            w.ui.push(InputEvent::Key { key, pressed: false, repeat: false });
+            w.ui.push(InputEvent::ModifiersChanged(w.mods));
+            w.rebuild = true;
+        }
         if let Some(text) = platform.copied_text {
             self.clipboard.set(text);
         }
@@ -434,10 +577,74 @@ impl<A: ShellApp> Shell<A> {
                 w.ui.push(InputEvent::Paste(text));
             }
         }
+        if let Some(h) = ctx.strip.filter(|h| *h != w.strip) {
+            w.strip = h;
+            #[cfg(target_os = "macos")]
+            {
+                w.inset = macos::place_traffic_lights(&w.window, h as f64);
+            }
+        }
+        let dock_id = w.dock_id;
+        for r in &ctx.windows {
+            match r {
+                WindowRequest::Minimize => w.window.set_minimized(true),
+                WindowRequest::ToggleMaximize => w.window.set_maximized(!w.window.is_maximized()),
+                WindowRequest::Close => {}
+            }
+        }
         self.wins.insert(wid, w);
+        if ctx.windows.contains(&WindowRequest::Close) {
+            self.close(dock_id);
+        }
+        if let Some(menus) = ctx.menu.filter(|m| *m != self.menu) {
+            #[cfg(target_os = "macos")]
+            macos::set_menu(&self.cfg.title, &menus);
+            self.menu = menus;
+        }
         for d in ctx.dialogs {
             self.show_dialog(d);
         }
+    }
+
+    /// A window's close button: the main window quits; a torn-off one gives
+    /// its panels back to the main window.
+    fn close(&mut self, dock_id: SurfaceId) {
+        if dock_id == SurfaceId::MAIN {
+            self.exit = true;
+        } else if let Some(d) = self.app.dock() {
+            d.close_surface(dock_id);
+        }
+    }
+
+    /// System menu items chosen since last time: an item with a shortcut
+    /// presses it in the focused window; the rest go to the app.
+    fn menu_chosen(&mut self, el: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        for id in macos::take_chosen() {
+            if id == macos::QUIT {
+                el.exit();
+                return;
+            }
+            let shortcut = self.menu.iter().flat_map(|m| &m.entries).find_map(|e| match e {
+                MenuEntry::Item { id: i, shortcut, .. } if *i == id => Some(*shortcut),
+                _ => None,
+            });
+            match shortcut.flatten() {
+                Some(sc) => {
+                    let main = self.wins.iter().find(|(_, w)| w.dock_id == SurfaceId::MAIN).map(|(id, _)| *id);
+                    let target = self.focused.filter(|id| self.wins.contains_key(id)).or(main);
+                    if let Some(w) = target.and_then(|id| self.wins.get_mut(&id)) {
+                        w.ui.push(InputEvent::ModifiersChanged(sc.mods));
+                        w.ui.push(InputEvent::Key { key: sc.key, pressed: true, repeat: false });
+                        w.release = Some(sc.key);
+                        w.rebuild = true;
+                        w.window.request_redraw();
+                    }
+                }
+                None => self.app.menu_action(id),
+            }
+        }
+        let _ = el;
     }
 
     /// Desktop: a native dialog, answered at once. iPadOS: the document
@@ -492,7 +699,8 @@ impl<A: ShellApp> ApplicationHandler<UserEvent> for Shell<A> {
         }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
+        self.menu_chosen(el);
         match event {
             UserEvent::Wake => {}
             UserEvent::Picked(d, paths) => self.app.dialog_result(d, paths),
@@ -505,22 +713,66 @@ impl<A: ShellApp> ApplicationHandler<UserEvent> for Shell<A> {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, wid: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _el: &ActiveEventLoop, wid: WindowId, event: WindowEvent) {
+        let dragging_tab = self.app.dock().is_some_and(|d| d.is_dragging());
         let Some(w) = self.wins.get_mut(&wid) else { return };
+        match &event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = w.window.scale_factor() as f32;
+                w.pointer = Vec2::new(position.x as f32 / scale, position.y as f32 / scale);
+                if BORDERLESS {
+                    let resize = edge(&w.window, w.pointer);
+                    if resize != w.resize {
+                        w.resize = resize;
+                        if let Some(dir) = resize {
+                            w.window.set_cursor(resize_cursor(dir));
+                        }
+                    }
+                }
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                let s = m.state();
+                w.mods = Modifiers { shift: s.shift_key(), ctrl: s.control_key(), alt: s.alt_key(), logo: s.super_key() };
+            }
+            WindowEvent::Focused(true) => self.focused = Some(wid),
+            // The title bar is the app's: a press on its empty space moves
+            // the window (double: maximizes), one on a borderless window's
+            // edge resizes it. Neither reaches the UI.
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } if !IOS && !dragging_tab => {
+                if let Some(dir) = w.resize {
+                    let _ = w.window.drag_resize_window(dir);
+                    return;
+                }
+                if w.pointer.y < w.strip && !w.ui.wants_pointer() {
+                    let now = Instant::now();
+                    let double = w.last_press.is_some_and(|t| (now - t).as_secs_f32() < DOUBLE_CLICK_S);
+                    w.last_press = if double { None } else { Some(now) };
+                    if double {
+                        w.window.set_maximized(!w.window.is_maximized());
+                    } else {
+                        let _ = w.window.drag_window();
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
         if !w.files.push_window_event(&mut w.ui, &event) {
             libgui_winit::push_window_event(&mut w.ui, &event, w.window.scale_factor());
         }
         let dock_id = w.dock_id;
         let origin = w.window.inner_position().ok().map(vec);
         match event {
-            WindowEvent::CloseRequested => {
-                if dock_id == SurfaceId::MAIN {
-                    el.exit();
-                } else if let Some(d) = self.app.dock() {
-                    d.close_surface(dock_id);
+            WindowEvent::CloseRequested => self.close(dock_id),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Focused(_) => {
+                // AppKit puts the traffic lights back on these.
+                #[cfg(target_os = "macos")]
+                {
+                    w.inset = macos::place_traffic_lights(&w.window, w.strip as f64);
+                    w.rebuild = true;
                 }
+                w.window.request_redraw();
             }
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => w.window.request_redraw(),
             WindowEvent::RedrawRequested => self.draw(wid),
             WindowEvent::CursorMoved { position, .. } => {
                 // The dock hit-tests in screen coordinates: during a tab drag
@@ -563,6 +815,10 @@ impl<A: ShellApp> ApplicationHandler<UserEvent> for Shell<A> {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if self.exit {
+            el.exit();
+            return;
+        }
         if self.gfx.is_none() {
             return;
         }
@@ -578,6 +834,37 @@ impl<A: ShellApp> ApplicationHandler<UserEvent> for Shell<A> {
     }
 }
 
+/// The edge of a borderless window under `p` (logical px), if any.
+fn edge(window: &Window, p: Vec2) -> Option<ResizeDirection> {
+    if window.is_maximized() || window.fullscreen().is_some() {
+        return None;
+    }
+    let scale = window.scale_factor() as f32;
+    let size = window.inner_size();
+    let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
+    let (l, r, t, b) = (p.x < RESIZE_PX, p.x > w - RESIZE_PX, p.y < RESIZE_PX, p.y > h - RESIZE_PX);
+    Some(match (l, r, t, b) {
+        (true, _, true, _) => ResizeDirection::NorthWest,
+        (_, true, true, _) => ResizeDirection::NorthEast,
+        (true, _, _, true) => ResizeDirection::SouthWest,
+        (_, true, _, true) => ResizeDirection::SouthEast,
+        (true, ..) => ResizeDirection::West,
+        (_, true, ..) => ResizeDirection::East,
+        (_, _, true, _) => ResizeDirection::North,
+        (_, _, _, true) => ResizeDirection::South,
+        _ => return None,
+    })
+}
+
+fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
+    match dir {
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
+    }
+}
+
 /// Run until the main window closes. `make_app` receives the [`Waker`] other
 /// threads use to wake the UI. Never returns on iPadOS.
 pub fn run<A: ShellApp + 'static>(cfg: ShellConfig, make_app: impl FnOnce(Waker) -> A) {
@@ -589,6 +876,8 @@ pub fn run<A: ShellApp + 'static>(cfg: ShellConfig, make_app: impl FnOnce(Waker)
     let waker: Waker = Arc::new(move || {
         let _ = p.send_event(UserEvent::Wake);
     });
+    #[cfg(target_os = "macos")]
+    macos::install(waker.clone());
     let mut shell = Shell {
         app: make_app(waker),
         cfg,
@@ -598,6 +887,9 @@ pub fn run<A: ShellApp + 'static>(cfg: ShellConfig, make_app: impl FnOnce(Waker)
         proxy,
         decoration: Vec2::ZERO,
         left_down: false,
+        menu: Vec::new(),
+        focused: None,
+        exit: false,
     };
     el.run_app(&mut shell).expect("event loop");
 }

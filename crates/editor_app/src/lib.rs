@@ -5,26 +5,82 @@
 use std::path::PathBuf;
 
 use libgui::{SurfaceId, Ui, Vec2};
-use platform_winit::{DockHost, FileDialog, Gpu, ShellApp, ShellConfig, ShellCtx, SurfaceInfo};
+use libgui_keymap::Platform;
+use platform_winit::{Chrome, DockHost, FileDialog, Gpu, MenuEntry, NativeMenu, ShellApp, ShellConfig, ShellCtx, SurfaceInfo, WindowRequest};
 use ve_engine::Engine;
 use ve_model::MediaRef;
-use ve_ui::{EditorUi, HostRequest};
+use ve_ui::{Action, EditorUi, Entry, HostRequest, WindowAction, WindowControls, WindowFrame};
 
-/// The editor, and what the open media picker is for when it is not an
-/// import (the dialog itself does not say).
-struct App(EditorUi, Option<HostRequest>);
+/// The editor; what the open media picker is for when it is not an import
+/// (the dialog itself does not say); and the actions behind the system menu
+/// bar's item ids.
+struct App(EditorUi, Option<HostRequest>, Vec<Action>);
+
+/// The editor's menus as the system menu bar takes them: item ids index
+/// `actions`.
+fn native_menus(menus: Vec<ve_ui::Menu>, actions: &mut Vec<Action>) -> Vec<NativeMenu> {
+    actions.clear();
+    let platform = Platform::current();
+    menus
+        .into_iter()
+        .map(|m| NativeMenu {
+            title: m.title,
+            entries: m
+                .entries
+                .into_iter()
+                .map(|e| match e {
+                    Entry::Separator => MenuEntry::Separator,
+                    Entry::Item(it) => {
+                        actions.push(it.action);
+                        MenuEntry::Item {
+                            id: actions.len() as u32 - 1,
+                            label: it.label,
+                            shortcut: it.shortcut.map(|c| c.resolve(platform)),
+                            enabled: it.enabled,
+                            checked: it.checked == Some(true),
+                        }
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
 
 fn file_ref(p: &std::path::Path) -> MediaRef {
     MediaRef(format!("file:{}", p.display()))
 }
 
 impl ShellApp for App {
-    fn prepare(&mut self, gpu: &Gpu, renderer: &mut libgui_wgpu::Renderer) {
-        self.0.prepare_gpu(&gpu.device, &gpu.queue, renderer);
+    fn prepare(&mut self, gpu: &Gpu, renderer: &mut libgui_wgpu::Renderer, surface: SurfaceId) {
+        if surface == SurfaceId::MAIN {
+            self.0.prepare_gpu(&gpu.device, &gpu.queue, renderer);
+        } else {
+            // A torn-off panel shows the same monitor and thumbnails.
+            self.0.share_textures(surface, renderer);
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui, surface: SurfaceId, shell: &mut ShellCtx) {
-        self.0.ui_for(ui, surface);
+        let controls = match shell.chrome() {
+            Chrome::Os => WindowControls::Os,
+            Chrome::Leading { inset } => WindowControls::Leading { inset },
+            Chrome::Drawn { maximized } => WindowControls::Drawn { maximized },
+        };
+        self.0.ui_framed(ui, surface, WindowFrame { controls, system_menu: shell.system_menu() });
+        shell.set_title_strip(self.0.title_strip(surface));
+        for (s, a) in self.0.take_window_actions() {
+            if s == surface {
+                shell.window(match a {
+                    WindowAction::Minimize => WindowRequest::Minimize,
+                    WindowAction::ToggleMaximize => WindowRequest::ToggleMaximize,
+                    WindowAction::Close => WindowRequest::Close,
+                });
+            }
+        }
+        if surface == SurfaceId::MAIN && shell.system_menu() {
+            let menus = self.0.menus();
+            shell.set_menu(native_menus(menus, &mut self.2));
+        }
         for r in self.0.take_requests() {
             shell.file_dialog(match r {
                 HostRequest::ImportMedia => {
@@ -39,6 +95,12 @@ impl ShellApp for App {
                 HostRequest::SaveProjectAs => FileDialog::SaveProject { default_name: format!("{}.veproj", self.0.project_name()) },
                 HostRequest::ExportAs { default_name, extension } => FileDialog::SaveMedia { default_name, extension },
             });
+        }
+    }
+
+    fn menu_action(&mut self, id: u32) {
+        if let Some(a) = self.2.get(id as usize).cloned() {
+            self.0.perform(&a);
         }
     }
 
@@ -127,6 +189,6 @@ pub fn run(engine: Engine, touch: bool) {
         // Hardware-decoded frames go to the compositor without a copy where
         // the platform can import them.
         ui.set_importer(gpu_import::importer());
-        App(ui, None)
+        App(ui, None, Vec::new())
     });
 }

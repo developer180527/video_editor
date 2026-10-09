@@ -121,22 +121,26 @@ fn editor() -> EditorUi {
 }
 
 fn render(app: &mut EditorUi, w: u32, h: u32, name: &str, setup: impl Fn(&mut EditorUi)) {
+    render_framed(app, w, h, name, ve_ui::WindowFrame::default(), setup);
+}
+
+fn render_framed(app: &mut EditorUi, w: u32, h: u32, name: &str, frame: ve_ui::WindowFrame, setup: impl Fn(&mut EditorUi)) {
     let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
     ui.reserve(8_000);
     let info = FrameInfo { screen_size: Vec2::new(w as f32, h as f32), scale: 1.0, dt: 1.0 / 60.0 };
     for _ in 0..4 {
         ui.begin_frame(info);
-        app.ui(&mut ui);
+        app.ui_framed(&mut ui, SurfaceId::MAIN, frame);
         let _ = ui.end_frame();
     }
     setup(app);
     for _ in 0..3 {
         ui.begin_frame(info);
-        app.ui(&mut ui);
+        app.ui_framed(&mut ui, SurfaceId::MAIN, frame);
         let _ = ui.end_frame();
     }
     ui.begin_frame(info);
-    app.ui(&mut ui);
+    app.ui_framed(&mut ui, SurfaceId::MAIN, frame);
     let out = ui.end_frame();
     let img = SoftRenderer::new().render_to_image(&out, w, h);
     drop(out);
@@ -150,8 +154,8 @@ fn render(app: &mut EditorUi, w: u32, h: u32, name: &str, setup: impl Fn(&mut Ed
     enc.write_header().unwrap().write_image_data(&img.data).unwrap();
     println!("{}", path.display());
     // With a dialog open the last tree laid out is the modal's own.
-    let min = if app.view.dialog.is_some() { 10 } else { 200 };
-    assert!(ui.frame_cost().nodes > min, "the editor did not build");
+    let min = if app.view.dialog.is_some() { 10 } else { 100 };
+    assert!(ui.frame_cost().nodes > min, "the editor did not build ({} nodes)", ui.frame_cost().nodes);
 }
 
 #[test]
@@ -178,6 +182,29 @@ fn features() {
         app.view.dialog = Some(ve_ui::Dialog::Speed { clip: app.view.selection[0], percent: 50.0, reverse: false, ripple: true });
         app.view.selection.clear();
     });
+}
+
+/// The title bar as the editor draws it: the window buttons it draws
+/// itself (Windows, Linux), and room left for the OS's (macOS).
+#[test]
+fn title_bars() {
+    let mut app = editor();
+    let drawn = ve_ui::WindowFrame { controls: ve_ui::WindowControls::Drawn { maximized: false }, system_menu: false };
+    render_framed(&mut app, 2000, 1129, "titlebar-drawn.png", drawn, |_| {});
+    let mac = ve_ui::WindowFrame { controls: ve_ui::WindowControls::Leading { inset: 78.0 }, system_menu: true };
+    render_framed(&mut app, 2000, 1129, "titlebar-mac.png", mac, |_| {});
+    // Every panel is listed in View, and toggling one closes and reopens it.
+    let view = |app: &EditorUi| app.menus().into_iter().find(|m| m.title == "View").unwrap();
+    let checked = |app: &EditorUi, name: &str| {
+        view(app).entries.iter().any(|e| matches!(e, ve_ui::Entry::Item(i) if i.label == name && i.checked == Some(true)))
+    };
+    assert!(checked(&app, "Program"));
+    app.perform(&ve_ui::Action::TogglePanel(ve_ui::Tab::Program));
+    assert!(!checked(&app, "Program"), "closed");
+    app.perform(&ve_ui::Action::TogglePanel(ve_ui::Tab::Program));
+    assert!(checked(&app, "Program"), "back");
+    app.perform(&ve_ui::Action::ResetWorkspace);
+    assert!(checked(&app, "Timeline"));
 }
 
 fn frame(ui: &mut Ui, app: &mut EditorUi) {

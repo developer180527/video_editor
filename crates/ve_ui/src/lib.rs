@@ -11,6 +11,7 @@
 mod dock;
 mod effects;
 mod features;
+mod menu;
 mod program;
 mod project;
 pub mod theme;
@@ -29,6 +30,7 @@ use ve_time::{Rate, Time, Timecode};
 
 pub use dock::Tab;
 pub use features::Dialog;
+pub use menu::{Action, Entry, Menu, MenuItem};
 pub use theme::theme;
 
 /// Payload kind the shell uses for files dragged in from the OS, carrying
@@ -53,6 +55,36 @@ pub enum HostRequest {
 }
 
 /// The timeline tools, in the order of the tool column.
+/// How the host frames a window, so the editor can draw a title bar of its
+/// own in place of the OS's.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowFrame {
+    pub controls: WindowControls,
+    /// The menus are in the system menu bar: don't draw them in the window.
+    pub system_menu: bool,
+}
+
+/// Who draws a window's minimize / maximize / close buttons, and where.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum WindowControls {
+    /// The OS frames the window (a tablet, tests): nothing to draw.
+    #[default]
+    Os,
+    /// The OS draws its buttons over the left end of the editor's bar: keep
+    /// `inset` logical px clear (0 when they are hidden, in full screen).
+    Leading { inset: f32 },
+    /// The editor draws them at the right end of its bar.
+    Drawn { maximized: bool },
+}
+
+/// A window button the editor drew was pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowAction {
+    Minimize,
+    ToggleMaximize,
+    Close,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Select,
@@ -130,6 +162,14 @@ pub struct EditorUi {
     thumbs: HashMap<(AssetId, i64), (wgpu::Texture, TextureId)>,
     thumb_uploads: Vec<((AssetId, i64), std::sync::Arc<ve_engine::Thumb>)>,
     monitor: Option<TextureId>,
+    /// The monitor's current picture, to point other windows' renderers at.
+    monitor_view: Option<wgpu::TextureView>,
+    /// Per torn-off window: the thumbnails its renderer has been given.
+    shared: HashMap<SurfaceId, HashSet<TextureId>>,
+    /// How the window being built is framed.
+    frame: WindowFrame,
+    window_actions: Vec<(SurfaceId, WindowAction)>,
+    tab_height: f32,
     /// The engine's state as of this frame.
     st: Published,
     playhead: Time,
@@ -187,6 +227,11 @@ impl EditorUi {
             thumbs: HashMap::new(),
             thumb_uploads: Vec::new(),
             monitor: None,
+            monitor_view: None,
+            shared: HashMap::new(),
+            frame: WindowFrame::default(),
+            window_actions: Vec::new(),
+            tab_height: 24.0,
             st,
             playhead: Time::ZERO,
             errors: Vec::new(),
@@ -218,7 +263,6 @@ impl EditorUi {
         std::mem::take(&mut self.requests)
     }
 
-    /// Render the program monitor and hand its texture to the UI renderer.
     /// Hand hardware-decoded frames to the compositor as they are, through
     /// the platform's `importer` (frames are copied through memory without
     /// one). Call before the first frame is drawn.
@@ -230,6 +274,8 @@ impl EditorUi {
         self.importer = importer;
     }
 
+    /// Render the program monitor and hand its texture (and new thumbnails)
+    /// to the main window's UI renderer.
     pub fn prepare_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui_wgpu::Renderer) {
         // Resolution from the quality menu; proxies from their toggle.
         let quality = ve_render::Quality { scale: [1.0, 0.5, 0.25][self.view.quality.min(2)], use_proxies: self.view.proxies };
@@ -275,6 +321,7 @@ impl EditorUi {
                 Some(id) => renderer.update_texture(id, &view),
                 None => self.monitor = Some(renderer.register_texture(&view)),
             }
+            self.monitor_view = Some(view);
         }
     }
 
@@ -439,8 +486,54 @@ impl EditorUi {
         r.frame_to_time(self.playhead.to_frame(r) + frames)
     }
 
-    /// One frame for one dock surface (the main window, or a torn-off panel).
+    /// Give a torn-off window's renderer the textures the main window's has
+    /// (the monitor, thumbnails), under the same ids, so panels show the same
+    /// pictures wherever they are. Call before building that window's UI.
+    pub fn share_textures(&mut self, surface: SurfaceId, renderer: &mut libgui_wgpu::Renderer) {
+        if surface == SurfaceId::MAIN {
+            return;
+        }
+        let bound = self.shared.entry(surface).or_default();
+        // The monitor's picture changes underneath its id: point at it each frame.
+        if let (Some(id), Some(view)) = (self.monitor, &self.monitor_view) {
+            renderer.update_texture(id, view);
+        }
+        for (tex, id) in self.thumbs.values() {
+            if bound.insert(*id) {
+                renderer.update_texture(*id, &tex.create_view(&Default::default()));
+            }
+        }
+    }
+
+    /// The height of the strip at the top of a window that is its title bar:
+    /// press empty space there to move the window.
+    pub fn title_strip(&self, surface: SurfaceId) -> f32 {
+        if surface == SurfaceId::MAIN {
+            topbar::HEIGHT
+        } else {
+            self.tab_height
+        }
+    }
+
+    /// The window buttons the editor drew that were pressed (drained).
+    pub fn take_window_actions(&mut self) -> Vec<(SurfaceId, WindowAction)> {
+        std::mem::take(&mut self.window_actions)
+    }
+
+    /// One frame for one dock surface (the main window, or a torn-off panel),
+    /// framed by the OS.
     pub fn ui_for(&mut self, ui: &mut Ui, surface: SurfaceId) {
+        self.ui_framed(ui, surface, WindowFrame::default());
+    }
+
+    /// One frame for one dock surface, in a window framed as `frame` says:
+    /// the editor draws the title bar (or keeps clear of the OS's buttons).
+    pub fn ui_framed(&mut self, ui: &mut Ui, surface: SurfaceId, frame: WindowFrame) {
+        self.frame = frame;
+        self.tab_height = ui.theme.tab.height;
+        if surface != SurfaceId::MAIN {
+            self.shared.retain(|id, _| self.dock.surface(*id).is_some());
+        }
         if surface == SurfaceId::MAIN {
             self.st = self.engine.published();
             self.playhead = self.engine.playhead();
@@ -463,14 +556,38 @@ impl EditorUi {
             }
             // The dock is borrowed apart from the rest of `self` through the viewer.
             let mut dock = std::mem::replace(&mut self.dock, DockState::new());
+            // A torn-off window's tab bar is its title bar: its tabs keep
+            // clear of the OS's window buttons.
+            let padding = dock.config.tab_bar_padding;
+            if let (true, WindowControls::Leading { inset }) = (surface != SurfaceId::MAIN, frame.controls) {
+                dock.config.tab_bar_padding = inset.max(padding);
+            }
             let mut viewer = dock::Viewer { app: self };
             dock.show(ui, surface, &mut viewer);
+            dock.config.tab_bar_padding = padding;
             self.dock = dock;
         });
+        if surface != SurfaceId::MAIN {
+            if let WindowControls::Drawn { maximized } = frame.controls {
+                let w = topbar::CONTROLS_W;
+                let rect = Rect::new(ui.input().screen_size.x - w, 0.0, w, self.tab_height);
+                ui.container_at(Id::new(("window-controls", surface.0)), rect, Frame::none(), |ui| {
+                    ui.container(Layout::row().width(Size::Grow(1.0)).height(Size::Grow(1.0)), Frame::none(), |ui| {
+                        for a in topbar::window_controls(ui, maximized, self.tab_height) {
+                            self.window_actions.push((surface, a));
+                        }
+                    });
+                });
+            }
+        }
         if surface == SurfaceId::MAIN {
             self.export_ui(ui);
             self.dialogs(ui);
-            self.shortcuts(ui);
+        }
+        // Keys go to the focused window, so every window takes shortcuts
+        // (after the dialogs: an open one holds them back).
+        self.shortcuts(ui);
+        if surface == SurfaceId::MAIN {
             ui.drag_ghost();
             ui.show_toasts();
         }

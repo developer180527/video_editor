@@ -174,3 +174,76 @@ fn info(ui: &mut Ui, app: &mut EditorUi) {
         ui.label(&format!("Duration: {}", app.timecode(seq.duration())));
     }
 }
+
+/// Every panel open in any window.
+pub(crate) fn open_tabs(dock: &DockState<Tab>) -> Vec<Tab> {
+    fn walk(n: &DockNode<Tab>, out: &mut Vec<Tab>) {
+        match n {
+            DockNode::Leaf(l) => out.extend(l.tabs.iter().copied()),
+            DockNode::Split(s) => {
+                walk(&s.first, out);
+                walk(&s.second, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for s in dock.surfaces() {
+        if let Some(r) = &s.root {
+            walk(r, &mut out);
+        }
+    }
+    out
+}
+
+/// `node` without `tab`; panes left empty go, and a split left with one
+/// side becomes that side.
+fn without(dock: &mut DockState<Tab>, node: DockNode<Tab>, tab: Tab) -> Option<DockNode<Tab>> {
+    match node {
+        DockNode::Leaf(mut l) => {
+            l.tabs.retain(|t| *t != tab);
+            if l.tabs.is_empty() {
+                return None;
+            }
+            l.active = l.active.min(l.tabs.len() - 1);
+            Some(DockNode::Leaf(l))
+        }
+        DockNode::Split(s) => {
+            let (axis, fraction) = (s.axis, s.fraction);
+            match (without(dock, *s.first, tab), without(dock, *s.second, tab)) {
+                (Some(a), Some(b)) => Some(dock.split(axis, fraction, a, b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// Close `tab` where it is open; open it in the main window where it is not.
+pub(crate) fn toggle_tab(dock: &mut DockState<Tab>, tab: Tab) {
+    if !open_tabs(dock).contains(&tab) {
+        dock.add_tab(SurfaceId::MAIN, tab);
+        return;
+    }
+    let ids: Vec<SurfaceId> = dock.surfaces().iter().map(|s| s.id).collect();
+    for id in ids {
+        let Some(root) = dock.take_root(id) else { continue };
+        match without(dock, root, tab) {
+            Some(r) => dock.set_root(id, r),
+            // A torn-off window with nothing left in it closes.
+            None if id != SurfaceId::MAIN => dock.close_surface(id),
+            None => {}
+        }
+    }
+}
+
+/// Back to the layout the editor opens with; torn-off windows close.
+pub(crate) fn reset(dock: &mut DockState<Tab>, touch: bool) {
+    let floating: Vec<SurfaceId> = dock.surfaces().iter().map(|s| s.id).filter(|id| *id != SurfaceId::MAIN).collect();
+    for id in floating {
+        dock.take_root(id);
+        dock.close_surface(id);
+    }
+    let config = dock.config.clone();
+    *dock = initial(touch);
+    dock.config = config;
+}
