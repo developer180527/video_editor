@@ -20,6 +20,8 @@ fn fixture() -> F {
         name: "a".into(),
         media: MediaRef("file:a".into()),
         info: Some(MediaInfo { duration: s(100), video: None, audio: Vec::new() }),
+        variants: Vec::new(),
+        marks: Default::default(),
     };
     let (v1, a1) = (Track::new(TrackKind::Video, "V1"), Track::new(TrackKind::Audio, "A1"));
     let seq = Sequence {
@@ -27,6 +29,7 @@ fn fixture() -> F {
         name: "S".into(),
         format: SequenceFormat::default(),
         tracks: [v1.clone(), a1.clone()].into_iter().map(Arc::new).collect(),
+        marks: Default::default(),
     };
     let f = F { seq: seq.id, v1: v1.id, a1: a1.id, asset: asset.id, p: Project::new("t") };
     p.assets.insert(asset.id, Arc::new(asset));
@@ -48,6 +51,10 @@ fn linked_clip(f: &F, start: i64, src: i64, len: i64, link: Option<LinkId>) -> A
         enabled: true,
         link,
         effects: Default::default(),
+        retime: Default::default(),
+        transition_in: None,
+        transition_out: None,
+        channels: Vec::new(),
     })
 }
 
@@ -238,4 +245,74 @@ fn razor_and_head_trim_agree() {
     let trimmed = run(&f, Command::TrimClip { clip: c.id, edge: Edge::Start, delta: s(3) });
     let (_, _, t) = trimmed.find_clip(c.id).unwrap();
     assert_eq!(right.effects[0].params, t.effects[0].params);
+}
+
+fn get(p: &Project, id: ClipId) -> Arc<Clip> {
+    p.find_clip(id).unwrap().2.clone()
+}
+
+#[test]
+fn double_speed_halves_the_clip_and_ripples() {
+    let mut f = fixture();
+    let a = clip(&f, 0, 10, 8); // media 10..18
+    let b = clip(&f, 8, 40, 4);
+    put(&mut f, true, &a);
+    put(&mut f, true, &b);
+    let p = run(&f, set_speed(&f.p, a.id, Ratio::new(2, 1), true).unwrap());
+    let a2 = get(&p, a.id);
+    assert_eq!((a2.timeline_range().duration, a2.media_extent()), (s(4), ve_time::TimeRange::new(s(10), s(8))), "same media, half the time");
+    assert_eq!(a2.source_time(s(3)), s(16));
+    assert_eq!(get(&p, b.id).timeline_start, s(4), "the next clip closes up");
+}
+
+#[test]
+fn cuts_and_head_trims_keep_frames_on_their_media_at_any_speed() {
+    let mut f = fixture();
+    let a = clip(&f, 0, 10, 8);
+    put(&mut f, true, &a);
+    f.p = set_speed(&f.p, a.id, Ratio::new(2, 1), false).unwrap().apply(&f.p).unwrap().project; // 4 s on the timeline
+    // Razor at 1 s: both sides show media 12 s at the cut.
+    let p = run(&f, razor(&f.p, &[a.id], s(1), false).unwrap());
+    let clips = p.sequence(f.seq).unwrap().track(f.v1).unwrap().1.clips.clone();
+    assert!((clips[0].source_time(s(1) - Time(1)) - s(12)).ticks().abs() <= 2, "continuous across the cut");
+    assert_eq!(clips[1].source_time(s(1)), s(12));
+    // A head trim of 1 s skips 2 s of media.
+    let p = run(&f, Command::TrimClip { clip: a.id, edge: Edge::Start, delta: s(1) });
+    assert_eq!(get(&p, a.id).source_time(s(1)), s(12));
+    // Extending past the media is refused: at 2x each timeline second is two
+    // of media.
+    let mut g = fixture();
+    let c = clip(&g, 0, 90, 8); // media 90..98 of 100
+    put(&mut g, true, &c);
+    g.p = set_speed(&g.p, c.id, Ratio::new(2, 1), false).unwrap().apply(&g.p).unwrap().project;
+    assert!(Command::TrimClip { clip: c.id, edge: Edge::End, delta: s(1) }.apply(&g.p).is_ok(), "to media 100, the end");
+    assert_eq!(Command::TrimClip { clip: c.id, edge: Edge::End, delta: s(2) }.apply(&g.p).unwrap_err(), CommandError::BeyondSource);
+}
+
+#[test]
+fn reverse_plays_the_same_span_backwards() {
+    let mut f = fixture();
+    let a = clip(&f, 0, 10, 8);
+    put(&mut f, true, &a);
+    let p = run(&f, set_speed(&f.p, a.id, Ratio::new(-1, 1), false).unwrap());
+    let r = get(&p, a.id);
+    assert!(r.source_time(s(1)) > r.source_time(s(2)), "media runs down");
+    assert_eq!(r.source_time(Time::ZERO), s(18) - Time(1), "from the last frame");
+    let e = r.media_extent();
+    assert!(e.start >= s(10) && e.end() <= s(18));
+}
+
+#[test]
+fn marks_media_and_layouts_change_and_undo() {
+    let f = fixture();
+    let mut m = Marks { in_point: Some(s(2)), out_point: Some(s(5)), ..Default::default() };
+    run(&f, Command::SetMarks { owner: crate::MarksOwner::Sequence(f.seq), marks: m.clone() });
+    m.in_point = Some(s(9));
+    assert_eq!(
+        Command::SetMarks { owner: crate::MarksOwner::Sequence(f.seq), marks: m }.apply(&f.p).unwrap_err(),
+        CommandError::Invalid(ModelError::BadMarks),
+        "in after out"
+    );
+    run(&f, Command::SetAssetMedia { asset: f.asset, media: MediaRef("file:moved/a".into()), info: None });
+    run(&f, Command::SetTrackLayout { sequence: f.seq, track: f.a1, layout: ChannelLayout::Mono });
 }

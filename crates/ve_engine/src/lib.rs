@@ -20,12 +20,12 @@ pub mod frame;
 mod project_file;
 
 pub use client::{EngineClient, Published, Waker};
-pub use clips::{clips_for_asset, default_value, make_clip};
+pub use clips::{clips_for_asset, default_value, make_clip, make_generator_clip, make_sequence_clip};
 pub use ve_command::edit;
 pub use ve_plugin_host::intrinsic;
 
 pub use project_file::{ProjectFileError, FILE_FORMAT};
-pub use ve_command::{Command, CommandError, Edge, TrackState};
+pub use ve_command::{Command, CommandError, Edge, MarksOwner, TrackState};
 pub use ve_model::Snapshot;
 pub use ve_plugin_host::Registry as PluginRegistry;
 /// How plugins describe themselves, for frontends that build UI from it.
@@ -172,6 +172,7 @@ impl Engine {
             .into_iter()
             .map(Arc::new)
             .collect(),
+            marks: Default::default(),
         };
         p.active_sequence = Some(seq.id);
         p.sequences.insert(seq.id, Arc::new(seq));
@@ -248,10 +249,24 @@ impl Engine {
         let storage = &self.platform.storage;
         let media = storage.make_ref(picked)?;
         let info = self.platform.media.probe(&storage.resolve(&media)?)?;
-        let asset = Asset { id: AssetId::new(), name: storage.display_name(&media), media, info: Some(info) };
+        let asset = Asset { id: AssetId::new(), name: storage.display_name(&media), media, info: Some(info), variants: Vec::new(), marks: Default::default() };
         let id = asset.id;
         self.execute(Command::AddAsset { asset: Arc::new(asset) })?;
         Ok(id)
+    }
+
+    /// Attach `picked` as `asset`'s proxy (replacing any): probed, then
+    /// played instead of the original wherever previews use proxies.
+    pub fn attach_proxy(&mut self, asset: AssetId, picked: &str) -> Result<(), EngineError> {
+        let storage = &self.platform.storage;
+        let media = storage.make_ref(picked)?;
+        let info = self.platform.media.probe(&storage.resolve(&media)?)?;
+        let v = info.video.ok_or_else(|| MediaError::Unsupported("a proxy needs a picture".into()))?;
+        let a = self.project.assets.get(&asset).ok_or(CommandError::NotFound("asset"))?;
+        let mut variants: Vec<MediaVariant> = a.variants.iter().filter(|v| v.kind != VariantKind::Proxy).cloned().collect();
+        variants.push(MediaVariant { kind: VariantKind::Proxy, media, width: v.width, height: v.height });
+        self.execute(Command::SetAssetVariants { asset, variants })?;
+        Ok(())
     }
 
     // ---- files -------------------------------------------------------------

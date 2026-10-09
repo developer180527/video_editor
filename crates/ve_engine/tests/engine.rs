@@ -31,6 +31,10 @@ fn add_generator_clip(e: &mut Engine, start: i64, len: i64) -> ClipId {
         enabled: true,
         link: None,
         effects: Default::default(),
+        retime: Default::default(),
+        transition_in: None,
+        transition_out: None,
+        channels: Vec::new(),
     };
     let id = clip.id;
     e.execute(Command::AddClip { sequence: seq.id, track: seq.tracks[0].id, clip: Arc::new(clip) }).unwrap();
@@ -112,6 +116,10 @@ fn threaded_client_round_trip() {
         enabled: true,
         link: None,
         effects: Default::default(),
+        retime: Default::default(),
+        transition_in: None,
+        transition_out: None,
+        channels: Vec::new(),
     };
     client.execute(Command::AddClip { sequence: seq.id, track: seq.tracks[0].id, clip: Arc::new(clip) });
     // Seek applies locally at once.
@@ -141,6 +149,8 @@ fn make_clip_attaches_intrinsics() {
             video: Some(VideoStreamInfo { width: 1280, height: 720, rate: ve_time::Rate::FPS_25, codec: "h264".into() }),
             audio: Vec::new(),
         }),
+        variants: Vec::new(),
+        marks: Default::default(),
     };
     let fmt = SequenceFormat::default();
     let c = make_clip(e.plugins(), &fmt, &asset, TrackKind::Video, Time::from_seconds(3), None);
@@ -208,6 +218,8 @@ fn every_audio_stream_gets_a_track_and_a_clip() {
             video: Some(VideoStreamInfo { width: 1920, height: 1080, rate: ve_time::Rate::FPS_25, codec: "h264".into() }),
             audio: vec![stream("mono", 1), stream("mono", 1), stream("mono", 1), stream("stereo", 2)],
         }),
+        variants: Vec::new(),
+        marks: Default::default(),
     };
     e.execute(Command::AddAsset { asset: Arc::new(asset.clone()) }).unwrap();
     let before = e.snapshot();
@@ -246,6 +258,8 @@ fn clips_must_name_an_existing_stream() {
         name: "a.wav".into(),
         media: MediaRef("file:a.wav".into()),
         info: Some(MediaInfo { duration: Time::from_seconds(1), video: None, audio: vec![AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: "pcm".into(), layout: "stereo".into() }] }),
+        variants: Vec::new(),
+        marks: Default::default(),
     };
     e.execute(Command::AddAsset { asset: Arc::new(asset.clone()) }).unwrap();
     let snap = e.snapshot();
@@ -254,4 +268,71 @@ fn clips_must_name_an_existing_stream() {
     clip.source = ClipSource::Asset { asset: asset.id, audio_stream: 1 };
     let err = e.execute(Command::AddClip { sequence: seq.id, track: seq.tracks[2].id, clip: Arc::new(clip) }).unwrap_err();
     assert!(matches!(err, CommandError::Invalid(ModelError::MissingAudioStream(_))), "{err:?}");
+}
+
+/// Every schema-3 feature survives a save and an open unchanged.
+#[test]
+fn new_features_round_trip_through_the_file() {
+    let dir = tmp("schema3");
+    let mut e = engine(&dir);
+    let snap = e.snapshot();
+    let seq = snap.active().unwrap().clone();
+    // A nested sequence holding a sped-up, reversed generator with a fade.
+    let mut inner_clip = make_generator_clip(e.plugins(), &seq.format, &intrinsic::plugin_ref(intrinsic::BARS), Time::from_seconds(4)).unwrap();
+    inner_clip.retime = Retime::Remap(vec![RemapKey { time: Time::ZERO, offset: Time::from_seconds(2) }, RemapKey { time: Time::from_seconds(4), offset: Time::ZERO }]);
+    inner_clip.transition_in = Some(Arc::new(Transition {
+        id: EffectId::new(),
+        plugin: intrinsic::plugin_ref(intrinsic::DIP_TO_BLACK),
+        before: Time::ZERO,
+        after: Time::from_seconds(1),
+        params: OrdMap::new(),
+    }));
+    let mut v1 = Track::new(TrackKind::Video, "V1");
+    v1.clips.push_back(Arc::new(inner_clip));
+    let mut a1 = Track::new(TrackKind::Audio, "A1");
+    a1.layout = ChannelLayout::Mono;
+    let inner = Sequence::new("Nest", seq.format.clone(), [v1, a1]);
+    e.execute(Command::AddSequence { sequence: Arc::new(inner.clone()) }).unwrap();
+    let mut outer = make_sequence_clip(e.plugins(), &seq.format, &inner, TrackKind::Video, None);
+    outer.source = ClipSource::Sequence { sequence: inner.id, angle: Some(0) };
+    outer.retime = Retime::Speed(Ratio::new(24000, 25025));
+    e.execute(Command::AddClip { sequence: seq.id, track: seq.tracks[0].id, clip: Arc::new(outer) }).unwrap();
+    // Marks, a proxy, a track layout.
+    let marker = Marker {
+        id: MarkerId::new(),
+        time: Time::from_seconds(1),
+        duration: Time::ZERO,
+        name: "Chapter 1".into(),
+        comment: String::new(),
+        color: MarkerColor::Blue,
+        kind: MarkerKind::Chapter,
+    };
+    let marks = Marks { in_point: Some(Time::from_seconds(1)), out_point: None, markers: [marker].into_iter().collect() };
+    e.execute(Command::SetMarks { owner: MarksOwner::Sequence(seq.id), marks }).unwrap();
+    let mut asset = Asset::new("a.mov", MediaRef("file:a.mov".into()), None);
+    asset.variants.push(MediaVariant { kind: VariantKind::Proxy, media: MediaRef("file:a_proxy.mov".into()), width: 960, height: 540 });
+    e.execute(Command::AddAsset { asset: Arc::new(asset) }).unwrap();
+    e.execute(Command::SetTrackLayout { sequence: seq.id, track: seq.tracks[3].id, layout: ChannelLayout::Mono }).unwrap();
+
+    let file = MediaRef(format!("file:{}", dir.join("p.veproj").display()));
+    e.save_as(file.clone()).unwrap();
+    let mut other = engine(&dir);
+    other.open(file).unwrap();
+    assert_eq!(*other.snapshot(), *e.snapshot());
+}
+
+#[test]
+fn a_sequence_cannot_contain_itself() {
+    let mut e = engine(&tmp("cycle"));
+    let snap = e.snapshot();
+    let seq = snap.active().unwrap().clone();
+    let inner = Sequence::new("Inner", seq.format.clone(), [Track::new(TrackKind::Video, "V1")]);
+    e.execute(Command::AddSequence { sequence: Arc::new(inner.clone()) }).unwrap();
+    // Outer holds Inner…
+    let c = make_sequence_clip(e.plugins(), &seq.format, &inner, TrackKind::Video, None);
+    e.execute(Command::AddClip { sequence: seq.id, track: seq.tracks[0].id, clip: Arc::new(c) }).unwrap();
+    // …so Inner may not hold Outer.
+    let back = make_sequence_clip(e.plugins(), &seq.format, &seq, TrackKind::Video, None);
+    let err = e.execute(Command::AddClip { sequence: inner.id, track: inner.tracks[0].id, clip: Arc::new(back) }).unwrap_err();
+    assert!(matches!(err, CommandError::Invalid(ModelError::NestingCycle(_))), "{err:?}");
 }

@@ -277,7 +277,7 @@ impl EngineClient {
         // Playing forwards: have the next cut's pictures ready in time.
         if let State::Playing { rate } = p.transport.state() {
             if rate > 0.0 {
-                crate::frame::prefetch(&p.snapshot, t, Time::from_seconds_f64(2.0 * rate), &self.video);
+                crate::frame::prefetch(&p.snapshot, t, Time::from_seconds_f64(2.0 * rate), quality.use_proxies, &self.video);
             }
         }
         Some(crate::frame::resolve(&p.snapshot, plan, &p.plugins, &self.video, None))

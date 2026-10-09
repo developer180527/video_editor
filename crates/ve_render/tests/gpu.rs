@@ -28,18 +28,12 @@ fn gray(w: u32, h: u32, y: u8) -> Arc<VideoFrame> {
 }
 
 fn plan(w: u32, h: u32) -> FramePlan {
-    FramePlan { time: Time::ZERO, width: w, height: h, layers: vec![] }
+    FramePlan { time: Time::ZERO, width: w, height: h, layers: vec![], proxies: false }
 }
 
 fn layer(frame: Arc<VideoFrame>, scale: f32, opacity: f32) -> RenderLayer {
     let (w, h) = (frame.width as f32, frame.height as f32);
-    RenderLayer {
-        frame,
-        motion: Motion { position: [32.0, 18.0], scale, rotation: 0.0, anchor: [w / 2.0, h / 2.0], crop: [0.0; 4] },
-        opacity,
-        blend: Blend::Normal,
-        effects: vec![],
-    }
+    RenderLayer::of_frame(frame, Motion { position: [32.0, 18.0], scale, rotation: 0.0, anchor: [w / 2.0, h / 2.0], crop: [0.0; 4] }, opacity)
 }
 
 fn px(img: &(u32, u32, Vec<u8>), x: u32, y: u32) -> [u8; 4] {
@@ -265,7 +259,7 @@ fn deep_output_keeps_ten_bit_steps() {
     let levels = |deep: bool| {
         let mut c = Compositor::new(&device);
         c.set_deep_output(deep);
-        c.render(&device, &queue, &FramePlan { time: Time::ZERO, width: w, height: h, layers: vec![] }, &[l.clone()], (w, h), WorkingSpace::LinearRec709);
+        c.render(&device, &queue, &FramePlan { time: Time::ZERO, width: w, height: h, layers: vec![], proxies: false }, &[l.clone()], (w, h), WorkingSpace::LinearRec709);
         let rb = c.start_readback(&device, &queue).unwrap();
         let bpp = rb.bytes_per_pixel() as usize;
         let (_, _, px) = rb.finish(&device).unwrap();

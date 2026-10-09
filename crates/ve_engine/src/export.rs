@@ -55,6 +55,8 @@ impl ExportPreset {
 /// A running export, shared with whoever shows its progress.
 pub struct ExportState {
     pub name: String,
+    /// The first sequence frame exported (the in point's).
+    pub first: i64,
     pub total: u64,
     done: AtomicU64,
     cancel: AtomicBool,
@@ -93,12 +95,14 @@ pub fn start(
 ) -> Arc<ExportState> {
     let seq = project.active().cloned();
     let rate = seq.as_ref().map(|s| s.format.rate).unwrap_or(ve_time::Rate::FPS_24);
-    let duration = seq.as_ref().map(|s| s.duration()).unwrap_or(Time::ZERO);
-    // Every frame that starts before the end.
-    let last = duration - Time(1);
-    let total = if duration > Time::ZERO { last.to_frame(rate) as u64 + 1 } else { 0 };
+    // The in/out range when set, else the whole sequence: every frame that
+    // touches it.
+    let range = seq.as_ref().map(|s| s.marks.range(s.duration())).unwrap_or_default();
+    let first = range.start.to_frame(rate);
+    let total = if range.duration > Time::ZERO { ((range.end() - Time(1)).to_frame(rate) - first + 1) as u64 } else { 0 };
     let state = Arc::new(ExportState {
         name: platform.storage.display_name(&out),
+        first,
         total,
         done: AtomicU64::new(0),
         cancel: AtomicBool::new(false),
@@ -194,9 +198,9 @@ fn run(
         if state.cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let t = f.rate.frame_to_time(i as i64);
+        let t = f.rate.frame_to_time(state.first + i as i64);
         let plan = ve_render::evaluate(&seq, t, Quality::FULL);
-        crate::frame::prefetch(project, t, Time::from_seconds(1), pool);
+        crate::frame::prefetch(project, t, Time::from_seconds(1), false, pool);
         let frame = crate::frame::resolve(project, plan, registry, pool, Some(FRAME_TIMEOUT));
         if let Some(why) = frame.missing.first() {
             let tc = ve_time::Timecode::from_time(t, f.rate, f.rate.is_drop_frame_rate());
@@ -210,7 +214,7 @@ fn run(
             encode(&mut *enc, prev, at)?;
         }
         // This frame's share of the audio, counted in whole samples from zero.
-        let next = f.rate.frame_to_time(i as i64 + 1);
+        let next = f.rate.frame_to_time(state.first + i as i64 + 1);
         let n = samples_at(next) - samples_at(t);
         audio.resize(n * 2, 0.0);
         mixer.render(project, &seq, t, &mut audio);

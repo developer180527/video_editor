@@ -10,12 +10,13 @@
 //!   Apple, Vulkan/D3D12 elsewhere), so this is not a port.
 
 mod compositor;
+pub mod generate;
 
-pub use compositor::{quad, yuv_levels, Blend, Compositor, Readback, DEEP_FORMAT, GpuEffect, Motion, RenderLayer, TextureImporter, WorkingSpace, DISPLAY_FORMAT, WORKING_FORMAT};
+pub use compositor::{quad, yuv_levels, Blend, Compositor, LayerSource, NestedLayers, Readback, RenderTransition, DEEP_FORMAT, GpuEffect, Motion, RenderLayer, TextureImporter, WorkingSpace, DISPLAY_FORMAT, WORKING_FORMAT};
 
 use std::sync::Arc;
 use ve_model::*;
-use ve_time::Time;
+use ve_time::{Time, TimeRange};
 
 /// How hard to try. Previews drop resolution; export never does.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -43,11 +44,28 @@ pub struct Layer {
     pub track: TrackId,
     pub clip: ClipId,
     pub source: ClipSource,
-    /// The source frame to show.
+    /// The source frame to show (through the clip's speed or remap).
     pub source_time: Time,
-    /// Time since the clip's start: what keyframes and effects see.
+    /// Time since the clip's start: what keyframes and effects see. Outside
+    /// `0..duration` inside a transition (the clip's handles).
     pub clip_time: Time,
     pub effects: Vec<ResolvedEffect>,
+    /// Inside a transition: the other clip and how far along it is.
+    pub transition: Option<Box<LayerTransition>>,
+}
+
+/// A layer's part in a transition. The layer is the clip going out, unless
+/// it is fading in from nothing (`self_incoming`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerTransition {
+    pub plugin: PluginRef,
+    pub params: Vec<(String, Value)>,
+    /// 0 at the transition's start, 1 at its end.
+    pub progress: f64,
+    /// The clip coming in, for a cross transition; `None` for a fade.
+    pub incoming: Option<Layer>,
+    /// This layer is the one coming in (a fade from nothing).
+    pub self_incoming: bool,
 }
 
 /// Everything needed to draw one frame of a sequence.
@@ -57,6 +75,8 @@ pub struct FramePlan {
     pub width: u32,
     pub height: u32,
     pub layers: Vec<Layer>,
+    /// Read pictures from proxies where assets have them.
+    pub proxies: bool,
 }
 
 impl ResolvedEffect {
@@ -112,17 +132,39 @@ impl Layer {
 
 /// What the sequence shows at `t`.
 pub fn evaluate(seq: &Sequence, t: Time, quality: Quality) -> FramePlan {
-    let layers = seq
-        .tracks
-        .iter()
-        .filter(|tr| tr.kind == TrackKind::Video && tr.enabled)
-        .filter_map(|tr| tr.clip_at(t).filter(|c| c.enabled).map(|c| layer(tr, c, t)))
-        .collect();
+    let layers = seq.tracks.iter().filter(|tr| tr.kind == TrackKind::Video && tr.enabled).filter_map(|tr| track_layer(tr, t)).collect();
     FramePlan {
         time: t,
         width: ((seq.format.width as f32 * quality.scale).round() as u32).max(1),
         height: ((seq.format.height as f32 * quality.scale).round() as u32).max(1),
         layers,
+        proxies: quality.use_proxies,
+    }
+}
+
+/// What one track shows at `t`: a clip, or a transition between two (or
+/// from or to nothing). Disabled clips show nothing.
+fn track_layer(track: &Track, t: Time) -> Option<Layer> {
+    let active = track.active_at(t);
+    let shown = |c: &&Arc<Clip>| c.enabled;
+    match active.as_slice() {
+        [] => None,
+        [a] if a.transition.is_none() => Some(a.clip).filter(shown).map(|c| layer(track, c, t)),
+        _ => {
+            let (tr, progress, _) = active.iter().find_map(|a| a.transition)?;
+            let out = active.iter().find(|a| matches!(a.transition, Some((_, _, Role::Outgoing)))).map(|a| a.clip).filter(shown);
+            let inc = active.iter().find(|a| matches!(a.transition, Some((_, _, Role::Incoming)))).map(|a| a.clip).filter(shown);
+            let into = TimeRange::new(Time::ZERO, tr.duration());
+            let local = Time::from_seconds_f64(progress * into.duration.as_seconds_f64());
+            let params = tr.params.iter().map(|(k, p)| (k.clone(), p.value_at(local))).collect();
+            let (mut base, incoming, self_incoming) = match (out, inc) {
+                (Some(o), i) => (layer(track, o, t), i.map(|i| layer(track, i, t)), false),
+                (None, Some(i)) => (layer(track, i, t), None, true),
+                (None, None) => return None,
+            };
+            base.transition = Some(Box::new(LayerTransition { plugin: tr.plugin.clone(), params, progress, incoming, self_incoming }));
+            Some(base)
+        }
     }
 }
 
@@ -143,6 +185,7 @@ fn layer(track: &Track, c: &Arc<Clip>, t: Time) -> Layer {
                 params: e.params.iter().map(|(k, p)| (k.clone(), p.value_at(clip_time))).collect(),
             })
             .collect(),
+        transition: None,
     }
 }
 
@@ -168,6 +211,10 @@ mod tests {
                 enabled: true,
                 link: None,
                 effects: Default::default(),
+                retime: Default::default(),
+                transition_in: None,
+                transition_out: None,
+                channels: Vec::new(),
             })
         };
         let mut v1 = Track::new(TrackKind::Video, "V1");
@@ -183,6 +230,7 @@ mod tests {
             name: "s".into(),
             format: SequenceFormat::default(),
             tracks: [v1, v2, hidden, a1].into_iter().map(Arc::new).collect(),
+            marks: Default::default(),
         };
         let plan = evaluate(&seq, s(3), Quality::PREVIEW);
         assert_eq!((plan.width, plan.height), (960, 540));

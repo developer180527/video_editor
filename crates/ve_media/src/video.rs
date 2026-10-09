@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use ve_model::{AssetId, MediaRef};
+use ve_model::MediaRef;
 use ve_ports::{FrameData, MediaBackend, Resolved, Storage, VideoDecoder, VideoFrame};
 use ve_time::Time;
 
@@ -168,7 +168,9 @@ struct Source {
 pub struct VideoPool {
     storage: Arc<dyn Storage>,
     media: Arc<dyn MediaBackend>,
-    sources: Mutex<HashMap<AssetId, Arc<Source>>>,
+    /// By media file: an asset's original and its proxy are separate
+    /// sources; two assets of one file share one.
+    sources: Mutex<HashMap<MediaRef, Arc<Source>>>,
     /// Bytes of decoded frames each source may hold.
     budget: usize,
     waker: Mutex<Option<Waker>>,
@@ -200,13 +202,13 @@ impl VideoPool {
         self.gpu_frames.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn source(self: &Arc<Self>, asset: AssetId, media: &MediaRef) -> Arc<Source> {
+    fn source(self: &Arc<Self>, media: &MediaRef) -> Arc<Source> {
         let mut sources = self.sources.lock().unwrap();
-        if let Some(s) = sources.get(&asset) {
+        if let Some(s) = sources.get(media) {
             return s.clone();
         }
         let src = Arc::new(Source { state: Mutex::new(State::default()), wake: Condvar::new() });
-        sources.insert(asset, src.clone());
+        sources.insert(media.clone(), src.clone());
         let (pool, s, media) = (Arc::downgrade(self), src.clone(), media.clone());
         std::thread::Builder::new()
             .name("ve-decode".into())
@@ -217,8 +219,8 @@ impl VideoPool {
 
     /// The frame of `asset` shown at source time `t`. Never blocks; asks the
     /// worker to decode around `t`.
-    pub fn frame(self: &Arc<Self>, asset: AssetId, media: &MediaRef, t: Time) -> Lookup {
-        let src = self.source(asset, media);
+    pub fn frame(self: &Arc<Self>, media: &MediaRef, t: Time) -> Lookup {
+        let src = self.source(media);
         let mut st = src.state.lock().unwrap();
         st.asked = Some(std::time::Instant::now());
         if let Some(e) = &st.error {
@@ -240,8 +242,8 @@ impl VideoPool {
     /// A clip of `asset` will start showing source time `t` soon: decode its
     /// first frames ahead of time, without disturbing the frames wanted now.
     /// Renew the hint while it holds; it lapses after a couple of seconds.
-    pub fn prefetch(self: &Arc<Self>, asset: AssetId, media: &MediaRef, t: Time) {
-        let src = self.source(asset, media);
+    pub fn prefetch(self: &Arc<Self>, media: &MediaRef, t: Time) {
+        let src = self.source(media);
         let mut st = src.state.lock().unwrap();
         let fresh = st.upcoming() != Some(t);
         st.upcoming = Some((t, std::time::Instant::now()));
@@ -252,8 +254,8 @@ impl VideoPool {
     }
 
     /// The exact frame at `t`, waiting for it (export).
-    pub fn frame_blocking(self: &Arc<Self>, asset: AssetId, media: &MediaRef, t: Time, timeout: Duration) -> Result<Arc<VideoFrame>, String> {
-        let src = self.source(asset, media);
+    pub fn frame_blocking(self: &Arc<Self>, media: &MediaRef, t: Time, timeout: Duration) -> Result<Arc<VideoFrame>, String> {
+        let src = self.source(media);
         let deadline = std::time::Instant::now() + timeout;
         let mut st = src.state.lock().unwrap();
         st.want = Some(t);
@@ -275,8 +277,8 @@ impl VideoPool {
     }
 
     /// Stop decoding `asset` and free its frames (it left the project).
-    pub fn close(&self, asset: AssetId) {
-        if let Some(s) = self.sources.lock().unwrap().remove(&asset) {
+    pub fn close(&self, media: &MediaRef) {
+        if let Some(s) = self.sources.lock().unwrap().remove(media) {
             s.state.lock().unwrap().closed = true;
             s.wake.notify_all();
         }
@@ -523,14 +525,14 @@ mod tests {
     fn a_small_budget_does_not_decode_the_whole_file() {
         // Room for 10 frames; the look-ahead wants 25 (1 s at 25 fps).
         let (pool, decoded) = pool(0, 10_000, 10);
-        let (a, m) = (AssetId::new(), MediaRef("x".into()));
-        pool.frame_blocking(a, &m, Time::ZERO, WAIT).unwrap();
+        let m = MediaRef("x".into());
+        pool.frame_blocking(&m, Time::ZERO, WAIT).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let n = decoded.load(Ordering::SeqCst);
         assert!(n <= 12, "decoded {n} frames into a 10-frame budget");
         // Playing on still finds every frame.
         for i in 1..60 {
-            let f = pool.frame_blocking(a, &m, RATE.frame_to_time(i), WAIT).unwrap();
+            let f = pool.frame_blocking(&m, RATE.frame_to_time(i), WAIT).unwrap();
             assert_eq!(f.pts, RATE.frame_to_time(i));
         }
         let n = decoded.load(Ordering::SeqCst);
@@ -540,20 +542,20 @@ mod tests {
     #[test]
     fn a_large_budget_decodes_a_second_ahead() {
         let (pool, decoded) = pool(0, 10_000, 1000);
-        let (a, m) = (AssetId::new(), MediaRef("x".into()));
-        pool.frame_blocking(a, &m, Time::ZERO, WAIT).unwrap();
+        let m = MediaRef("x".into());
+        pool.frame_blocking(&m, Time::ZERO, WAIT).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         // Count before asking for frame 24: asking moves the look-ahead
         // window, and a fast machine starts on the next second at once.
         let n = decoded.load(Ordering::SeqCst);
         assert!(n <= 30, "decoded {n} frames for a one-second look-ahead");
-        assert!(matches!(pool.frame(a, &m, RATE.frame_to_time(24)), Lookup::Exact(_)), "frame 24 is within the second ahead");
+        assert!(matches!(pool.frame(&m, RATE.frame_to_time(24)), Lookup::Exact(_)), "frame 24 is within the second ahead");
     }
 
     #[test]
     fn before_the_first_frame_shows_the_first_frame() {
         let (pool, _) = pool(3, 50, 100);
-        let f = pool.frame_blocking(AssetId::new(), &MediaRef("x".into()), Time::ZERO, WAIT).unwrap();
+        let f = pool.frame_blocking(&MediaRef("x".into()), Time::ZERO, WAIT).unwrap();
         assert_eq!(f.pts, RATE.frame_to_time(3));
     }
 
@@ -561,7 +563,7 @@ mod tests {
     fn past_the_end_holds_the_last_frame_without_waiting() {
         let (pool, _) = pool(0, 50, 100);
         let start = std::time::Instant::now();
-        let f = pool.frame_blocking(AssetId::new(), &MediaRef("x".into()), RATE.frame_to_time(60), WAIT).unwrap();
+        let f = pool.frame_blocking(&MediaRef("x".into()), RATE.frame_to_time(60), WAIT).unwrap();
         assert_eq!(f.pts, RATE.frame_to_time(49));
         assert!(start.elapsed() < Duration::from_secs(1));
     }
@@ -570,16 +572,16 @@ mod tests {
     fn the_next_clip_is_ready_before_the_cut() {
         // Playing at 2 s; a clip of the same source starting at 30 s is next.
         let (pool, _) = pool(0, 10_000, 200);
-        let (a, m) = (AssetId::new(), MediaRef("x".into()));
+        let m = MediaRef("x".into());
         let now = Time::from_seconds(2);
-        pool.frame_blocking(a, &m, now, WAIT).unwrap();
-        pool.prefetch(a, &m, Time::from_seconds(30));
+        pool.frame_blocking(&m, now, WAIT).unwrap();
+        pool.prefetch(&m, Time::from_seconds(30));
         std::thread::sleep(Duration::from_millis(300));
         // The playing clip kept its own look-ahead…
-        assert!(matches!(pool.frame(a, &m, now + RATE.frame_to_time(10)), Lookup::Exact(_)));
+        assert!(matches!(pool.frame(&m, now + RATE.frame_to_time(10)), Lookup::Exact(_)));
         // …and at the cut the incoming frame is already there, without
         // waiting. (Asked last: asking moves the wanted time to the cut.)
-        assert!(matches!(pool.frame(a, &m, Time::from_seconds(30)), Lookup::Exact(_)), "next clip's head was decoded");
+        assert!(matches!(pool.frame(&m, Time::from_seconds(30)), Lookup::Exact(_)), "next clip's head was decoded");
     }
 
     #[test]
@@ -587,14 +589,14 @@ mod tests {
         let alive = Arc::new(AtomicUsize::new(0));
         let media = Arc::new(Fake { first: 0, count: 10_000, decoded: Arc::new(AtomicUsize::new(0)), alive: alive.clone() });
         let pool = VideoPool::new(Arc::new(AnyFile), media, 1000 * FRAME);
-        let (a, m) = (AssetId::new(), MediaRef("x".into()));
-        pool.frame_blocking(a, &m, Time::ZERO, WAIT).unwrap();
+        let m = MediaRef("x".into());
+        pool.frame_blocking(&m, Time::ZERO, WAIT).unwrap();
         assert_eq!(alive.load(Ordering::SeqCst), 1);
         std::thread::sleep(IDLE * 3);
         assert_eq!(alive.load(Ordering::SeqCst), 0, "closed when idle");
         // Cached frames are still there; new ones reopen it.
-        assert!(matches!(pool.frame(a, &m, RATE.frame_to_time(3)), Lookup::Exact(_)));
-        let f = pool.frame_blocking(a, &m, Time::from_seconds(100), WAIT).unwrap();
+        assert!(matches!(pool.frame(&m, RATE.frame_to_time(3)), Lookup::Exact(_)));
+        let f = pool.frame_blocking(&m, Time::from_seconds(100), WAIT).unwrap();
         assert_eq!(f.pts, Time::from_seconds(100));
         assert_eq!(alive.load(Ordering::SeqCst), 1);
     }
@@ -602,9 +604,9 @@ mod tests {
     #[test]
     fn a_dropped_pool_stops_its_workers() {
         let (pool, decoded) = pool(0, 10_000, 1000);
-        let (a, m) = (AssetId::new(), MediaRef("x".into()));
-        pool.frame_blocking(a, &m, Time::ZERO, WAIT).unwrap();
-        let src = Arc::downgrade(pool.sources.lock().unwrap().get(&a).unwrap());
+        let m = MediaRef("x".into());
+        pool.frame_blocking(&m, Time::ZERO, WAIT).unwrap();
+        let src = Arc::downgrade(pool.sources.lock().unwrap().get(&m).unwrap());
         drop(pool);
         std::thread::sleep(Duration::from_millis(200));
         assert!(src.upgrade().is_none(), "worker still holds its source");

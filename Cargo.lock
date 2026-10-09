@@ -2762,6 +2762,7 @@ dependencies = [
 name = "ve_render"
 version = "0.1.0"
 dependencies = [
+ "fontdue",
  "pollster 1.0.1",
  "ve_builtins",
  "ve_model",

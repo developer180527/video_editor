@@ -85,8 +85,23 @@ pub enum Command {
     AddEffect { clip: ClipId, index: usize, effect: Arc<Effect> },
     RemoveEffect { clip: ClipId, effect: EffectId },
     SetTrackState { sequence: SequenceId, track: TrackId, state: TrackState },
+    /// Point an asset at other media (relinking a moved or replaced file).
+    SetAssetMedia { asset: AssetId, media: MediaRef, info: Option<MediaInfo> },
+    /// Replace an asset's renditions (attach or drop proxies).
+    SetAssetVariants { asset: AssetId, variants: Vec<MediaVariant> },
+    /// Replace the in/out points and markers of a sequence or an asset.
+    SetMarks { owner: MarksOwner, marks: Marks },
+    /// An audio track's channel layout.
+    SetTrackLayout { sequence: SequenceId, track: TrackId, layout: ChannelLayout },
     /// Several commands as one undo step, all or nothing.
     Batch { label: String, commands: Vec<Command> },
+}
+
+/// Whose marks a [`Command::SetMarks`] replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarksOwner {
+    Sequence(SequenceId),
+    Asset(AssetId),
 }
 
 /// The result of applying a command.
@@ -118,6 +133,10 @@ impl Command {
             Command::AddEffect { .. } => "Add Effect".into(),
             Command::RemoveEffect { .. } => "Remove Effect".into(),
             Command::SetTrackState { .. } => "Change Track".into(),
+            Command::SetAssetMedia { .. } => "Relink Media".into(),
+            Command::SetAssetVariants { .. } => "Change Proxies".into(),
+            Command::SetMarks { .. } => "Change Markers".into(),
+            Command::SetTrackLayout { .. } => "Change Track Channels".into(),
             Command::Batch { label, .. } => label.clone(),
         }
     }
@@ -238,19 +257,14 @@ impl Command {
                 let mut c = (*old).clone();
                 match edge {
                     Edge::Start => {
-                        c.timeline_start += *delta;
-                        c.source_range.start += *delta;
-                        c.source_range.duration -= *delta;
+                        // Speed-aware: frames (and remap keys) stay on their media.
+                        c = old.with_start_advanced(*delta);
                         c.effects = shift_keyframes(&c.effects, *delta);
                     }
                     Edge::End => c.source_range.duration += *delta,
                 }
                 check_range(c.source_range, c.timeline_start)?;
-                if let Some(limit) = source_duration(p, &c) {
-                    if c.source_range.start < Time::ZERO || c.source_range.end() > limit {
-                        return Err(CommandError::BeyondSource);
-                    }
-                }
+                check_media(p, &c)?;
                 let t = track_mut(p, sid, tid)?;
                 if t.locked {
                     return Err(CommandError::Locked);
@@ -276,11 +290,7 @@ impl Command {
             SetClip { clip } => {
                 check_range(clip.source_range, clip.timeline_start)?;
                 let (sid, tid, old) = loc.locate(p, clip.id)?;
-                if let Some(limit) = source_duration(p, clip) {
-                    if clip.source_range.start < Time::ZERO || clip.source_range.end() > limit {
-                        return Err(CommandError::BeyondSource);
-                    }
-                }
+                check_media(p, clip)?;
                 let t = track_mut(p, sid, tid)?;
                 if t.locked {
                     return Err(CommandError::Locked);
@@ -315,6 +325,30 @@ impl Command {
                 t.muted = state.muted;
                 t.solo = state.solo;
                 SetTrackState { sequence: *sequence, track: *track, state: old }
+            }
+            SetAssetMedia { asset, media, info } => {
+                let a = Arc::make_mut(p.assets.get_mut(asset).ok_or(CommandError::NotFound("asset"))?);
+                let old_media = std::mem::replace(&mut a.media, media.clone());
+                let old_info = std::mem::replace(&mut a.info, info.clone());
+                SetAssetMedia { asset: *asset, media: old_media, info: old_info }
+            }
+            SetAssetVariants { asset, variants } => {
+                let a = Arc::make_mut(p.assets.get_mut(asset).ok_or(CommandError::NotFound("asset"))?);
+                SetAssetVariants { asset: *asset, variants: std::mem::replace(&mut a.variants, variants.clone()) }
+            }
+            SetMarks { owner, marks } => {
+                let slot = match owner {
+                    MarksOwner::Sequence(id) => &mut seq_mut(p, *id)?.marks,
+                    MarksOwner::Asset(id) => &mut Arc::make_mut(p.assets.get_mut(id).ok_or(CommandError::NotFound("asset"))?).marks,
+                };
+                SetMarks { owner: *owner, marks: std::mem::replace(slot, marks.clone()) }
+            }
+            SetTrackLayout { sequence, track, layout } => {
+                let t = track_mut(p, *sequence, *track)?;
+                if t.locked {
+                    return Err(CommandError::Locked);
+                }
+                SetTrackLayout { sequence: *sequence, track: *track, layout: std::mem::replace(&mut t.layout, *layout) }
             }
             Batch { label, commands } => {
                 // Applied in order on a scratch copy; `p` changes only if all succeed.
@@ -376,11 +410,26 @@ fn check_range(source: TimeRange, start: Time) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// How long a clip's source is, when it is known: a file's duration, a
+/// nested sequence's. Generators are endless.
 fn source_duration(p: &Project, c: &Clip) -> Option<Time> {
     match &c.source {
         ClipSource::Asset { asset, .. } => p.assets.get(asset)?.info.as_ref().map(|i| i.duration),
+        ClipSource::Sequence { sequence, .. } => p.sequences.get(sequence).map(|s| s.duration()),
         ClipSource::Generator { .. } => None,
     }
+}
+
+/// The media the clip plays — at its speed, or through its remap — lies
+/// within its source.
+fn check_media(p: &Project, c: &Clip) -> Result<(), CommandError> {
+    if let Some(limit) = source_duration(p, c) {
+        let used = c.media_extent();
+        if used.start < Time::ZERO || used.end() > limit {
+            return Err(CommandError::BeyondSource);
+        }
+    }
+    Ok(())
 }
 
 fn clips_using(p: &Project, asset: AssetId) -> Option<ClipId> {

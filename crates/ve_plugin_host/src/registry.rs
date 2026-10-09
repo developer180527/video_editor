@@ -33,6 +33,8 @@ pub enum ParamKind {
     Vec2,
     Color,
     Choice(Vec<String>),
+    /// Text, with its default (a title's words).
+    Text(String),
 }
 
 /// A parameter as the host's UI and keyframing see it.

@@ -30,4 +30,4 @@ macro_rules! id_type {
     )*};
 }
 
-id_type!(AssetId, SequenceId, TrackId, ClipId, EffectId, LinkId);
+id_type!(AssetId, SequenceId, TrackId, ClipId, EffectId, LinkId, MarkerId);

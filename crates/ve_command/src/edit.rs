@@ -112,13 +112,21 @@ fn split(b: &mut Builder, clip: ClipId, at: Time, new_link: &mut HashMap<LinkId,
     let offset = at - c.timeline_start;
     let mut left = (*c).clone();
     left.source_range.duration = offset;
-    let mut right = (*c).clone();
+    // The new cut is a straight cut: the left part keeps the way in, the
+    // right part the way out.
+    left.transition_out = None;
+    let mut right = c.with_start_advanced(offset);
     right.id = ClipId::new();
-    right.timeline_start = at;
-    right.source_range.start += offset;
-    right.source_range.duration -= offset;
+    right.transition_in = None;
     right.link = c.link.map(|l| *new_link.entry(l).or_insert_with(LinkId::new));
     right.effects = shift_keyframes(&c.effects, offset);
+    // A transition must still fit in the part that keeps it.
+    if left.transition_in.as_ref().is_some_and(|t| t.after > left.source_range.duration) {
+        left.transition_in = None;
+    }
+    if right.transition_out.as_ref().is_some_and(|t| t.before > right.source_range.duration) {
+        right.transition_out = None;
+    }
     let id = right.id;
     b.push(Command::SetClip { clip: Arc::new(left) })?;
     b.push(Command::AddClip { sequence: seq, track: tr, clip: Arc::new(right) })?;
@@ -189,8 +197,9 @@ pub fn ripple_trim(p: &Project, clip: ClipId, edge: Edge, delta: Time, follow_li
                 delta
             }
             Edge::Start => {
-                new.source_range.start += delta;
-                new.source_range.duration -= delta;
+                // The clip stays put; it starts later in its media.
+                new = old.with_start_advanced(delta);
+                new.timeline_start = old.timeline_start;
                 new.effects = shift_keyframes(&old.effects, delta);
                 -delta
             }
@@ -237,6 +246,120 @@ pub fn slip(p: &Project, clip: ClipId, delta: Time, follow_links: bool) -> Resul
         b.push(Command::SetClip { clip: Arc::new(new) })?;
     }
     b.finish("Slip")
+}
+
+/// Change a clip's speed (`speed` < 0 plays it backwards), keeping the
+/// span of media it plays: the clip gets shorter or longer on the timeline.
+/// With `ripple`, everything after it on its track moves to suit; without,
+/// growing into the next clip fails. A remapped clip becomes constant speed.
+pub fn set_speed(p: &Project, clip: ClipId, speed: Ratio, ripple: bool) -> Result<Command, CommandError> {
+    if speed.num == 0 {
+        return Err(CommandError::BadRange);
+    }
+    let (s, t, old) = find(p, clip)?;
+    let used = old.media_extent();
+    let span = used.duration.max(Time(1));
+    let mut new = (*old).clone();
+    new.retime = Retime::Speed(speed);
+    new.source_range.start = if speed.num > 0 { used.start } else { used.end() - Time(1) };
+    new.source_range.duration = Ratio::new(speed.den, speed.num.abs()).apply(span).max(Time(1));
+    let growth = new.source_range.duration - old.source_range.duration;
+    let mut b = Builder::new(p);
+    let end = old.timeline_range().end();
+    if ripple && growth > Time::ZERO {
+        shift_track(&mut b, s, t, end, growth, &[clip])?;
+    }
+    b.push(Command::SetClip { clip: Arc::new(new) })?;
+    if ripple && growth < Time::ZERO {
+        shift_track(&mut b, s, t, end, growth, &[clip])?;
+    }
+    b.finish("Speed/Duration")
+}
+
+/// Put `transition` at a clip's head (`Edge::Start`: from the clip before,
+/// or from nothing) or tail (`Edge::End`: to nothing), or remove it (`None`).
+pub fn set_transition(p: &Project, clip: ClipId, edge: Edge, transition: Option<Transition>) -> Result<Command, CommandError> {
+    let (_, _, old) = find(p, clip)?;
+    let mut new = (*old).clone();
+    let slot = match edge {
+        Edge::Start => &mut new.transition_in,
+        Edge::End => &mut new.transition_out,
+    };
+    *slot = transition.map(Arc::new);
+    let mut b = Builder::new(p);
+    b.push(Command::SetClip { clip: Arc::new(new) })?;
+    b.finish("Transition")
+}
+
+/// Show multicam `angle` (a video track of the nested sequence) from this
+/// clip on; `None` shows the whole nest. Cut first to switch mid-clip.
+pub fn set_angle(p: &Project, clip: ClipId, angle: Option<u32>) -> Result<Command, CommandError> {
+    let (_, _, old) = find(p, clip)?;
+    let ClipSource::Sequence { sequence, .. } = old.source else { return Err(CommandError::NotFound("multicam clip")) };
+    let mut new = (*old).clone();
+    new.source = ClipSource::Sequence { sequence, angle };
+    let mut b = Builder::new(p);
+    b.push(Command::SetClip { clip: Arc::new(new) })?;
+    b.finish("Switch Angle")
+}
+
+/// Nest `clips` of sequence `seq` into a new sequence (a compound clip):
+/// they move into it on matching tracks, keeping their timing relative to
+/// the earliest, and are replaced by one clip of the new sequence per kind
+/// (on the lowest video and highest audio track they used), linked. `make`
+/// builds that clip from the new sequence (with its intrinsic effects).
+pub fn nest(p: &Project, seq: SequenceId, clips: &[ClipId], name: &str, make: impl Fn(&Sequence, TrackKind, Option<LinkId>) -> Clip) -> Result<Command, CommandError> {
+    let parent = p.sequence(seq).ok_or(CommandError::NotFound("sequence"))?;
+    let picked: Vec<(usize, Arc<Clip>)> = parent
+        .tracks
+        .iter()
+        .enumerate()
+        .flat_map(|(ti, t)| t.clips.iter().filter(|c| clips.contains(&c.id)).map(move |c| (ti, c.clone())))
+        .collect();
+    let t0 = picked.iter().map(|(_, c)| c.timeline_start).min().ok_or(CommandError::NotFound("clips to nest"))?;
+    // The new sequence: the parent's tracks that hold picked clips.
+    let used: Vec<usize> = {
+        let mut v: Vec<usize> = picked.iter().map(|(ti, _)| *ti).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    // Clip ids are unique in the whole project: the nested copies get new
+    // ones (and new link groups, linked as before).
+    let mut links: HashMap<LinkId, LinkId> = HashMap::new();
+    let mut inner = Sequence::new(name, parent.format.clone(), used.iter().map(|&ti| {
+        let src = &parent.tracks[ti];
+        let mut t = Track::new(src.kind, src.name.clone());
+        t.layout = src.layout;
+        t.clips = picked
+            .iter()
+            .filter(|(i, _)| *i == ti)
+            .map(|(_, c)| {
+                let mut c = (**c).clone();
+                c.id = ClipId::new();
+                c.link = c.link.map(|l| *links.entry(l).or_insert_with(LinkId::new));
+                c.timeline_start -= t0;
+                Arc::new(c)
+            })
+            .collect();
+        t
+    }));
+    inner.marks = Marks::default();
+    let mut b = Builder::new(p);
+    b.push(Command::AddSequence { sequence: Arc::new(inner.clone()) })?;
+    for (_, c) in &picked {
+        b.push(Command::RemoveClip { clip: c.id })?;
+    }
+    let kinds = [TrackKind::Video, TrackKind::Audio];
+    let present: Vec<TrackKind> = kinds.into_iter().filter(|k| used.iter().any(|&ti| parent.tracks[ti].kind == *k)).collect();
+    let link = (present.len() > 1).then(LinkId::new);
+    for kind in present {
+        let track = used.iter().filter(|&&ti| parent.tracks[ti].kind == kind).map(|&ti| parent.tracks[ti].id).next().unwrap();
+        let mut c = make(&inner, kind, link);
+        c.timeline_start = t0;
+        b.push(Command::AddClip { sequence: seq, track, clip: Arc::new(c) })?;
+    }
+    b.finish("Nest")
 }
 
 /// Move a clip by dragging it: to `start` on `track`, its linked partners by

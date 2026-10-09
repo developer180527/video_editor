@@ -9,7 +9,7 @@ use ve_time::{Time, TimeRange};
 #[ignore = "timing measurement; run with --release --ignored --nocapture"]
 fn bench_ripple() {
     let mut p = Project::new("t");
-    let asset = Asset { id: AssetId::new(), name: "a".into(), media: MediaRef("a".into()), info: None };
+    let asset = Asset { id: AssetId::new(), name: "a".into(), media: MediaRef("a".into()), info: None, variants: Vec::new(), marks: Default::default() };
     let mut v1 = Track::new(TrackKind::Video, "V1");
     let n = 6000;
     for i in 0..n {
@@ -17,11 +17,15 @@ fn bench_ripple() {
             id: ClipId::new(), name: "c".into(), source: ClipSource::Asset { asset: asset.id, audio_stream: 0 },
             source_range: TimeRange::new(Time::ZERO, Time::from_seconds(1)), timeline_start: Time::from_seconds(i),
             enabled: true, link: None, effects: Default::default(),
+            retime: Default::default(),
+            transition_in: None,
+            transition_out: None,
+            channels: Vec::new(),
         }));
     }
     let first = v1.clips[0].id;
     p.assets.insert(asset.id, Arc::new(asset));
-    let seq = Sequence { id: SequenceId::new(), name: "s".into(), format: SequenceFormat::default(), tracks: [Arc::new(v1)].into_iter().collect() };
+    let seq = Sequence { id: SequenceId::new(), name: "s".into(), format: SequenceFormat::default(), tracks: [Arc::new(v1)].into_iter().collect(), marks: Default::default() };
     p.sequences.insert(seq.id, Arc::new(seq));
 
     let t = std::time::Instant::now();

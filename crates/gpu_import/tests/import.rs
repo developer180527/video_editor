@@ -39,14 +39,9 @@ fn render(dev: &(wgpu::Device, wgpu::Queue), frame: Arc<VideoFrame>, importer: O
     let mut c = Compositor::new(device);
     c.set_importer(importer);
     let (w, h) = (frame.width, frame.height);
-    let layer = RenderLayer {
-        motion: Motion { position: [w as f32 / 2.0, h as f32 / 2.0], scale: 100.0, rotation: 0.0, anchor: [w as f32 / 2.0, h as f32 / 2.0], crop: [0.0; 4] },
-        frame,
-        opacity: 1.0,
-        blend: Blend::Normal,
-        effects: vec![],
-    };
-    let plan = FramePlan { time: Time::ZERO, width: w, height: h, layers: vec![] };
+    let motion = Motion { position: [w as f32 / 2.0, h as f32 / 2.0], scale: 100.0, rotation: 0.0, anchor: [w as f32 / 2.0, h as f32 / 2.0], crop: [0.0; 4] };
+    let layer = RenderLayer::of_frame(frame, motion, 1.0);
+    let plan = FramePlan { time: Time::ZERO, width: w, height: h, layers: vec![], proxies: false };
     c.render(device, queue, &plan, &[layer], (w, h), WorkingSpace::AcesCg);
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     c.read_output(device, queue).unwrap().2

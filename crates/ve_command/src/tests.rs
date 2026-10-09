@@ -21,6 +21,8 @@ fn fixture() -> Fixture {
         name: "a.mp4".into(),
         media: MediaRef("file:a.mp4".into()),
         info: Some(MediaInfo { duration: s(20), video: None, audio: Vec::new() }),
+        variants: Vec::new(),
+        marks: Default::default(),
     };
     let (v1, v2, a1) =
         (Track::new(TrackKind::Video, "V1"), Track::new(TrackKind::Video, "V2"), Track::new(TrackKind::Audio, "A1"));
@@ -29,6 +31,7 @@ fn fixture() -> Fixture {
         name: "S".into(),
         format: SequenceFormat::default(),
         tracks: [v1.clone(), v2.clone(), a1.clone()].into_iter().map(Arc::new).collect(),
+        marks: Default::default(),
     };
     let f = Fixture { seq: seq.id, v1: v1.id, v2: v2.id, a1: a1.id, asset: asset.id, p: Project::new("t") };
     p.assets.insert(asset.id, Arc::new(asset));
@@ -47,6 +50,10 @@ fn clip(f: &Fixture, start: i64, src: i64, len: i64) -> Arc<Clip> {
         enabled: true,
         link: None,
         effects: Default::default(),
+        retime: Default::default(),
+        transition_in: None,
+        transition_out: None,
+        channels: Vec::new(),
     })
 }
 

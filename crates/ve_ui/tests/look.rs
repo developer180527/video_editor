@@ -24,6 +24,8 @@ fn asset(name: &str, secs: i64, video: bool, audio: bool) -> Asset {
             video: video.then(|| VideoStreamInfo { width: 1920, height: 1080, rate: Rate::FPS_24, codec: "h264".into() }),
             audio: audio.then(|| AudioStreamInfo { sample_rate: 48000, channels: 2, codec: "aac".into(), layout: "stereo".into() }).into_iter().collect(),
         }),
+        variants: Vec::new(),
+        marks: Default::default(),
     }
 }
 

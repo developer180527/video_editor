@@ -15,12 +15,16 @@ fn clip(asset: AssetId, start: i64, len: i64) -> Arc<Clip> {
         enabled: true,
         link: None,
         effects: Default::default(),
+        retime: Default::default(),
+        transition_in: None,
+        transition_out: None,
+        channels: Vec::new(),
     })
 }
 
 fn sample() -> (Project, AssetId) {
     let mut p = Project::new("t");
-    let a = Asset { id: AssetId::new(), name: "a.mp4".into(), media: MediaRef("file:a.mp4".into()), info: None };
+    let a = Asset { id: AssetId::new(), name: "a.mp4".into(), media: MediaRef("file:a.mp4".into()), info: None, variants: Vec::new(), marks: Default::default() };
     let aid = a.id;
     p.assets.insert(aid, Arc::new(a));
     let mut v1 = Track::new(TrackKind::Video, "V1");
@@ -31,6 +35,7 @@ fn sample() -> (Project, AssetId) {
         name: "Sequence 01".into(),
         format: SequenceFormat::default(),
         tracks: [Arc::new(v1), Arc::new(Track::new(TrackKind::Audio, "A1"))].into_iter().collect(),
+        marks: Default::default(),
     };
     p.active_sequence = Some(seq.id);
     p.sequences.insert(seq.id, Arc::new(seq));
@@ -116,6 +121,10 @@ fn is_free_agrees_with_a_full_scan() {
             enabled: true,
             link: None,
             effects: Default::default(),
+            retime: Default::default(),
+            transition_in: None,
+            transition_out: None,
+            channels: Vec::new(),
         }));
         at += len;
     }
@@ -125,4 +134,73 @@ fn is_free_agrees_with_a_full_scan() {
         let full = track.clips.iter().all(|c| Some(c.id) == except || !c.timeline_range().overlaps(range));
         assert_eq!(track.is_free(range, except), full, "{range:?} except {except:?}");
     }
+}
+
+fn dissolve(before: i64, after: i64) -> Option<Arc<Transition>> {
+    Some(Arc::new(Transition {
+        id: EffectId::new(),
+        plugin: PluginRef { api: PluginApi::Builtin, id: "ve.dissolve".into(), major_version: 1 },
+        before: s(before),
+        after: s(after),
+        params: OrdMap::new(),
+    }))
+}
+
+#[test]
+fn transitions_decide_what_plays() {
+    let asset = AssetId::new();
+    let mut a = (*clip(asset, 0, 10)).clone();
+    let mut b = (*clip(asset, 10, 10)).clone(); // adjacent: a cut at 10
+    let mut c = (*clip(asset, 30, 10)).clone(); // after a gap
+    b.transition_in = dissolve(1, 1); // cross-dissolve 9..11
+    c.transition_in = dissolve(0, 2); // fade in 30..32
+    c.transition_out = dissolve(2, 0); // fade out 38..40
+    a.transition_out = dissolve(5, 5); // ignored: b follows directly
+    let mut t = Track::new(TrackKind::Video, "V1");
+    for x in [a.clone(), b.clone(), c.clone()] {
+        t.clips.push_back(Arc::new(x));
+    }
+    let at = |sec: f64| t.active_at(Time::from_seconds_f64(sec));
+    let roles = |v: Vec<Active>| v.iter().map(|x| (x.clip.id, x.transition.map(|(_, p, r)| ((p * 100.0).round() as i32, r)))).collect::<Vec<_>>();
+    assert_eq!(roles(at(5.0)), [(a.id, None)]);
+    assert_eq!(roles(at(9.5)), [(a.id, Some((25, Role::Outgoing))), (b.id, Some((25, Role::Incoming)))], "a cross-dissolve");
+    assert_eq!(roles(at(10.5)), [(a.id, Some((75, Role::Outgoing))), (b.id, Some((75, Role::Incoming)))]);
+    assert_eq!(roles(at(15.0)), [(b.id, None)], "a's fade out is ignored at the cut");
+    assert_eq!(roles(at(31.0)), [(c.id, Some((50, Role::Incoming)))], "a fade from nothing");
+    assert_eq!(roles(at(39.0)), [(c.id, Some((50, Role::Outgoing)))], "a fade to nothing");
+    assert!(at(25.0).is_empty());
+    // The clips reach into their handles for the dissolve.
+    assert_eq!(t.reach(0), TimeRange::from_bounds(s(0), s(11)));
+    assert_eq!(t.reach(1), TimeRange::from_bounds(s(9), s(20)));
+}
+
+#[test]
+fn transition_regions_may_not_overlap() {
+    let asset = AssetId::new();
+    let (mut p, seq_id) = {
+        let mut p = Project::new("t");
+        p.assets.insert(asset, Arc::new(Asset::new("a", MediaRef("file:a".into()), None)));
+        let seq = Sequence::new("s", SequenceFormat::default(), [Track::new(TrackKind::Video, "V1")]);
+        let id = seq.id;
+        p.sequences.insert(id, Arc::new(seq));
+        (p, id)
+    };
+    let mut asset_obj = (*p.assets[&asset]).clone();
+    asset_obj.id = asset;
+    p.assets.insert(asset, Arc::new(asset_obj));
+    let put = |p: &mut Project, clips: Vec<Clip>| {
+        let mut seq = (*p.sequences[&seq_id]).clone();
+        let t = Arc::make_mut(&mut seq.tracks[0]);
+        t.clips = clips.into_iter().map(Arc::new).collect();
+        p.sequences.insert(seq_id, Arc::new(seq));
+    };
+    let a = (*clip(asset, 0, 10)).clone();
+    let mut b = (*clip(asset, 10, 10)).clone();
+    b.transition_in = dissolve(4, 1);
+    put(&mut p, vec![a.clone(), b.clone()]);
+    assert_eq!(validate(&p), Ok(()));
+    // Reaching back past the start of the clip before it.
+    b.transition_in = dissolve(11, 1);
+    put(&mut p, vec![a, b]);
+    assert!(matches!(validate(&p), Err(ModelError::BadTransition(_))));
 }

@@ -56,31 +56,31 @@ fn storage() -> Arc<FileStorage> {
 fn video_pool_decodes_ahead_and_seeks() {
     let Some(file) = clip_file() else { return eprintln!("skipped: no ffmpeg CLI") };
     let pool = VideoPool::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()), 64 << 20);
-    let (asset, media) = (AssetId::new(), MediaRef(format!("file:{}", file.display())));
+    let media = MediaRef(format!("file:{}", file.display()));
     let r = Rate::FPS_25;
     // Exact frame, waiting for it.
-    let f = pool.frame_blocking(asset, &media, r.frame_to_time(10), Duration::from_secs(5)).unwrap();
+    let f = pool.frame_blocking(&media, r.frame_to_time(10), Duration::from_secs(5)).unwrap();
     assert_eq!(f.pts, r.frame_to_time(10));
     // The worker decodes ahead: frame 20 arrives without asking for it.
     std::thread::sleep(Duration::from_millis(300));
-    assert!(matches!(pool.frame(asset, &media, r.frame_to_time(20)), Lookup::Exact(_)), "decoded ahead");
+    assert!(matches!(pool.frame(&media, r.frame_to_time(20)), Lookup::Exact(_)), "decoded ahead");
     // A far jump seeks; meanwhile the nearest frame is offered.
     let t = r.frame_to_time(90);
-    match pool.frame(asset, &media, t) {
+    match pool.frame(&media, t) {
         Lookup::Exact(_) | Lookup::Nearest(_) => {}
         _ => panic!("something to show while seeking"),
     }
-    let f = pool.frame_blocking(asset, &media, t, Duration::from_secs(5)).unwrap();
+    let f = pool.frame_blocking(&media, t, Duration::from_secs(5)).unwrap();
     assert_eq!(f.pts, t);
     // And back again.
-    let f = pool.frame_blocking(asset, &media, r.frame_to_time(3), Duration::from_secs(5)).unwrap();
+    let f = pool.frame_blocking(&media, r.frame_to_time(3), Duration::from_secs(5)).unwrap();
     assert_eq!(f.pts, r.frame_to_time(3));
 }
 
 #[test]
 fn missing_media_fails_cleanly() {
     let pool = VideoPool::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()), 1 << 20);
-    let r = pool.frame_blocking(AssetId::new(), &MediaRef("file:/nope.mov".into()), Time::ZERO, Duration::from_secs(2));
+    let r = pool.frame_blocking(&MediaRef("file:/nope.mov".into()), Time::ZERO, Duration::from_secs(2));
     assert!(r.is_err());
 }
 
@@ -92,6 +92,8 @@ fn project(file: &std::path::Path) -> (Project, SequenceId) {
         name: "a".into(),
         media: MediaRef(format!("file:{}", file.display())),
         info: Some(MediaInfo { duration: Time::from_seconds(4), video: None, audio: Vec::new() }),
+        variants: Vec::new(),
+        marks: Default::default(),
     };
     let clip = |track_gain_db: f64| {
         let mut params = OrdMap::new();
@@ -112,13 +114,17 @@ fn project(file: &std::path::Path) -> (Project, SequenceId) {
             })]
             .into_iter()
             .collect(),
+            retime: Default::default(),
+            transition_in: None,
+            transition_out: None,
+            channels: Vec::new(),
         })
     };
     let mut a1 = Track::new(TrackKind::Audio, "A1");
     a1.clips.push_back(clip(0.0));
     let mut a2 = Track::new(TrackKind::Audio, "A2");
     a2.clips.push_back(clip(-96.0)); // silent by volume
-    let seq = Sequence { id: SequenceId::new(), name: "s".into(), format: SequenceFormat::default(), tracks: [a1, a2].into_iter().map(Arc::new).collect() };
+    let seq = Sequence { id: SequenceId::new(), name: "s".into(), format: SequenceFormat::default(), tracks: [a1, a2].into_iter().map(Arc::new).collect(), marks: Default::default() };
     let id = seq.id;
     p.assets.insert(asset.id, Arc::new(asset));
     p.sequences.insert(id, Arc::new(seq));
@@ -230,15 +236,15 @@ fn realtime_playback_keeps_up() {
         return eprintln!("skipped");
     };
     let pool = VideoPool::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()), 512 << 20);
-    let (asset, media) = (AssetId::new(), MediaRef(format!("file:{}", p.display())));
-    pool.frame_blocking(asset, &media, Time::ZERO, Duration::from_secs(5)).unwrap();
+    let media = MediaRef(format!("file:{}", p.display()));
+    pool.frame_blocking(&media, Time::ZERO, Duration::from_secs(5)).unwrap();
     let start = std::time::Instant::now();
     let (mut exact, mut miss) = (0, 0);
     let mut worst = Duration::ZERO;
     while start.elapsed() < Duration::from_secs(4) {
         let t = Time::from_seconds_f64(start.elapsed().as_secs_f64());
         let q = std::time::Instant::now();
-        match pool.frame(asset, &media, t) {
+        match pool.frame(&media, t) {
             Lookup::Exact(_) => exact += 1,
             _ => miss += 1,
         }
@@ -330,11 +336,11 @@ fn native_frames_flow_through_the_cache() {
     }
     let pool = VideoPool::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()), 512 << 20);
     pool.set_gpu_frames(true);
-    let (asset, media) = (AssetId::new(), MediaRef(format!("file:{}", p.display())));
+    let media = MediaRef(format!("file:{}", p.display()));
     let r = Rate::FPS_30;
     let mut native = 0;
     for i in 0..120 {
-        let f = pool.frame_blocking(asset, &media, r.frame_to_time(i), Duration::from_secs(5)).unwrap();
+        let f = pool.frame_blocking(&media, r.frame_to_time(i), Duration::from_secs(5)).unwrap();
         assert_eq!(f.pts.to_frame(r), i);
         native += matches!(f.data, ve_ports::FrameData::Native(_)) as usize;
     }

@@ -20,26 +20,57 @@ pub fn make_clip(
         TrackKind::Video => " [V]",
         TrackKind::Audio => " [A]",
     };
+    let size = asset.info.as_ref().and_then(|i| i.video.as_ref()).map(|v| (v.width, v.height)).unwrap_or((format.width, format.height));
+    clip_of(
+        ClipSource::Asset { asset: asset.id, audio_stream: 0 },
+        format!("{}{suffix}", asset.name),
+        intrinsics(registry, format, kind, size),
+        duration,
+        link,
+    )
+}
+
+/// A generator clip (`ve.color`, `ve.bars`, `ve.title`, or a plugin's),
+/// `duration` long: its parameters as an effect at their defaults (so they
+/// animate and undo like any effect's), then Motion and Opacity.
+pub fn make_generator_clip(registry: &Registry, format: &SequenceFormat, plugin: &PluginRef, duration: Time) -> Option<Clip> {
+    let info = registry.find(plugin)?;
+    let params = info.params.iter().map(|p| (p.id.clone(), Param::Constant(default_value(&p.kind, p.default)))).collect();
+    let mut effects = Vector::new();
+    effects.push_back(Arc::new(Effect { id: EffectId::new(), plugin: plugin.clone(), enabled: true, params }));
+    effects.append(intrinsics(registry, format, TrackKind::Video, (format.width, format.height)));
+    Some(clip_of(ClipSource::Generator { plugin: plugin.clone() }, info.name.clone(), effects, duration, None))
+}
+
+/// A clip of the whole of `sequence` (a compound or multicam clip) for a
+/// track of `kind`.
+pub fn make_sequence_clip(registry: &Registry, format: &SequenceFormat, sequence: &Sequence, kind: TrackKind, link: Option<LinkId>) -> Clip {
+    let size = (sequence.format.width, sequence.format.height);
+    clip_of(
+        ClipSource::Sequence { sequence: sequence.id, angle: None },
+        sequence.name.clone(),
+        intrinsics(registry, format, kind, size),
+        sequence.duration().max(Time(1)),
+        link,
+    )
+}
+
+/// The intrinsic effects for a clip of `kind` whose picture is `size`:
+/// Motion (fitted to the frame, like Premiere's "Set to Frame Size") and
+/// Opacity on video; Volume and Panner on audio.
+fn intrinsics(registry: &Registry, format: &SequenceFormat, kind: TrackKind, size: (u32, u32)) -> Vector<Arc<Effect>> {
     let ids: &[&str] = match kind {
         TrackKind::Video => &[intrinsic::MOTION, intrinsic::OPACITY],
         TrackKind::Audio => &[intrinsic::VOLUME, intrinsic::PANNER],
     };
-    let (sw, sh) = asset
-        .info
-        .as_ref()
-        .and_then(|i| i.video.as_ref())
-        .map(|v| (v.width as f64, v.height as f64))
-        .unwrap_or((format.width as f64, format.height as f64));
-    let effects = ids
-        .iter()
+    let (sw, sh) = (size.0 as f64, size.1 as f64);
+    ids.iter()
         .filter_map(|id| registry.find(&intrinsic::plugin_ref(id)))
         .map(|info| {
             let params = info
                 .params
                 .iter()
                 .map(|p| {
-                    // Like Premiere's "Set to Frame Size": a source of another
-                    // size is scaled to fit the frame, aspect kept.
                     let fit = (format.width as f64 / sw).min(format.height as f64 / sh) * 100.0;
                     let d = match p.id.as_str() {
                         "scale" => [(fit * 100.0).round() / 100.0, 0.0, 0.0, 0.0],
@@ -52,16 +83,23 @@ pub fn make_clip(
                 .collect();
             Arc::new(Effect { id: EffectId::new(), plugin: info.plugin.clone(), enabled: true, params })
         })
-        .collect();
+        .collect()
+}
+
+fn clip_of(source: ClipSource, name: String, effects: Vector<Arc<Effect>>, duration: Time, link: Option<LinkId>) -> Clip {
     Clip {
         id: ClipId::new(),
-        name: format!("{}{suffix}", asset.name),
-        source: ClipSource::Asset { asset: asset.id, audio_stream: 0 },
+        name,
+        source,
         source_range: TimeRange::new(Time::ZERO, duration),
         timeline_start: Time::ZERO,
         enabled: true,
         link,
         effects,
+        retime: Default::default(),
+        transition_in: None,
+        transition_out: None,
+        channels: Vec::new(),
     }
 }
 
@@ -119,5 +157,6 @@ pub fn default_value(kind: &ve_plugin_host::ParamKind, d: [f64; 4]) -> Value {
         Vec2 => Value::Vec2([d[0], d[1]]),
         Color => Value::Color(d.map(|x| x as f32)),
         Choice(_) => Value::Choice(d[0] as u32),
+        Text(t) => Value::Text(t.clone()),
     }
 }
