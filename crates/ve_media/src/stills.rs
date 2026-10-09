@@ -33,7 +33,8 @@ pub struct Thumb {
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Job {
     Thumb(AssetId, MediaRef, i64),
-    Peaks(AssetId, MediaRef),
+    /// An asset's audio stream (an index into its `MediaInfo::audio`).
+    Peaks(AssetId, MediaRef, usize),
 }
 
 #[derive(Default)]
@@ -44,7 +45,7 @@ struct State {
     /// Thumbnails in the order made, and their total size, for the budget.
     order: VecDeque<(AssetId, i64)>,
     thumb_bytes: usize,
-    peaks: HashMap<AssetId, Arc<Vec<f32>>>,
+    peaks: HashMap<(AssetId, usize), Arc<Vec<f32>>>,
     failed: HashSet<AssetId>,
     version: u64,
 }
@@ -96,14 +97,14 @@ impl Stills {
         }
     }
 
-    /// Peaks for the whole asset if ready, else queue them.
-    pub fn peaks(&self, asset: AssetId, media: &MediaRef) -> Option<Arc<Vec<f32>>> {
+    /// Peaks of the asset's `stream`-th audio stream if ready, else queue them.
+    pub fn peaks(&self, asset: AssetId, media: &MediaRef, stream: usize) -> Option<Arc<Vec<f32>>> {
         let mut st = self.state.lock().unwrap();
-        match st.peaks.get(&asset) {
+        match st.peaks.get(&(asset, stream)) {
             Some(p) => Some(p.clone()),
             None => {
                 if !st.failed.contains(&asset) {
-                    self.ask(&mut st, Job::Peaks(asset, media.clone()));
+                    self.ask(&mut st, Job::Peaks(asset, media.clone(), stream));
                 }
                 None
             }
@@ -227,10 +228,10 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
                     None => Err(*asset),
                 }
             }
-            Job::Peaks(asset, m) => {
+            Job::Peaks(asset, m, stream) => {
                 let rate = 8_000u32;
                 let per = (rate / PEAKS_PER_SECOND) as usize;
-                let peaks = storage.resolve(m).ok().and_then(|r| media.open_audio(&r, rate, 1).ok()).map(|mut d| {
+                let peaks = storage.resolve(m).ok().and_then(|r| media.open_audio(&r, *stream, rate, 1).ok()).map(|mut d| {
                     let mut out = Vec::new();
                     let (mut acc, mut n) = (0f32, 0usize);
                     while let Ok(Some(b)) = d.next_block() {
@@ -250,7 +251,7 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
                     Some(p) => {
                         if let Some(stills) = s.upgrade() {
                             let mut st = stills.state.lock().unwrap();
-                            st.peaks.insert(*asset, Arc::new(p));
+                            st.peaks.insert((*asset, *stream), Arc::new(p));
                             st.version += 1;
                         }
                         Ok(())

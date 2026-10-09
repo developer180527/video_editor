@@ -19,7 +19,7 @@ fn fixture() -> F {
         id: AssetId::new(),
         name: "a".into(),
         media: MediaRef("file:a".into()),
-        info: Some(MediaInfo { duration: s(100), video: None, audio: None }),
+        info: Some(MediaInfo { duration: s(100), video: None, audio: Vec::new() }),
     };
     let (v1, a1) = (Track::new(TrackKind::Video, "V1"), Track::new(TrackKind::Audio, "A1"));
     let seq = Sequence {
@@ -42,7 +42,7 @@ fn linked_clip(f: &F, start: i64, src: i64, len: i64, link: Option<LinkId>) -> A
     Arc::new(Clip {
         id: ClipId::new(),
         name: "c".into(),
-        source: ClipSource::Asset { asset: f.asset },
+        source: ClipSource::Asset { asset: f.asset, audio_stream: 0 },
         source_range: TimeRange::new(s(src), s(len)),
         timeline_start: s(start),
         enabled: true,

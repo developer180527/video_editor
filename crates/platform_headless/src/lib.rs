@@ -224,7 +224,7 @@ impl MediaBackend for NoMedia {
     fn open_video(&self, _m: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError> {
         Err(MediaError::Unsupported("no media backend".into()))
     }
-    fn open_audio(&self, _m: &Resolved, _sr: u32, _ch: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
+    fn open_audio(&self, _m: &Resolved, _stream: usize, _sr: u32, _ch: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
         Err(MediaError::Unsupported("no media backend".into()))
     }
     fn open_encoder(&self, _o: &Resolved, _s: &EncoderSettings) -> Result<Box<dyn Encoder>, MediaError> {

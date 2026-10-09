@@ -238,3 +238,46 @@ fn steady_and_changing_frames_render_right() {
     let half = RenderLayer { opacity: 0.5, ..light.clone() };
     assert!(shot(&half) < shot(&light));
 }
+
+/// The deep output keeps 10-bit steps that the 8-bit monitor merges.
+#[test]
+fn deep_output_keeps_ten_bit_steps() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    if !device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+        return eprintln!("skipped: no 16-bit textures");
+    }
+    // 64 columns, one 10-bit code each: 400, 401, … 463.
+    let (w, h) = (64u32, 2u32);
+    let word = |v: u16| (v << 6).to_le_bytes();
+    let luma: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(move |x| word(400 + x as u16))).collect();
+    let chroma: Vec<u8> = (0..w * h / 2).flat_map(|_| word(512)).collect();
+    let frame = Arc::new(VideoFrame {
+        pts: Time::ZERO,
+        duration: Time::from_seconds(1),
+        width: w,
+        height: h,
+        format: PixelFormat::P010,
+        color: ColorTags { primaries: "bt709".into(), transfer: "bt709".into(), matrix: "bt709".into(), full_range: false },
+        data: FrameData::Cpu { planes: vec![luma, chroma], strides: vec![w as usize * 2, w as usize * 2] },
+    });
+    let mut l = layer(frame, 100.0, 1.0);
+    l.motion.position = [w as f32 / 2.0, h as f32 / 2.0];
+    let levels = |deep: bool| {
+        let mut c = Compositor::new(&device);
+        c.set_deep_output(deep);
+        c.render(&device, &queue, &FramePlan { time: Time::ZERO, width: w, height: h, layers: vec![] }, &[l.clone()], (w, h), WorkingSpace::LinearRec709);
+        let rb = c.start_readback(&device, &queue).unwrap();
+        let bpp = rb.bytes_per_pixel() as usize;
+        let (_, _, px) = rb.finish(&device).unwrap();
+        let green: Vec<u32> = (0..w as usize)
+            .map(|x| if bpp == 8 { u16::from_le_bytes([px[x * 8 + 2], px[x * 8 + 3]]) as u32 } else { px[x * 4 + 1] as u32 })
+            .collect();
+        assert!(green.windows(2).all(|p| p[1] >= p[0]), "a ramp stays a ramp: {green:?}");
+        let mut d = green.clone();
+        d.dedup();
+        d.len()
+    };
+    let (deep, eight) = (levels(true), levels(false));
+    assert_eq!(deep, 64, "every 10-bit step survives the deep output");
+    assert!(eight < 24, "the 8-bit monitor merges them ({eight} levels)");
+}

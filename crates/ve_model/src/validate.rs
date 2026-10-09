@@ -22,6 +22,8 @@ pub enum ModelError {
     TrackOrder,
     #[error("the active sequence does not exist")]
     MissingActiveSequence,
+    #[error("clip {0} plays an audio stream its media does not have")]
+    MissingAudioStream(ClipId),
 }
 
 pub fn validate(p: &Project) -> Result<(), ModelError> {
@@ -45,9 +47,14 @@ pub fn validate(p: &Project) -> Result<(), ModelError> {
                 if c.timeline_start.ticks() < 0 {
                     return Err(ModelError::NegativeStart(c.id));
                 }
-                if let ClipSource::Asset { asset } = &c.source {
-                    if !p.assets.contains_key(asset) {
+                if let ClipSource::Asset { asset, audio_stream } = &c.source {
+                    let Some(a) = p.assets.get(asset) else {
                         return Err(ModelError::MissingAsset(c.id));
+                    };
+                    // Only known streams can be checked (unprobed media has no info).
+                    let streams = a.info.as_ref().map_or(0, |i| i.audio.len());
+                    if t.kind == TrackKind::Audio && streams > 0 && *audio_stream as usize >= streams {
+                        return Err(ModelError::MissingAudioStream(c.id));
                     }
                 }
                 for e in &c.effects {

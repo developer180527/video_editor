@@ -56,8 +56,8 @@ fn probe(paths: &[String]) -> i32 {
                     if let Some(v) = &i.video {
                         println!("  video     {}x{} @ {}/{} fps, {}", v.width, v.height, v.rate.num, v.rate.den, v.codec);
                     }
-                    if let Some(au) = &i.audio {
-                        println!("  audio     {} Hz, {} ch, {}", au.sample_rate, au.channels, au.codec);
+                    for (k, au) in i.audio.iter().enumerate() {
+                        println!("  audio {:<3} {} Hz, {} ({} ch), {}", k + 1, au.sample_rate, au.layout, au.channels, au.codec);
                     }
                 }
             }
@@ -71,8 +71,6 @@ fn probe(paths: &[String]) -> i32 {
 }
 
 fn assemble(project: &str, media: &[String]) -> i32 {
-    use std::sync::Arc;
-    use ve_model::TrackKind;
     let mut e = engine();
     let mut at = ve_time::Time::ZERO;
     for m in media {
@@ -87,15 +85,12 @@ fn assemble(project: &str, media: &[String]) -> i32 {
         let seq = snap.active().unwrap().clone();
         let a = snap.assets[&asset].clone();
         let info = a.info.clone().unwrap();
-        let link = (info.video.is_some() && info.audio.is_some()).then(ve_model::LinkId::new);
-        let mut items = Vec::new();
-        for kind in [TrackKind::Video, TrackKind::Audio] {
-            let has = if kind == TrackKind::Video { info.video.is_some() } else { info.audio.is_some() };
-            let track = seq.tracks.iter().find(|t| t.kind == kind);
-            if let (true, Some(t)) = (has, track) {
-                items.push((t.id, Arc::new(ve_engine::make_clip(e.plugins(), &seq.format, &a, kind, info.duration, link))));
-            }
+        // Picture plus every audio stream, adding audio tracks as needed.
+        let (adds, items) = ve_engine::clips_for_asset(e.plugins(), &seq, &a, info.duration, None, None);
+        for add in adds {
+            e.execute(add).expect("add track");
         }
+        let snap = e.snapshot();
         let cmd = ve_engine::edit::overwrite(&snap, seq.id, at, &items).expect("place");
         e.execute(cmd).expect("place");
         at += info.duration;

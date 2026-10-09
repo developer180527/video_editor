@@ -109,7 +109,7 @@ fn grid(ui: &mut Ui, app: &mut EditorUi, drop_hover: bool) {
                     // A poster frame a moment in, past any fade from black.
                     let at = a.info.as_ref().map(|i| Time::from_seconds(1).min(Time(i.duration.ticks() / 2))).unwrap_or(Time::ZERO);
                     let tex = if a.info.as_ref().is_some_and(|i| i.video.is_some()) { app.thumb_tex(a, at) } else { None };
-                    let peaks = if tex.is_none() { app.peaks(a) } else { None };
+                    let peaks = if tex.is_none() { app.peaks(a, 0) } else { None };
                     let r = thumbnail(ui, a, selected == Some(a.id), rate, tex, peaks);
                     if r.clicked {
                         picked = Some(a.id);
@@ -154,8 +154,8 @@ fn thumbnail(ui: &mut Ui, a: &Arc<Asset>, selected: bool, rate: Rate, tex: Optio
     }
     let hot = ui.animate_bool(id, 0, r.hovered);
     let (c0, c1) = tint(&a.name);
-    let audio_only = a.info.as_ref().is_some_and(|i| i.video.is_none() && i.audio.is_some());
-    let has_audio = a.info.as_ref().is_some_and(|i| i.audio.is_some());
+    let audio_only = a.info.as_ref().is_some_and(|i| i.video.is_none() && !i.audio.is_empty());
+    let has_audio = a.info.as_ref().is_some_and(|i| !i.audio.is_empty());
     let dur = a
         .info
         .as_ref()

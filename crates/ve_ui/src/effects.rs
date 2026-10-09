@@ -220,7 +220,7 @@ fn group(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>, lab
 fn default_for(app: &EditorUi, clip: &Clip, p: &ParamInfo) -> Value {
     let fmt = app.snap().active().map(|s| s.format.clone()).unwrap_or_default();
     let src = match &clip.source {
-        ClipSource::Asset { asset } => app.snap().assets.get(asset).and_then(|a| a.info.as_ref()).and_then(|i| i.video.clone()),
+        ClipSource::Asset { asset, .. } => app.snap().assets.get(asset).and_then(|a| a.info.as_ref()).and_then(|i| i.video.clone()),
         _ => None,
     };
     let d = match p.id.as_str() {

@@ -139,7 +139,7 @@ fn make_clip_attaches_intrinsics() {
         info: Some(MediaInfo {
             duration: Time::from_seconds(3),
             video: Some(VideoStreamInfo { width: 1280, height: 720, rate: ve_time::Rate::FPS_25, codec: "h264".into() }),
-            audio: None,
+            audio: Vec::new(),
         }),
     };
     let fmt = SequenceFormat::default();
@@ -191,4 +191,67 @@ fn autosave_writes_unsaved_changes_only() {
     // Saving for real retires it.
     e.save_as(MediaRef(format!("file:{}", dir.join("p.veproj").display()))).unwrap();
     assert!(!path.exists());
+}
+
+/// Dropping a file with more audio streams than the sequence has audio
+/// tracks: tracks are added, and every stream gets a linked clip.
+#[test]
+fn every_audio_stream_gets_a_track_and_a_clip() {
+    let mut e = engine(&tmp("streams"));
+    let stream = |layout: &str, channels| AudioStreamInfo { sample_rate: 48_000, channels, codec: "pcm_s24le".into(), layout: layout.into() };
+    let asset = Asset {
+        id: AssetId::new(),
+        name: "cam.mxf".into(),
+        media: MediaRef("file:cam.mxf".into()),
+        info: Some(MediaInfo {
+            duration: Time::from_seconds(4),
+            video: Some(VideoStreamInfo { width: 1920, height: 1080, rate: ve_time::Rate::FPS_25, codec: "h264".into() }),
+            audio: vec![stream("mono", 1), stream("mono", 1), stream("mono", 1), stream("stereo", 2)],
+        }),
+    };
+    e.execute(Command::AddAsset { asset: Arc::new(asset.clone()) }).unwrap();
+    let before = e.snapshot();
+    let seq = before.active().unwrap().clone(); // V1 V2 A1 A2
+    let (adds, items) = clips_for_asset(e.plugins(), &seq, &asset, Time::from_seconds(4), None, None);
+    assert_eq!((adds.len(), items.len()), (2, 5), "A3 and A4 added; picture + 4 streams");
+    let with_tracks = Command::Batch { label: String::new(), commands: adds.clone() }.apply(&before).unwrap().project;
+    let edit = edit::overwrite(&with_tracks, seq.id, Time::ZERO, &items).unwrap();
+    e.execute(Command::Batch { label: "Overwrite".into(), commands: adds.into_iter().chain([edit]).collect() }).unwrap();
+
+    let snap = e.snapshot();
+    let seq = snap.active().unwrap();
+    let audio: Vec<_> = seq.tracks.iter().filter(|t| t.kind == TrackKind::Audio).collect();
+    assert_eq!(audio.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["A1", "A2", "A3", "A4"]);
+    let streams: Vec<u32> = audio
+        .iter()
+        .map(|t| match &t.clips[0].source {
+            ClipSource::Asset { audio_stream, .. } => *audio_stream,
+            _ => panic!(),
+        })
+        .collect();
+    assert_eq!(streams, [0, 1, 2, 3]);
+    let link = seq.tracks[0].clips[0].link;
+    assert!(link.is_some() && audio.iter().all(|t| t.clips[0].link == link), "all linked to the picture");
+    // One undo step takes it all back, tracks included.
+    assert!(e.undo());
+    assert_eq!(*e.snapshot(), *before);
+}
+
+/// A clip cannot name an audio stream its media does not have.
+#[test]
+fn clips_must_name_an_existing_stream() {
+    let mut e = engine(&tmp("badstream"));
+    let asset = Asset {
+        id: AssetId::new(),
+        name: "a.wav".into(),
+        media: MediaRef("file:a.wav".into()),
+        info: Some(MediaInfo { duration: Time::from_seconds(1), video: None, audio: vec![AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: "pcm".into(), layout: "stereo".into() }] }),
+    };
+    e.execute(Command::AddAsset { asset: Arc::new(asset.clone()) }).unwrap();
+    let snap = e.snapshot();
+    let seq = snap.active().unwrap();
+    let mut clip = make_clip(e.plugins(), &seq.format, &asset, TrackKind::Audio, Time::from_seconds(1), None);
+    clip.source = ClipSource::Asset { asset: asset.id, audio_stream: 1 };
+    let err = e.execute(Command::AddClip { sequence: seq.id, track: seq.tracks[2].id, clip: Arc::new(clip) }).unwrap_err();
+    assert!(matches!(err, CommandError::Invalid(ModelError::MissingAudioStream(_))), "{err:?}");
 }

@@ -11,7 +11,7 @@
 
 mod compositor;
 
-pub use compositor::{quad, yuv_levels, Blend, Compositor, Readback, GpuEffect, Motion, RenderLayer, TextureImporter, WorkingSpace, DISPLAY_FORMAT, WORKING_FORMAT};
+pub use compositor::{quad, yuv_levels, Blend, Compositor, Readback, DEEP_FORMAT, GpuEffect, Motion, RenderLayer, TextureImporter, WorkingSpace, DISPLAY_FORMAT, WORKING_FORMAT};
 
 use std::sync::Arc;
 use ve_model::*;
@@ -162,7 +162,7 @@ mod tests {
             Arc::new(Clip {
                 id: ClipId::new(),
                 name: "c".into(),
-                source: ClipSource::Asset { asset },
+                source: ClipSource::Asset { asset, audio_stream: 0 },
                 source_range: TimeRange::new(s(src), s(5)),
                 timeline_start: s(start),
                 enabled: true,

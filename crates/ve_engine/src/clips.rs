@@ -56,13 +56,57 @@ pub fn make_clip(
     Clip {
         id: ClipId::new(),
         name: format!("{}{suffix}", asset.name),
-        source: ClipSource::Asset { asset: asset.id },
+        source: ClipSource::Asset { asset: asset.id, audio_stream: 0 },
         source_range: TimeRange::new(Time::ZERO, duration),
         timeline_start: Time::ZERO,
         enabled: true,
         link,
         effects,
     }
+}
+
+/// Everything a drop of `asset` puts on the timeline: its picture (if any)
+/// on `video_track`, and one clip per audio stream on consecutive audio
+/// tracks from `first_audio` (the first audio track when `None`) — all
+/// linked, `duration` long from the source's start. Cameras that record each
+/// channel as its own stream (eight mono streams) land on A1…A8, like any
+/// professional editor. Where the sequence has too few audio tracks, the
+/// returned commands add them; apply those first.
+pub fn clips_for_asset(
+    registry: &Registry,
+    seq: &Sequence,
+    asset: &Asset,
+    duration: Time,
+    video_track: Option<TrackId>,
+    first_audio: Option<TrackId>,
+) -> (Vec<crate::Command>, Vec<(TrackId, Arc<Clip>)>) {
+    let Some(info) = &asset.info else { return (vec![], vec![]) };
+    let streams = info.audio.len();
+    let link = (info.video.is_some() as usize + streams > 1).then(LinkId::new);
+    let mut items = Vec::new();
+    if let (Some(_), Some(t)) = (&info.video, video_track.or_else(|| seq.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id))) {
+        items.push((t, Arc::new(make_clip(registry, &seq.format, asset, TrackKind::Video, duration, link))));
+    }
+    // Audio tracks from the first one wanted, then new ones after the last.
+    let audio: Vec<TrackId> = seq.tracks.iter().filter(|t| t.kind == TrackKind::Audio).map(|t| t.id).collect();
+    let from = first_audio.and_then(|f| audio.iter().position(|t| *t == f)).unwrap_or(0);
+    let mut tracks: Vec<TrackId> = audio.iter().skip(from).take(streams).copied().collect();
+    let mut adds = Vec::new();
+    while tracks.len() < streams {
+        let n = audio.len() + adds.len() + 1;
+        let track = Track::new(TrackKind::Audio, format!("A{n}"));
+        tracks.push(track.id);
+        adds.push(crate::Command::AddTrack { sequence: seq.id, index: seq.tracks.len() + adds.len(), track: Arc::new(track) });
+    }
+    for (k, t) in tracks.into_iter().enumerate() {
+        let mut clip = make_clip(registry, &seq.format, asset, TrackKind::Audio, duration, link);
+        clip.source = ClipSource::Asset { asset: asset.id, audio_stream: k as u32 };
+        if streams > 1 {
+            clip.name = format!("{} [A{}]", asset.name, k + 1);
+        }
+        items.push((t, Arc::new(clip)));
+    }
+    (adds, items)
 }
 
 /// A parameter's value from its declared kind and four numbers.

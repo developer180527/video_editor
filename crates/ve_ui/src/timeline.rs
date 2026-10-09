@@ -699,14 +699,14 @@ impl Shot {
                     (_, TrackKind::Audio) => ClipKind::Audio,
                 };
                 let asset_name = match &c.source {
-                    ClipSource::Asset { asset } => proj.assets.get(asset).map(|a| a.name.clone()).unwrap_or_default(),
+                    ClipSource::Asset { asset, .. } => proj.assets.get(asset).map(|a| a.name.clone()).unwrap_or_default(),
                     _ => c.name.clone(),
                 };
                 let fx = c.effects.iter().any(|e| {
                     !e.plugin.id.starts_with("ve.") || e.params.values().any(|p| matches!(p, Param::Animated(_)))
                 });
                 let asset = match &c.source {
-                    ClipSource::Asset { asset } => proj.assets.get(asset).cloned(),
+                    ClipSource::Asset { asset, .. } => proj.assets.get(asset).cloned(),
                     _ => None,
                 };
                 let start = c.timeline_start.as_seconds_f64() as f32;
@@ -730,8 +730,8 @@ impl Shot {
                         cells.push((off, app.thumb_tex(a, t)));
                     }
                 }
-                let peaks = match (kind, &asset) {
-                    (ClipKind::Audio, Some(a)) => app.peaks(a),
+                let peaks = match (kind, &asset, &c.source) {
+                    (ClipKind::Audio, Some(a), ClipSource::Asset { audio_stream, .. }) => app.peaks(a, *audio_stream as usize),
                     _ => None,
                 };
                 clips.push(ClipShot {

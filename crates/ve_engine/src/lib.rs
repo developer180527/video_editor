@@ -20,7 +20,7 @@ pub mod frame;
 mod project_file;
 
 pub use client::{EngineClient, Published, Waker};
-pub use clips::{default_value, make_clip};
+pub use clips::{clips_for_asset, default_value, make_clip};
 pub use ve_command::edit;
 pub use ve_plugin_host::intrinsic;
 

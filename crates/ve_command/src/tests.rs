@@ -20,7 +20,7 @@ fn fixture() -> Fixture {
         id: AssetId::new(),
         name: "a.mp4".into(),
         media: MediaRef("file:a.mp4".into()),
-        info: Some(MediaInfo { duration: s(20), video: None, audio: None }),
+        info: Some(MediaInfo { duration: s(20), video: None, audio: Vec::new() }),
     };
     let (v1, v2, a1) =
         (Track::new(TrackKind::Video, "V1"), Track::new(TrackKind::Video, "V2"), Track::new(TrackKind::Audio, "A1"));
@@ -41,7 +41,7 @@ fn clip(f: &Fixture, start: i64, src: i64, len: i64) -> Arc<Clip> {
     Arc::new(Clip {
         id: ClipId::new(),
         name: "c".into(),
-        source: ClipSource::Asset { asset: f.asset },
+        source: ClipSource::Asset { asset: f.asset, audio_stream: 0 },
         source_range: TimeRange::new(s(src), s(len)),
         timeline_start: s(start),
         enabled: true,

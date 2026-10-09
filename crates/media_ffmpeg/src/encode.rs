@@ -2,8 +2,9 @@
 //! machine has (see [`video_encoders`]) — ProRes 422 HQ through FFmpeg's own
 //! (LGPL) encoder, AAC audio, into MP4 or MOV.
 //!
-//! Video arrives as display-encoded RGBA8 (what the compositor's display
-//! pass produces) and leaves as Rec.709 YCbCr, tagged as such.
+//! Video arrives as display-encoded RGBA — 16 bits per channel from export,
+//! 8 from elsewhere — and leaves as Rec.709 YCbCr at the codec's depth
+//! (10-bit for ProRes and, where the encoder can, HEVC), tagged as such.
 
 use std::ffi::{c_int, CString};
 use std::ptr;
@@ -23,6 +24,20 @@ struct Stream {
     hw_frames: *mut sys::AVBufferRef,
     /// The format frames are converted to in memory (before any upload).
     sw_pix: sys::AVPixelFormat,
+}
+
+/// Pixel formats to offer encoder `name`, deepest first: ProRes is 10-bit
+/// 4:2:2; HEVC is 10-bit (Main 10) where the encoder can, else 8-bit; H.264
+/// is 8-bit (10-bit H.264 is rarely supported by hardware or players).
+fn pixel_formats(name: &str) -> &'static [sys::AVPixelFormat] {
+    use sys::AVPixelFormat::*;
+    if name == "prores_ks" {
+        &[AV_PIX_FMT_YUV422P10LE]
+    } else if name.starts_with("hevc") {
+        &[AV_PIX_FMT_P010LE, AV_PIX_FMT_NV12]
+    } else {
+        &[AV_PIX_FMT_NV12]
+    }
 }
 
 /// An encoder to try: FFmpeg name, the device type it needs frames uploaded
@@ -120,22 +135,30 @@ impl FfEncoder {
     unsafe fn add_video(&mut self, s: &EncoderSettings) -> Result<Stream, MediaError> {
         let mut tried = Vec::new();
         for &(name, device, opts) in video_encoders(&s.video_codec) {
-            match unsafe { self.try_video(s, name, device, opts) } {
-                Ok(st) => return Ok(st),
-                Err(e) => tried.push(format!("{name}: {e}")),
+            for &pix in pixel_formats(name) {
+                match unsafe { self.try_video(s, name, device, opts, pix) } {
+                    Ok(st) => return Ok(st),
+                    Err(e) => tried.push(format!("{name} ({pix:?}): {e}")),
+                }
             }
         }
         Err(MediaError::Unsupported(format!("no {} encoder works here ({})", s.video_codec, tried.join("; "))))
     }
 
     /// Open encoder `name`, or say why not. Adds the stream only on success.
-    unsafe fn try_video(&mut self, s: &EncoderSettings, name: &str, device: Option<sys::AVHWDeviceType>, opts: &[(&str, &str)]) -> Result<Stream, String> {
+    unsafe fn try_video(
+        &mut self,
+        s: &EncoderSettings,
+        name: &str,
+        device: Option<sys::AVHWDeviceType>,
+        opts: &[(&str, &str)],
+        sw_pix: sys::AVPixelFormat,
+    ) -> Result<Stream, String> {
         let cname = CString::new(name).unwrap();
         let codec = unsafe { sys::avcodec_find_encoder_by_name(cname.as_ptr()) };
         if codec.is_null() {
             return Err("not in this build".into());
         }
-        let sw_pix = if name == "prores_ks" { sys::AVPixelFormat::AV_PIX_FMT_YUV422P10LE } else { sys::AVPixelFormat::AV_PIX_FMT_NV12 };
         unsafe {
             let mut ctx = sys::avcodec_alloc_context3(codec);
             (*ctx).width = s.width as c_int;
@@ -281,15 +304,17 @@ impl Encoder for FfEncoder {
         let Some(CpuPlanes { planes, strides }) = frame.data.cpu() else {
             return Err(MediaError::Unsupported("export frames must be in memory".into()));
         };
-        if frame.format != PixelFormat::Rgba8 {
-            return Err(MediaError::Unsupported("export frames must be RGBA8".into()));
-        }
+        let src_fmt = match frame.format {
+            PixelFormat::Rgba8 => sys::AVPixelFormat::AV_PIX_FMT_RGBA,
+            PixelFormat::Rgba16 => sys::AVPixelFormat::AV_PIX_FMT_RGBA64LE,
+            _ => return Err(MediaError::Unsupported("export frames must be RGBA8 or RGBA16".into())),
+        };
         unsafe {
             let ctx = self.video.ctx;
             let mut src = sys::av_frame_alloc();
             (*src).width = frame.width as c_int;
             (*src).height = frame.height as c_int;
-            (*src).format = sys::AVPixelFormat::AV_PIX_FMT_RGBA as c_int;
+            (*src).format = src_fmt as c_int;
             (*src).data[0] = planes[0].as_ptr() as *mut u8;
             (*src).linesize[0] = strides[0] as c_int;
             (*src).colorspace = sys::AVColorSpace::AVCOL_SPC_RGB;

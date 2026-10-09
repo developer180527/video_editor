@@ -33,6 +33,9 @@ use crate::FramePlan;
 pub const WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// What the monitor shows: display-encoded RGBA8.
 pub const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// The deep output (export): the same display-encoded picture as 16-bit
+/// integers, 0..65535. Renderable on every GPU, unlike 16-bit normalized.
+pub const DEEP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Uint;
 
 /// Turns a frame left in GPU memory by a hardware decoder into textures on
 /// the compositor's device without a copy: a `CVPixelBuffer` → Metal
@@ -240,13 +243,24 @@ struct Display {
 @group(0) @binding(1) var work: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 
-@fragment
-fn fs_display(i: VsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(work, samp, i.uv);
-    // Over black, then to the display: Rec.709 primaries, BT.1886 (2.4).
+// The monitor signal: Rec.709 primaries, BT.1886 (2.4), over black.
+fn display_signal(uv: vec2<f32>) -> vec4<f32> {
+    let c = textureSample(work, samp, uv);
     let m = mat3x3<f32>(d.w0.xyz, d.w1.xyz, d.w2.xyz);
     let rgb = clamp(m * c.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(pow(rgb, vec3<f32>(1.0 / 2.4)), 1.0);
+}
+
+@fragment
+fn fs_display(i: VsOut) -> @location(0) vec4<f32> {
+    return display_signal(i.uv);
+}
+
+// The same signal at 16 bits, for export: exact integers, no 8-bit step.
+@fragment
+fn fs_display_deep(i: VsOut) -> @location(0) vec4<u32> {
+    let v = display_signal(i.uv);
+    return vec4<u32>(round(clamp(v, vec4<f32>(0.0), vec4<f32>(1.0)) * 65535.0));
 }
 "#;
 
@@ -479,6 +493,9 @@ pub struct Compositor {
     one_layout: wgpu::BindGroupLayout,
     composite: HashMap<Blend, wgpu::RenderPipeline>,
     display: wgpu::RenderPipeline,
+    display_deep: wgpu::RenderPipeline,
+    /// Render the output at 16 bits ([`DEEP_FORMAT`]) instead of 8.
+    deep_output: bool,
     mip: wgpu::RenderPipeline,
     effects: HashMap<String, Result<wgpu::RenderPipeline, String>>,
     effect_layout: wgpu::BindGroupLayout,
@@ -579,6 +596,7 @@ impl Compositor {
             .map(|b| (b, pipeline(device, COMPOSITE, "vs_quad", "fs_quad", &one_layout, WORKING_FORMAT, Some(blend_state(b)))))
             .collect();
         let display = pipeline(device, &format!("{COMMON}{DISPLAY}"), "vs_full", "fs_display", &one_layout, DISPLAY_FORMAT, None);
+        let display_deep = pipeline(device, &format!("{COMMON}{DISPLAY}"), "vs_full", "fs_display_deep", &one_layout, DEEP_FORMAT, None);
         let mip = pipeline(device, &format!("{COMMON}{MIP}"), "vs_full", "fs_mip", &one_layout, WORKING_FORMAT, None);
         let dummy = texture(device, "dummy", 1, 1, WORKING_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
         Compositor {
@@ -589,6 +607,8 @@ impl Compositor {
             one_layout,
             composite,
             display,
+            display_deep,
+            deep_output: false,
             mip,
             effects: HashMap::new(),
             effect_layout,
@@ -605,6 +625,13 @@ impl Compositor {
         }
     }
 
+    /// Render the output at 16 bits per channel ([`DEEP_FORMAT`]): for
+    /// export, so 10-bit codecs get 10 real bits and 8-bit ones are rounded
+    /// from the full picture. The monitor stays 8-bit.
+    pub fn set_deep_output(&mut self, deep: bool) {
+        self.deep_output = deep;
+    }
+
     /// Use `importer` for frames left in GPU memory by hardware decoders.
     pub fn set_importer(&mut self, importer: Option<Arc<dyn TextureImporter>>) {
         self.importer = importer;
@@ -617,7 +644,7 @@ impl Compositor {
 
     /// Make `slot` hold a `w`×`h` texture; true if it was (re)made.
     fn target(slot: &mut Option<Target>, device: &wgpu::Device, label: &str, w: u32, h: u32, format: wgpu::TextureFormat, usage: wgpu::TextureUsages) -> bool {
-        if matches!(slot, Some(s) if s.w == w && s.h == h) {
+        if matches!(slot, Some(s) if s.w == w && s.h == h && s.tex.format() == format) {
             return false;
         }
         let tex = texture(device, label, w, h, format, usage);
@@ -759,7 +786,8 @@ impl Compositor {
         if Self::target(&mut self.work, device, "work", w, h, WORKING_FORMAT, target_usage) {
             self.display_bg = None;
         }
-        Self::target(&mut self.out, device, "monitor", w, h, DISPLAY_FORMAT, target_usage);
+        let out_format = if self.deep_output { DEEP_FORMAT } else { DISPLAY_FORMAT };
+        Self::target(&mut self.out, device, "monitor", w, h, out_format, target_usage);
         while self.slots.len() < layers.len() {
             self.slots.push(Slot::new(device));
         }
@@ -896,7 +924,7 @@ impl Compositor {
         }
         {
             let mut pass = begin(&mut enc, &self.out.as_ref().unwrap().view, Some(wgpu::Color::BLACK));
-            pass.set_pipeline(&self.display);
+            pass.set_pipeline(if self.deep_output { &self.display_deep } else { &self.display });
             pass.set_bind_group(0, self.display_bg.as_ref(), &[]);
             pass.draw(0..3, 0..1);
         }
@@ -914,7 +942,8 @@ impl Compositor {
     pub fn start_readback(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Readback> {
         let out = self.out.as_ref()?;
         let (w, h) = (out.w, out.h);
-        let row = (w * 4).div_ceil(256) * 256;
+        let bpp = if out.tex.format() == DEEP_FORMAT { 8 } else { 4 };
+        let row = (w * bpp).div_ceil(256) * 256;
         let size = (row * h) as u64;
         let pooled = {
             let mut pool = self.readback_pool.lock().unwrap();
@@ -940,7 +969,7 @@ impl Compositor {
         buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        Some(Readback { buf, w, h, row, index, rx, pool: self.readback_pool.clone() })
+        Some(Readback { buf, w, h, bpp, row, index, rx, pool: self.readback_pool.clone() })
     }
 }
 
@@ -949,6 +978,8 @@ pub struct Readback {
     buf: wgpu::Buffer,
     w: u32,
     h: u32,
+    /// 4 (RGBA8) or 8 (16-bit RGBA, little-endian).
+    bpp: u32,
     row: u32,
     index: wgpu::SubmissionIndex,
     rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
@@ -956,16 +987,21 @@ pub struct Readback {
 }
 
 impl Readback {
+    /// 4 for RGBA8, 8 for the deep output's 16-bit RGBA (little-endian).
+    pub fn bytes_per_pixel(&self) -> u32 {
+        self.bpp
+    }
+
     /// Wait for this copy (only this one, not work queued after it) and
-    /// return tightly packed RGBA8 rows.
+    /// return tightly packed rows (see [`Readback::bytes_per_pixel`]).
     pub fn finish(self, device: &wgpu::Device) -> Option<(u32, u32, Vec<u8>)> {
         let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(self.index), timeout: None });
         self.rx.recv().ok()?.ok()?;
-        let (w, h, row) = (self.w as usize, self.h as usize, self.row as usize);
+        let (w, h, row, bpp) = (self.w as usize, self.h as usize, self.row as usize, self.bpp as usize);
         let data = self.buf.slice(..).get_mapped_range().ok()?;
-        let mut px = Vec::with_capacity(w * h * 4);
+        let mut px = Vec::with_capacity(w * h * bpp);
         for y in 0..h {
-            px.extend_from_slice(&data[y * row..y * row + w * 4]);
+            px.extend_from_slice(&data[y * row..y * row + w * bpp]);
         }
         drop(data);
         self.buf.unmap();

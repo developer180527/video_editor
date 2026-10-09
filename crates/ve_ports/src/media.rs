@@ -27,6 +27,8 @@ pub enum PixelFormat {
     /// 10-bit 4:2:2 in 16-bit words, three planes (ProRes, DNxHR).
     Yuv422p10,
     Rgba8,
+    /// 16 bits per channel, little-endian: the deep output export encodes.
+    Rgba16,
     /// Half-float RGBA, linear: the engine's working format.
     Rgba16f,
 }
@@ -163,7 +165,10 @@ pub trait MediaBackend: Send + Sync {
     fn open_video_for_gpu(&self, media: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError> {
         self.open_video(media)
     }
-    fn open_audio(&self, media: &Resolved, sample_rate: u32, channels: u16) -> Result<Box<dyn AudioDecoder>, MediaError>;
+    /// The file's `stream`-th audio stream (an index into
+    /// `MediaInfo::audio`), converted to `sample_rate` and `channels` by its
+    /// channel layout (mono is centred, 5.1 is downmixed, …).
+    fn open_audio(&self, media: &Resolved, stream: usize, sample_rate: u32, channels: u16) -> Result<Box<dyn AudioDecoder>, MediaError>;
     /// `out` must be a reference the storage port can write.
     fn open_encoder(&self, out: &Resolved, settings: &EncoderSettings) -> Result<Box<dyn Encoder>, MediaError>;
 }

@@ -108,7 +108,7 @@ impl MediaBackend for Ffmpeg {
 
     fn probe(&self, media: &Resolved) -> Result<MediaInfo, MediaError> {
         let input = Input::open(media)?;
-        let mut info = MediaInfo { duration: Time::ZERO, video: None, audio: None };
+        let mut info = MediaInfo { duration: Time::ZERO, video: None, audio: Vec::new() };
         let ctx = unsafe { &*input.0 };
         if ctx.duration > 0 {
             info.duration = to_time(ctx.duration, sys::AVRational { num: 1, den: sys::AV_TIME_BASE as i32 });
@@ -126,11 +126,25 @@ impl MediaBackend for Ffmpeg {
                         codec: codec_name(par.codec_id),
                     });
                 }
-                sys::AVMediaType::AVMEDIA_TYPE_AUDIO if info.audio.is_none() => {
-                    info.audio = Some(AudioStreamInfo {
+                sys::AVMediaType::AVMEDIA_TYPE_AUDIO => {
+                    let channels = par.ch_layout.nb_channels;
+                    // Undeclared layouts (common in camera files) play as the
+                    // usual layout for their count; name them so.
+                    let layout = match (par.ch_layout.order, channels) {
+                        (sys::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC, 1) => "mono".to_string(),
+                        (sys::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC, 2) => "stereo".to_string(),
+                        (sys::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC, n) => format!("{n} channels"),
+                        _ => {
+                            let mut name = [0 as std::ffi::c_char; 64];
+                            let n = unsafe { sys::av_channel_layout_describe(&par.ch_layout, name.as_mut_ptr(), name.len()) };
+                            if n > 0 { unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned() } else { format!("{channels} channels") }
+                        }
+                    };
+                    info.audio.push(AudioStreamInfo {
                         sample_rate: par.sample_rate as u32,
                         channels: par.ch_layout.nb_channels as u16,
                         codec: codec_name(par.codec_id),
+                        layout,
                     });
                 }
                 _ => {}
@@ -147,8 +161,8 @@ impl MediaBackend for Ffmpeg {
         Ok(Box::new(VideoDec::open_with(media, true, true)?))
     }
 
-    fn open_audio(&self, media: &Resolved, sample_rate: u32, channels: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
-        Ok(Box::new(AudioDec::open(media, sample_rate, channels)?))
+    fn open_audio(&self, media: &Resolved, stream: usize, sample_rate: u32, channels: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
+        Ok(Box::new(AudioDec::open(media, stream, sample_rate, channels)?))
     }
 
     fn open_encoder(&self, out: &Resolved, settings: &EncoderSettings) -> Result<Box<dyn Encoder>, MediaError> {

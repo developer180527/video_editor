@@ -279,9 +279,10 @@ impl EditorUi {
         None
     }
 
-    /// Waveform peaks of `asset` (100 per second), once computed.
-    pub(crate) fn peaks(&self, asset: &Asset) -> Option<std::sync::Arc<Vec<f32>>> {
-        self.engine.stills().peaks(asset.id, &asset.media)
+    /// Waveform peaks of `asset`'s `stream`-th audio stream (100 per
+    /// second), once computed.
+    pub(crate) fn peaks(&self, asset: &Asset, stream: usize) -> Option<std::sync::Arc<Vec<f32>>> {
+        self.engine.stills().peaks(asset.id, &asset.media, stream)
     }
 
     /// Export to `path` with the chosen preset (after the host's save dialog).
@@ -590,30 +591,28 @@ impl EditorUi {
             return;
         };
         let duration = if info.duration > Time::ZERO { info.duration } else { Time::from_seconds(5) };
-        let link = (info.video.is_some() && info.audio.is_some()).then(LinkId::new);
-        let plugins = self.st.plugins.clone();
         let target = |kind: TrackKind, explicit: Option<TrackId>| {
             explicit
                 .filter(|id| seq.track(*id).is_some_and(|(_, t)| t.kind == kind))
                 .or_else(|| seq.tracks.iter().find(|t| t.kind == kind && self.view.targeted.contains(&t.id)).map(|t| t.id))
-                .or_else(|| seq.tracks.iter().find(|t| t.kind == kind).map(|t| t.id))
         };
-        let mut items = Vec::new();
-        if info.video.is_some() {
-            if let Some(t) = target(TrackKind::Video, video_track) {
-                items.push((t, std::sync::Arc::new(ve_engine::make_clip(&plugins, &seq.format, &a, TrackKind::Video, duration, link))));
+        // Picture and every audio stream, linked; audio tracks added if the
+        // file has more streams than the sequence has tracks.
+        let (adds, items) = ve_engine::clips_for_asset(&self.st.plugins, &seq, &a, duration, target(TrackKind::Video, video_track), target(TrackKind::Audio, video_track));
+        let add_tracks = ve_engine::Command::Batch { label: String::new(), commands: adds.clone() };
+        let with_tracks = match add_tracks.apply(self.snap()) {
+            Ok(r) => r.project,
+            Err(e) => {
+                self.errors.push(e.to_string());
+                return;
             }
-        }
-        if info.audio.is_some() {
-            if let Some(t) = target(TrackKind::Audio, video_track) {
-                items.push((t, std::sync::Arc::new(ve_engine::make_clip(&plugins, &seq.format, &a, TrackKind::Audio, duration, link))));
-            }
-        }
-        let r = if insert {
-            ve_engine::edit::insert(self.snap(), seq.id, at, &items)
-        } else {
-            ve_engine::edit::overwrite(self.snap(), seq.id, at, &items)
         };
+        let edit = if insert { ve_engine::edit::insert(&with_tracks, seq.id, at, &items) } else { ve_engine::edit::overwrite(&with_tracks, seq.id, at, &items) };
+        // One undo step: the new tracks and the edit.
+        let r = edit.map(|e| match adds.is_empty() {
+            true => e,
+            false => ve_engine::Command::Batch { label: e.label(), commands: adds.into_iter().chain([e]).collect() },
+        });
         self.run_edit(r);
     }
 }

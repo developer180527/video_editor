@@ -28,7 +28,8 @@ use std::sync::Arc;
 use ve_time::{Rate, Time, TimeRange};
 
 /// Bumped whenever the serialized shape changes; loaders migrate older files.
-pub const SCHEMA_VERSION: u32 = 1;
+/// 2: `MediaInfo::audio` lists every audio stream; clips name theirs.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A read-only view of the document, shared across threads.
 pub type Snapshot = Arc<Project>;
@@ -91,7 +92,9 @@ pub struct Asset {
 pub struct MediaInfo {
     pub duration: Time,
     pub video: Option<VideoStreamInfo>,
-    pub audio: Option<AudioStreamInfo>,
+    /// Every audio stream, in file order. Cameras often record each channel
+    /// as a stream of its own (eight mono streams, say); each can be a clip.
+    pub audio: Vec<AudioStreamInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -107,6 +110,10 @@ pub struct AudioStreamInfo {
     pub sample_rate: u32,
     pub channels: u16,
     pub codec: String,
+    /// The channel layout as FFmpeg names it: "mono", "stereo", "5.1",
+    /// "7.1"; or "N channels" when the file does not say.
+    #[serde(default)]
+    pub layout: String,
 }
 
 /// The format a sequence renders at.
@@ -217,8 +224,14 @@ pub fn partition_point<T: Clone>(v: &Vector<T>, pred: impl Fn(&T) -> bool) -> us
 /// What a clip plays.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClipSource {
-    /// A span of an imported file.
-    Asset { asset: AssetId },
+    /// A span of an imported file. An audio clip plays one of its audio
+    /// streams (an index into `MediaInfo::audio`), mixed to the sequence by
+    /// that stream's channel layout.
+    Asset {
+        asset: AssetId,
+        #[serde(default)]
+        audio_stream: u32,
+    },
     /// Synthesised by a plugin: a title, a colour matte, bars and tone.
     Generator { plugin: PluginRef },
 }

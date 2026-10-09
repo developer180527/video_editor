@@ -198,7 +198,12 @@ unsafe extern "C" fn pick_hw_format(ctx: *mut sys::AVCodecContext, fmts: *const 
 }
 
 fn first_stream(input: &Input, kind: sys::AVMediaType) -> Option<usize> {
-    input.streams().iter().position(|&s| unsafe { (*(*s).codecpar).codec_type == kind })
+    nth_stream(input, kind, 0)
+}
+
+/// The container index of the `nth` stream of `kind`.
+fn nth_stream(input: &Input, kind: sys::AVMediaType, nth: usize) -> Option<usize> {
+    input.streams().iter().enumerate().filter(|(_, &s)| unsafe { (*(*s).codecpar).codec_type == kind }).nth(nth).map(|(i, _)| i)
 }
 
 /// A decoded frame's two planes, shared with FFmpeg: holds a reference to
@@ -609,9 +614,11 @@ unsafe impl Send for AudioDec {}
 const MAX_LEAD_IN: Time = Time::from_seconds(10);
 
 impl AudioDec {
-    pub fn open(media: &Resolved, rate: u32, channels: u16) -> Result<AudioDec, MediaError> {
+    /// The `nth` audio stream of `media` (0 is the first audio stream).
+    pub fn open(media: &Resolved, nth: usize, rate: u32, channels: u16) -> Result<AudioDec, MediaError> {
         let input = Input::open(media)?;
-        let stream = first_stream(&input, sys::AVMediaType::AVMEDIA_TYPE_AUDIO).ok_or_else(|| MediaError::Unsupported("no audio stream".into()))?;
+        let stream = nth_stream(&input, sys::AVMediaType::AVMEDIA_TYPE_AUDIO, nth)
+            .ok_or_else(|| MediaError::Unsupported(if nth == 0 { "no audio stream".into() } else { format!("no audio stream {}", nth + 1) }))?;
         let (codec, _) = Codec::open(&input, stream, false)?;
         let tb = unsafe { (*input.streams()[stream]).time_base };
         let origin = input.origin();
@@ -627,17 +634,26 @@ impl AudioDec {
             let mut out_layout: sys::AVChannelLayout = std::mem::zeroed();
             sys::av_channel_layout_default(&mut out_layout, self.channels as c_int);
             let in_fmt: sys::AVSampleFormat = std::mem::transmute((*f).format);
+            // Channels without a declared layout get the usual one for their
+            // count (8 → 7.1), so the downmix to `channels` is defined.
+            let mut in_layout: sys::AVChannelLayout = std::mem::zeroed();
+            if (*f).ch_layout.order == sys::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC {
+                sys::av_channel_layout_default(&mut in_layout, (*f).ch_layout.nb_channels);
+            } else {
+                sys::av_channel_layout_copy(&mut in_layout, &(*f).ch_layout);
+            }
             let r = sys::swr_alloc_set_opts2(
                 &mut self.swr,
                 &out_layout,
                 sys::AVSampleFormat::AV_SAMPLE_FMT_FLT,
                 self.rate as c_int,
-                &(*f).ch_layout,
+                &in_layout,
                 in_fmt,
                 (*f).sample_rate,
                 0,
                 ptr::null_mut(),
             );
+            sys::av_channel_layout_uninit(&mut in_layout);
             if r < 0 || sys::swr_init(self.swr) < 0 {
                 return Err(MediaError::Unsupported(format!("audio resampling: {}", err(r))));
             }

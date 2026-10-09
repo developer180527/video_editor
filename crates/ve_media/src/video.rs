@@ -501,7 +501,7 @@ mod tests {
             self.alive.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FakeDec { alive: self.alive.clone(), first: self.first, next: self.first, end: self.first + self.count, decoded: self.decoded.clone() }))
         }
-        fn open_audio(&self, _: &Resolved, _: u32, _: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
+        fn open_audio(&self, _: &Resolved, _: usize, _: u32, _: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
             unimplemented!()
         }
         fn open_encoder(&self, _: &Resolved, _: &EncoderSettings) -> Result<Box<dyn Encoder>, MediaError> {

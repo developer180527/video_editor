@@ -22,8 +22,10 @@ pub fn db_to_gain(db: f64) -> f32 {
 }
 
 struct Stream {
-    /// The asset the decoder reads (a clip's source can be replaced).
+    /// The asset and audio stream the decoder reads (a clip's source can be
+    /// replaced).
     asset: AssetId,
+    stream: usize,
     dec: Box<dyn AudioDecoder>,
     /// Decoded stereo samples starting at `at` (source time).
     buf: VecDeque<f32>,
@@ -83,7 +85,7 @@ impl Mixer {
     }
 
     fn mix_clip(&mut self, project: &Project, clip: &Clip, start: Time, frames: usize, out: &mut [f32]) {
-        let ClipSource::Asset { asset } = &clip.source else { return };
+        let ClipSource::Asset { asset, audio_stream } = &clip.source else { return };
         let Some(asset) = project.assets.get(asset) else { return };
         if self.failed.contains_key(&clip.id) {
             return;
@@ -105,7 +107,7 @@ impl Mixer {
         // loop — opening a file costs far more than seeking it), open one
         // only when there is none.
         let ready = match self.streams.get_mut(&clip.id) {
-            Some(s) if s.asset != asset.id => false,
+            Some(s) if s.asset != asset.id || s.stream != *audio_stream as usize => false,
             Some(s) if (s.at - src_t).ticks().abs() < ve_time::TICKS_PER_SECOND / 100 => true, // within 10 ms
             Some(s) => {
                 let ok = s.dec.seek(src_t).is_ok();
@@ -119,7 +121,7 @@ impl Mixer {
             None => false,
         };
         if !ready {
-            match self.open(asset, src_t) {
+            match self.open(asset, *audio_stream as usize, src_t) {
                 Ok(s) => {
                     self.streams.insert(clip.id, s);
                 }
@@ -162,13 +164,13 @@ impl Mixer {
         s.at = src_t + Time((n as i128 * ve_time::TICKS_PER_SECOND as i128 / rate as i128) as i64);
     }
 
-    fn open(&self, asset: &Asset, at: Time) -> Result<Stream, String> {
+    fn open(&self, asset: &Asset, stream: usize, at: Time) -> Result<Stream, String> {
         let resolved = self.storage.resolve(&asset.media).map_err(|e| e.to_string())?;
-        let mut dec = self.media.open_audio(&resolved, self.rate, 2).map_err(|e| e.to_string())?;
+        let mut dec = self.media.open_audio(&resolved, stream, self.rate, 2).map_err(|e| e.to_string())?;
         // Always seek, even to zero: the decoder then lines its first sample
         // up with `at` by timestamp, exactly as when starting mid-clip.
         dec.seek(at).map_err(|e| e.to_string())?;
-        Ok(Stream { asset: asset.id, dec, buf: VecDeque::new(), at, ended: false })
+        Ok(Stream { asset: asset.id, stream, dec, buf: VecDeque::new(), at, ended: false })
     }
 }
 
@@ -210,7 +212,7 @@ mod tests {
         fn open_video(&self, _: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError> {
             unimplemented!()
         }
-        fn open_audio(&self, _: &Resolved, _: u32, _: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
+        fn open_audio(&self, _: &Resolved, _: usize, _: u32, _: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(Dec { seeks: self.seeks.clone() }))
         }
@@ -231,7 +233,7 @@ mod tests {
         track.clips.push_back(Arc::new(Clip {
             id: ClipId::new(),
             name: "c".into(),
-            source: ClipSource::Asset { asset: asset.id },
+            source: ClipSource::Asset { asset: asset.id, audio_stream: 0 },
             source_range: TimeRange::new(Time::ZERO, Time::from_seconds(60)),
             timeline_start: Time::ZERO,
             enabled: true,
@@ -274,7 +276,7 @@ mod tests {
         track.clips.push_back(Arc::new(Clip {
             id: ClipId::new(),
             name: "c".into(),
-            source: ClipSource::Asset { asset: asset.id },
+            source: ClipSource::Asset { asset: asset.id, audio_stream: 0 },
             source_range: TimeRange::new(Time::ZERO, Time::from_seconds(60)),
             timeline_start: Time::ZERO,
             enabled: true,

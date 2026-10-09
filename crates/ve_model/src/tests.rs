@@ -9,7 +9,7 @@ fn clip(asset: AssetId, start: i64, len: i64) -> Arc<Clip> {
     Arc::new(Clip {
         id: ClipId::new(),
         name: "c".into(),
-        source: ClipSource::Asset { asset },
+        source: ClipSource::Asset { asset, audio_stream: 0 },
         source_range: TimeRange::new(s(0), s(len)),
         timeline_start: s(start),
         enabled: true,

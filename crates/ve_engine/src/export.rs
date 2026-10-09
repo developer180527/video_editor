@@ -111,7 +111,13 @@ pub fn start(
             let budget = (platform.capabilities().memory_budget / 8) as usize;
             let pool = VideoPool::new(platform.storage.clone(), platform.media.clone(), budget);
             pool.set_gpu_frames(importer.is_some());
-            let r = run(&project, &platform, &registry, &pool, &gpu, preset, &out, &st, importer);
+            // A panic in here (a GPU validation error, a codec bug) must still
+            // end the export, or whoever shows its progress waits forever.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&project, &platform, &registry, &pool, &gpu, preset, &out, &st, importer)))
+                .unwrap_or_else(|p| {
+                    let why = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()));
+                    Err(format!("export failed unexpectedly: {}", why.unwrap_or_default()))
+                });
             drop(pool);
             if r.is_err() || st.cancel.load(Ordering::Relaxed) {
                 // Leave no half-written file behind.
@@ -162,20 +168,24 @@ fn run(
     let mut enc = platform.media.open_encoder(&target, &settings).map_err(|e| e.to_string())?;
     let mut comp = Compositor::new(device);
     comp.set_importer(importer);
+    // 16 bits per channel out of the compositor: 10-bit codecs get 10 real
+    // bits, 8-bit ones are rounded from the full picture, not the monitor's.
+    comp.set_deep_output(true);
     let mut mixer = Mixer::new(platform.storage.clone(), platform.media.clone(), SAMPLE_RATE);
     let samples_at = |t: Time| (t.ticks() as i128 * SAMPLE_RATE as i128 / ve_time::TICKS_PER_SECOND as i128) as usize;
     let mut audio = Vec::new();
     let frame_duration = f.rate.frame_duration();
     let encode = |enc: &mut dyn ve_ports::Encoder, rb: ve_render::Readback, at: Time| -> Result<(), String> {
+        let bpp = rb.bytes_per_pixel() as usize;
         let (w, h, px) = rb.finish(device).ok_or("could not read the rendered frame")?;
         enc.push_video(VideoFrame {
             pts: at,
             duration: frame_duration,
             width: w,
             height: h,
-            format: PixelFormat::Rgba8,
+            format: if bpp == 8 { PixelFormat::Rgba16 } else { PixelFormat::Rgba8 },
             color: ColorTags::default(),
-            data: FrameData::Cpu { planes: vec![px], strides: vec![w as usize * 4] },
+            data: FrameData::Cpu { planes: vec![px], strides: vec![w as usize * bpp] },
         })
         .map_err(|e| e.to_string())
     };

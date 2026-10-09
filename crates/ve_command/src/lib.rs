@@ -378,14 +378,14 @@ fn check_range(source: TimeRange, start: Time) -> Result<(), CommandError> {
 
 fn source_duration(p: &Project, c: &Clip) -> Option<Time> {
     match &c.source {
-        ClipSource::Asset { asset } => p.assets.get(asset)?.info.as_ref().map(|i| i.duration),
+        ClipSource::Asset { asset, .. } => p.assets.get(asset)?.info.as_ref().map(|i| i.duration),
         ClipSource::Generator { .. } => None,
     }
 }
 
 fn clips_using(p: &Project, asset: AssetId) -> Option<ClipId> {
     p.sequences.values().flat_map(|s| s.tracks.iter()).flat_map(|t| t.clips.iter()).find_map(|c| match &c.source {
-        ClipSource::Asset { asset: a } if *a == asset => Some(c.id),
+        ClipSource::Asset { asset: a, .. } if *a == asset => Some(c.id),
         _ => None,
     })
 }

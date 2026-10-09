@@ -14,7 +14,7 @@ fn bench_ripple() {
     let n = 6000;
     for i in 0..n {
         v1.clips.push_back(Arc::new(Clip {
-            id: ClipId::new(), name: "c".into(), source: ClipSource::Asset { asset: asset.id },
+            id: ClipId::new(), name: "c".into(), source: ClipSource::Asset { asset: asset.id, audio_stream: 0 },
             source_range: TimeRange::new(Time::ZERO, Time::from_seconds(1)), timeline_start: Time::from_seconds(i),
             enabled: true, link: None, effects: Default::default(),
         }));

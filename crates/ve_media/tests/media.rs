@@ -91,7 +91,7 @@ fn project(file: &std::path::Path) -> (Project, SequenceId) {
         id: AssetId::new(),
         name: "a".into(),
         media: MediaRef(format!("file:{}", file.display())),
-        info: Some(MediaInfo { duration: Time::from_seconds(4), video: None, audio: None }),
+        info: Some(MediaInfo { duration: Time::from_seconds(4), video: None, audio: Vec::new() }),
     };
     let clip = |track_gain_db: f64| {
         let mut params = OrdMap::new();
@@ -99,7 +99,7 @@ fn project(file: &std::path::Path) -> (Project, SequenceId) {
         Arc::new(Clip {
             id: ClipId::new(),
             name: "c".into(),
-            source: ClipSource::Asset { asset: asset.id },
+            source: ClipSource::Asset { asset: asset.id, audio_stream: 0 },
             source_range: TimeRange::new(Time::ZERO, Time::from_seconds(4)),
             timeline_start: Time::ZERO,
             enabled: true,
@@ -183,10 +183,10 @@ fn stills_make_thumbnails_and_peaks() {
     let stills = Stills::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()));
     let (asset, media) = (AssetId::new(), MediaRef(format!("file:{}", file.display())));
     assert!(stills.thumb(asset, &media, Time::from_seconds(1)).is_none(), "queued, not ready");
-    assert!(stills.peaks(asset, &media).is_none());
+    assert!(stills.peaks(asset, &media, 0).is_none());
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let (thumb, peaks) = loop {
-        if let (Some(t), Some(p)) = (stills.thumb(asset, &media, Time::from_seconds(1)), stills.peaks(asset, &media)) {
+        if let (Some(t), Some(p)) = (stills.thumb(asset, &media, Time::from_seconds(1)), stills.peaks(asset, &media, 0)) {
             break (t.1, p);
         }
         assert!(std::time::Instant::now() < deadline);
@@ -339,4 +339,40 @@ fn native_frames_flow_through_the_cache() {
         native += matches!(f.data, ve_ports::FrameData::Native(_)) as usize;
     }
     eprintln!("{native}/120 frames stayed in GPU memory");
+}
+
+/// A clip set to the file's second audio stream plays that stream.
+#[test]
+fn clips_play_their_own_audio_stream() {
+    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("two_streams.mov");
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=2"])
+        .args(["-map", "0", "-map", "1", "-c:a", "pcm_s16le"])
+        .arg(&p)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        return eprintln!("skipped: no ffmpeg CLI");
+    }
+    let (mut proj, seq_id) = project(&p);
+    // Point every clip at stream 2 (index 1).
+    let mut seq = (*proj.sequences[&seq_id]).clone();
+    for t in seq.tracks.iter_mut() {
+        let t = Arc::make_mut(t);
+        for c in t.clips.iter_mut() {
+            let c = Arc::make_mut(c);
+            if let ClipSource::Asset { audio_stream, .. } = &mut c.source {
+                *audio_stream = 1;
+            }
+        }
+    }
+    proj.sequences.insert(seq_id, Arc::new(seq.clone()));
+    let mut mixer = Mixer::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()), 48_000);
+    let mut out = vec![0f32; 48_000 * 2];
+    mixer.render(&proj, &seq, Time::ZERO, &mut out);
+    let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+    let crossings = left.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count() as f64;
+    assert!((crossings / 2.0 - 880.0).abs() < 5.0, "heard {} Hz", crossings / 2.0);
 }

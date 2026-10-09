@@ -30,7 +30,7 @@ fn probe_generated_clip() {
     let info = Ffmpeg::new().probe(&Resolved { path: Some(clip), guard: Box::new(()) }).unwrap();
     let v = info.video.unwrap();
     assert_eq!((v.width, v.height, v.rate), (320, 180, Rate::FPS_25));
-    let a = info.audio.unwrap();
+    let a = &info.audio[0];
     assert_eq!(a.sample_rate, 48000);
     let secs = info.duration.as_seconds_f64();
     assert!((1.9..2.2).contains(&secs), "{secs}");
@@ -91,7 +91,7 @@ fn decode_audio_resampled() {
         return;
     };
     let r = Resolved { path: Some(clip), guard: Box::new(()) };
-    let mut d = Ffmpeg::new().open_audio(&r, 48_000, 2).unwrap();
+    let mut d = Ffmpeg::new().open_audio(&r, 0, 48_000, 2).unwrap();
     let mut total = 0usize;
     let mut peak = 0f32;
     while let Some(b) = d.next_block().unwrap() {
@@ -111,8 +111,13 @@ fn decode_audio_resampled() {
 /// `None` (and a note) when this machine has no encoder for `codec`: CI
 /// runners have no GPU media engine, and H.264/HEVC are only encoded there.
 fn encode(codec: &str, container: &str) -> Option<ve_model::MediaInfo> {
+    encode_frames(codec, container, false).map(|(info, _)| info)
+}
+
+/// As `encode`, feeding 16-bit frames when `deep`; also returns the path.
+fn encode_frames(codec: &str, container: &str, deep: bool) -> Option<(ve_model::MediaInfo, PathBuf)> {
     use ve_ports::*;
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("encode_test.{container}"));
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("encode_test_{codec}{}.{container}", if deep { "_deep" } else { "" }));
     let settings = EncoderSettings {
         video_codec: codec.into(),
         audio_codec: "aac".into(),
@@ -134,15 +139,20 @@ fn encode(codec: &str, container: &str) -> Option<ve_model::MediaInfo> {
         r => r.unwrap(),
     };
     for i in 0..50u32 {
-        let px: Vec<u8> = (0..320 * 180).flat_map(|p| [(p % 320) as u8, (i * 5) as u8, 128, 255]).collect();
+        let (px, format, bpp): (Vec<u8>, _, usize) = if deep {
+            let px = (0..320 * 180).flat_map(|p: u32| [((p % 320) * 200) as u16, (i * 1300) as u16, 32768, 65535]).flat_map(u16::to_le_bytes).collect();
+            (px, PixelFormat::Rgba16, 8)
+        } else {
+            ((0..320 * 180).flat_map(|p| [(p % 320) as u8, (i * 5) as u8, 128, 255]).collect(), PixelFormat::Rgba8, 4)
+        };
         enc.push_video(VideoFrame {
             pts: Rate::FPS_25.frame_to_time(i as i64),
             duration: Rate::FPS_25.frame_duration(),
             width: 320,
             height: 180,
-            format: PixelFormat::Rgba8,
+            format,
             color: ColorTags::default(),
-            data: FrameData::Cpu { planes: vec![px], strides: vec![320 * 4] },
+            data: FrameData::Cpu { planes: vec![px], strides: vec![320 * bpp] },
         })
         .unwrap();
     }
@@ -152,7 +162,19 @@ fn encode(codec: &str, container: &str) -> Option<ve_model::MediaInfo> {
     }).collect();
     enc.push_audio(AudioBlock { pts: Time::ZERO, sample_rate: 48_000, channels: 2, samples }).unwrap();
     enc.finish().unwrap();
-    Some(Ffmpeg::new().probe(&Resolved { path: Some(path), guard: Box::new(()) }).unwrap())
+    Some((Ffmpeg::new().probe(&Resolved { path: Some(path.clone()), guard: Box::new(()) }).unwrap(), path))
+}
+
+/// From 16-bit frames, HEVC comes out 10-bit (Main 10) where the encoder
+/// can, and ProRes always.
+#[test]
+fn deep_frames_encode_at_ten_bits() {
+    for (codec, container) in [("prores", "mov"), ("hevc", "mp4")] {
+        let Some((_, path)) = encode_frames(codec, container, true) else { continue };
+        let mut d = Ffmpeg::new().open_video(&Resolved { path: Some(path), guard: Box::new(()) }).unwrap();
+        let f = d.next_frame().unwrap().unwrap();
+        assert_eq!(f.format, ve_ports::PixelFormat::P010, "{codec} decodes as 10-bit");
+    }
 }
 
 #[test]
@@ -160,7 +182,7 @@ fn encode_h264_mp4_round_trips() {
     let Some(info) = encode("h264", "mp4") else { return };
     let v = info.video.unwrap();
     assert_eq!((v.width, v.height, v.rate, v.codec.as_str()), (320, 180, Rate::FPS_25, "h264"));
-    assert_eq!(info.audio.unwrap().codec, "aac");
+    assert_eq!(info.audio[0].codec, "aac");
     let secs = info.duration.as_seconds_f64();
     assert!((1.9..2.2).contains(&secs), "{secs}");
 }
@@ -203,7 +225,7 @@ fn timestamps_start_at_the_file_start() {
         let f = v.next_frame().unwrap().unwrap();
         assert!(f.pts <= t && t < f.pts + f.duration, "{:.3} s for {:.3} s", f.pts.as_seconds_f64(), t.as_seconds_f64());
     }
-    let mut a = ff.open_audio(&r, 48_000, 2).unwrap();
+    let mut a = ff.open_audio(&r, 0, 48_000, 2).unwrap();
     let b = a.next_block().unwrap().unwrap();
     assert!(b.pts.as_seconds_f64().abs() < 0.1, "first sound at {:.3} s", b.pts.as_seconds_f64());
 }
@@ -257,4 +279,47 @@ fn hardware_decode_keeps_colour_tags() {
     assert_eq!((f.color.primaries.as_str(), f.color.transfer.as_str(), f.color.matrix.as_str()), ("bt2020", "arib-std-b67", "bt2020nc"), "hardware={hardware}");
     // And the planes are handed over, not copied.
     assert!(matches!(f.data, ve_ports::FrameData::Shared(_)));
+}
+
+/// Sign changes per second of a mono signal: about twice its frequency.
+fn crossings(samples: &[f32], rate: u32) -> f64 {
+    let n = samples.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+    n as f64 * rate as f64 / samples.len() as f64
+}
+
+/// A camera-style file: two mono streams (440 Hz, 880 Hz) and a 5.1 one.
+fn three_streams() -> Option<Resolved> {
+    made(
+        "streams.mov",
+        &[
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000:duration=1,aformat=channel_layouts=5.1",
+            "-map", "0", "-map", "1", "-map", "2", "-c:a", "pcm_s16le",
+        ],
+    )
+}
+
+#[test]
+fn every_audio_stream_is_listed_and_playable() {
+    let Some(r) = three_streams() else { return eprintln!("skipped: no ffmpeg CLI") };
+    let ff = Ffmpeg::new();
+    let info = ff.probe(&r).unwrap();
+    let layouts: Vec<(&str, u16)> = info.audio.iter().map(|a| (a.layout.as_str(), a.channels)).collect();
+    assert_eq!(layouts, [("mono", 1), ("mono", 1), ("5.1", 6)]);
+    for (stream, hz) in [(0, 440.0), (1, 880.0)] {
+        let mut d = ff.open_audio(&r, stream, 48_000, 1).unwrap();
+        let mut s = Vec::new();
+        while let Some(b) = d.next_block().unwrap() {
+            s.extend(b.samples);
+        }
+        let f = crossings(&s, 48_000) / 2.0;
+        assert!((f - hz).abs() < 5.0, "stream {stream}: {f} Hz, wanted {hz}");
+    }
+    // 5.1 downmixed to stereo: sound in both channels.
+    let mut d = ff.open_audio(&r, 2, 48_000, 2).unwrap();
+    let b = d.next_block().unwrap().unwrap();
+    let peak = |c: usize| b.samples.iter().skip(c).step_by(2).fold(0f32, |m, v| m.max(v.abs()));
+    assert!(peak(0) > 0.01 && peak(1) > 0.01, "5.1 downmix: L {} R {}", peak(0), peak(1));
+    assert!(ff.open_audio(&r, 3, 48_000, 2).is_err(), "no fourth stream");
 }

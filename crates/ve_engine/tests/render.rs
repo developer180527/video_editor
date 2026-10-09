@@ -148,7 +148,7 @@ fn export_h264_with_audio() {
     let info = ff.probe(&r).unwrap();
     let v = info.video.unwrap();
     assert_eq!((v.width, v.height, v.codec.as_str()), (1920, 1080, "h264"));
-    assert_eq!(info.audio.unwrap().codec, "aac");
+    assert_eq!(info.audio[0].codec, "aac");
     let secs = info.duration.as_seconds_f64();
     assert!((1.95..2.1).contains(&secs), "{secs}");
     // The picture survived the round trip: the second bar is still yellow.
@@ -160,7 +160,7 @@ fn export_h264_with_audio() {
     let cb = planes[1][(y / 2) * strides[1] + (x / 2) * 2];
     assert!(luma > 150 && cb < 80, "yellow: high luma, low Cb ({luma}, {cb})");
     // And the audio is there.
-    let mut ad = ff.open_audio(&r, 48_000, 2).unwrap();
+    let mut ad = ff.open_audio(&r, 0, 48_000, 2).unwrap();
     let mut peak = 0f32;
     while let Some(b) = ad.next_block().unwrap() {
         peak = b.samples.iter().fold(peak, |m, s| m.max(s.abs()));
@@ -198,7 +198,9 @@ fn export_fails_on_missing_media_and_ignores_the_preview() {
     let run = |gpu, name: &str| {
         // ProRes: encoded in software, so this runs on any machine.
         let job = client.export(gpu, ExportPreset::ProResMov, MediaRef(format!("file:{}", dir.join(name).display())), None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
+            assert!(std::time::Instant::now() < deadline, "export hung at {:.0}%", job.progress() * 100.0);
             // The preview keeps asking for the frame at the playhead.
             client.seek(Time::from_seconds(1));
             let _ = client.frame(Quality::FULL);
@@ -213,4 +215,61 @@ fn export_fails_on_missing_media_and_ignores_the_preview() {
     let err = run(gpu, "bad.mov").unwrap_err();
     assert!(err.contains("will_vanish.mov"), "{err}");
     assert!(!dir.join("bad.mov").exists(), "no half-written file");
+}
+
+/// A 10-bit gradient exported to ProRes keeps far more than 256 levels: the
+/// export no longer goes through 8 bits.
+#[test]
+fn prores_export_keeps_ten_bits() {
+    let src = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("grad10.mov");
+    let made = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "nullsrc=s=1024x64:d=0.2,format=gray16le,geq=lum='X*64'"])
+        .args(["-pix_fmt", "yuv422p10le", "-c:v", "prores_ks", "-profile:v", "3"])
+        .arg(&src)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !made {
+        return eprintln!("skipped: no ffmpeg CLI");
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("skipped: no GPU") };
+    if !adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+        return eprintln!("skipped: no 16-bit textures (10-bit sources are read at 8 bits)");
+    }
+    let desc = wgpu::DeviceDescriptor { required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM, ..Default::default() };
+    let gpu = pollster::block_on(adapter.request_device(&desc)).unwrap();
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("export10");
+    let mut e = Engine::new(platform_headless::platform(&dir, Arc::new(media_ffmpeg::Ffmpeg::new())));
+    e.new_project("t");
+    let asset = e.import(src.to_str().unwrap()).unwrap();
+    let snap = e.snapshot();
+    let seq = snap.active().unwrap().clone();
+    let a = snap.assets[&asset].clone();
+    let clip = make_clip(e.plugins(), &seq.format, &a, TrackKind::Video, Time::from_ticks(ve_time::TICKS_PER_SECOND / 10), None);
+    e.execute(edit::overwrite(&snap, seq.id, Time::ZERO, &[(seq.tracks[0].id, Arc::new(clip))]).unwrap()).unwrap();
+    let out = dir.join("grad.mov");
+    let client = e.spawn(Arc::new(|| {}));
+    let job = client.export(gpu, ExportPreset::ProResMov, MediaRef(format!("file:{}", out.display())), None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let result = loop {
+        if let Some(r) = job.result() {
+            break r;
+        }
+        assert!(std::time::Instant::now() < deadline, "export hung");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    result.unwrap();
+
+    use ve_ports::{MediaBackend, Resolved};
+    let mut d = media_ffmpeg::Ffmpeg::new().open_video(&Resolved { path: Some(out), guard: Box::new(()) }).unwrap();
+    let f = d.next_frame().unwrap().unwrap();
+    assert_eq!(f.format, ve_ports::PixelFormat::P010, "a 10-bit file");
+    let ve_ports::CpuPlanes { planes, strides } = f.data.cpu().unwrap();
+    let row = &planes[0][540 * strides[0]..540 * strides[0] + 1920 * 2];
+    let mut levels: Vec<u16> = row.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]]) >> 6).collect();
+    levels.sort();
+    levels.dedup();
+    eprintln!("{} distinct 10-bit luma levels across the exported gradient", levels.len());
+    assert!(levels.len() > 600, "{} distinct luma levels across the gradient (8-bit export gives ~220)", levels.len());
 }
