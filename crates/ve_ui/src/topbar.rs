@@ -1,6 +1,6 @@
 //! The application bar, which is also the window's title bar: the OS's
-//! window buttons (or ours), the menus, workspace tabs (Import / Edit /
-//! Export), the project title, and the right side's utilities.
+//! window buttons (or ours), the menus (where they live in the window),
+//! the project title, and the right side's utilities.
 
 use crate::theme::REEL;
 use libgui::*;
@@ -30,25 +30,9 @@ pub fn bar(ui: &mut Ui, app: &mut EditorUi) {
             // The traffic lights are drawn here by the OS.
             ui.space((inset - 10.0).max(0.0));
         }
-        let home = icon_button(ui, "home", Icon::Home, 24.0, false);
-        ui.tooltip(&home, "Open Project…");
-        if home.clicked {
-            app.requests.push(HostRequest::OpenProject);
-        }
+        // Where menus live in the window (not macOS), they are the bar's left end.
         if !app.frame.system_menu {
             app.menu_bar(ui);
-        }
-        ui.space(8.0);
-        for (i, name) in ["Import", "Edit", "Export"].iter().enumerate() {
-            if workspace_tab(ui, i, name, &mut app.view.workspace) && i != 1 {
-                // Import and Export open their dialogs and return to Edit.
-                if i == 0 {
-                    app.requests.push(HostRequest::ImportMedia);
-                } else {
-                    app.show_export = true;
-                }
-                app.view.workspace = 1;
-            }
         }
         ui.flex();
         title(ui, app);
@@ -125,33 +109,6 @@ pub fn window_controls(ui: &mut Ui, maximized: bool, height: f32) -> Vec<WindowA
         });
     }
     out
-}
-
-/// One of the workspace names: white and underlined when active.
-fn workspace_tab(ui: &mut Ui, i: usize, name: &str, selected: &mut usize) -> bool {
-    let t = ui.theme.clone();
-    let id = ui.make_id(("ws", i));
-    let r = ui.interact(id);
-    if r.clicked {
-        *selected = i;
-    }
-    if r.hovered {
-        ui.cursor = Cursor::Pointer;
-    }
-    let on = *selected == i;
-    let hot = ui.animate_bool(id, 0, r.hovered);
-    let size = 13.0;
-    let w = ui.fonts.measure(ui.font, size, name).x + 20.0;
-    let text = ui.frame_text(name);
-    ui.add_leaf(id, Layout::leaf(Size::Fixed(w), Size::Fixed(30.0)), Vec2::ZERO, true, move |p, rect| {
-        let c = if on { REEL.bright } else { t.palette.text_muted.lerp(REEL.text_soft, hot) };
-        p.text_centered(rect, size, c, text);
-        if on {
-            let tw = p.measure(size, text).x;
-            p.rect(Rect::new(rect.center().x - tw * 0.5, rect.bottom() - 5.0, tw, 2.0), REEL.bright, 1.0);
-        }
-    });
-    r.clicked
 }
 
 fn title(ui: &mut Ui, app: &EditorUi) {
