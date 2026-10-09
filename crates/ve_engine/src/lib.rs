@@ -255,6 +255,15 @@ impl Engine {
         Ok(id)
     }
 
+    /// Point `asset` at `picked` instead (a moved or replaced file), probed.
+    pub fn relink(&mut self, asset: AssetId, picked: &str) -> Result<(), EngineError> {
+        let storage = &self.platform.storage;
+        let media = storage.make_ref(picked)?;
+        let info = self.platform.media.probe(&storage.resolve(&media)?)?;
+        self.execute(Command::SetAssetMedia { asset, media, info: Some(info) })?;
+        Ok(())
+    }
+
     /// Attach `picked` as `asset`'s proxy (replacing any): probed, then
     /// played instead of the original wherever previews use proxies.
     pub fn attach_proxy(&mut self, asset: AssetId, picked: &str) -> Result<(), EngineError> {

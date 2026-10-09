@@ -74,6 +74,44 @@ fn editor() -> EditorUi {
     place(&assets[3], 8, 7, Some(v1), Some(a1));
     place(&assets[0], 3, 5, Some(v2), None);
     place(&assets[5], 0, 14, None, Some(a2));
+
+    // The features on show: a dissolve on the cut at 6 s, a fade out of the
+    // music, the last shot at half speed, a title on V2, in/out and markers.
+    let snap = e.snapshot();
+    let v1_clips = snap.active().unwrap().tracks[0].clips.clone();
+    let tr = |id: &str, before: Time, after: Time| Transition {
+        id: EffectId::new(),
+        plugin: ve_engine::intrinsic::plugin_ref(id),
+        before,
+        after,
+        params: Default::default(),
+    };
+    let half = Time::from_seconds_f64(0.5);
+    e.execute(edit::set_transition(&snap, v1_clips[1].id, ve_engine::Edge::Start, Some(tr(ve_engine::intrinsic::DISSOLVE, half, half))).unwrap()).unwrap();
+    let snap = e.snapshot();
+    let music = snap.active().unwrap().tracks[3].clips[0].id;
+    e.execute(edit::set_transition(&snap, music, ve_engine::Edge::End, Some(tr(ve_engine::intrinsic::CROSSFADE, s(2), Time::ZERO))).unwrap()).unwrap();
+    let snap = e.snapshot();
+    for id in edit::linked(&snap, v1_clips[2].id) {
+        let snap = e.snapshot();
+        e.execute(edit::set_speed(&snap, id, Ratio::new(1, 2), false).unwrap()).unwrap();
+    }
+    let title = ve_engine::make_generator_clip(e.plugins(), &seq.format, &ve_engine::intrinsic::plugin_ref(ve_engine::intrinsic::TITLE), s(4)).unwrap();
+    let snap = e.snapshot();
+    e.execute(edit::overwrite(&snap, seq.id, s(10), &[(v2, Arc::new(title))]).unwrap()).unwrap();
+    let mut marks = Marks { in_point: Some(s(1)), out_point: Some(s(12)), ..Default::default() };
+    for (t, name, color) in [(4, "Pan starts", MarkerColor::Green), (9, "Music swell", MarkerColor::Orange)] {
+        marks.markers.push_back(Marker {
+            id: MarkerId::new(),
+            time: s(t),
+            duration: Time::ZERO,
+            name: name.into(),
+            comment: String::new(),
+            color,
+            kind: MarkerKind::Comment,
+        });
+    }
+    e.execute(Command::SetMarks { owner: ve_engine::MarksOwner::Sequence(seq.id), marks }).unwrap();
     e.seek(Time::from_seconds(2));
     let client = e.spawn(Arc::new(|| {}));
     wait(&client, |c| c.snapshot().active().is_some_and(|s| s.duration() > Time::ZERO));
@@ -111,7 +149,9 @@ fn render(app: &mut EditorUi, w: u32, h: u32, name: &str, setup: impl Fn(&mut Ed
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(&img.data).unwrap();
     println!("{}", path.display());
-    assert!(ui.frame_cost().nodes > 200, "the editor did not build");
+    // With a dialog open the last tree laid out is the modal's own.
+    let min = if app.view.dialog.is_some() { 10 } else { 200 };
+    assert!(ui.frame_cost().nodes > min, "the editor did not build");
 }
 
 #[test]
@@ -122,6 +162,21 @@ fn desktop_editor() {
         let snap = app.engine.snapshot();
         let first = snap.active().unwrap().tracks[0].clips[0].id;
         app.view.selection = edit::linked(&snap, first);
+    });
+}
+
+/// The feature UI: a selected transition in Effect Controls, and the
+/// Speed/Duration dialog over it all.
+#[test]
+fn features() {
+    let mut app = editor();
+    render(&mut app, 2000, 1129, "features.png", |app| {
+        let snap = app.engine.snapshot();
+        let cut = snap.active().unwrap().tracks[0].clips[1].id;
+        app.view.selected_transition = Some((cut, ve_engine::Edge::Start));
+        app.view.selection = vec![snap.active().unwrap().tracks[0].clips[2].id];
+        app.view.dialog = Some(ve_ui::Dialog::Speed { clip: app.view.selection[0], percent: 50.0, reverse: false, ripple: true });
+        app.view.selection.clear();
     });
 }
 
@@ -189,4 +244,55 @@ fn drag_and_razor_through_the_ui() {
     app.engine.undo();
     wait(&app.engine, |c| c.published().undo_label.as_deref() == Some("Move"));
     assert_eq!(app.engine.snapshot().active().unwrap().tracks[0].clips.len(), 3);
+}
+
+fn press(ui: &mut Ui, app: &mut EditorUi, key: Key, mods: Modifiers) {
+    ui.push(InputEvent::ModifiersChanged(mods));
+    ui.push(InputEvent::Key { key, pressed: true, repeat: false });
+    frame(ui, app);
+    ui.push(InputEvent::Key { key, pressed: false, repeat: false });
+    ui.push(InputEvent::ModifiersChanged(Modifiers::NONE));
+    frame(ui, app);
+}
+
+/// The marking and transition shortcuts, through the real UI: I and O set
+/// in and out, M drops a marker, Cmd+D puts a dissolve on the nearest cut,
+/// and Delete takes the selected transition off again.
+#[test]
+fn marks_and_transitions_from_the_keyboard() {
+    let mut app = editor();
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    for _ in 0..4 {
+        frame(&mut ui, &mut app);
+    }
+    let marks = |app: &EditorUi| app.engine.snapshot().active().unwrap().marks.clone();
+    let markers_before = marks(&app).markers.len();
+
+    app.engine.seek(Time::from_seconds(3));
+    frame(&mut ui, &mut app);
+    press(&mut ui, &mut app, Key::I, Modifiers::NONE);
+    wait(&app.engine, |_| marks(&app).in_point == Some(Time::from_seconds(3)));
+    press(&mut ui, &mut app, Key::M, Modifiers::NONE);
+    wait(&app.engine, |_| marks(&app).markers.len() == markers_before + 1);
+
+    // Out at 5 s is the end of the frame under the playhead.
+    app.engine.seek(Time::from_seconds(5));
+    frame(&mut ui, &mut app);
+    press(&mut ui, &mut app, Key::O, Modifiers::NONE);
+    let out = Time::from_seconds(5) + Rate::FPS_24.frame_to_time(1);
+    wait(&app.engine, |_| marks(&app).out_point == Some(out));
+
+    // Cmd+D at 5 s: the nearest edit point on V1 is the cut at 6 s, which
+    // already has a dissolve from the fixture — so first take that off.
+    let cut = clip_on(&app, 0, 1);
+    assert!(cut.transition_in.is_some());
+    app.view.selected_transition = Some((cut.id, ve_engine::Edge::Start));
+    press(&mut ui, &mut app, Key::Delete, Modifiers::NONE);
+    wait(&app.engine, |_| clip_on(&app, 0, 1).transition_in.is_none());
+    press(&mut ui, &mut app, Key::D, Modifiers { logo: true, ..Modifiers::NONE });
+    wait(&app.engine, |_| clip_on(&app, 0, 1).transition_in.is_some());
+    let t = clip_on(&app, 0, 1).transition_in.clone().unwrap();
+    assert_eq!(t.plugin.id, ve_engine::intrinsic::DISSOLVE);
+    assert_eq!(t.before + t.after, Time::from_seconds(1), "one second, centred");
+    assert_eq!(t.before, t.after);
 }

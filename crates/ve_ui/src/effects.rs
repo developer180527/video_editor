@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use libgui::*;
-use ve_engine::Command;
+use ve_engine::{edit, Command, Edge};
 use ve_model::*;
 use ve_engine::{EffectInfo, Implementation, ParamInfo, ParamKind};
 use ve_time::{Time, Timecode};
@@ -43,8 +43,19 @@ pub fn panel(ui: &mut Ui, app: &mut EditorUi) {
         .first()
         .and_then(|id| app.snap().find_clip(*id))
         .map(|(s, ti, c)| (c.clone(), s.tracks[ti].kind == TrackKind::Video));
+    // A selected transition takes the panel.
+    let transition = app.view.selected_transition.and_then(|(id, edge)| {
+        let (s, ti, c) = app.snap().find_clip(id)?;
+        let t = if edge == Edge::Start { c.transition_in.clone() } else { c.transition_out.clone() }?;
+        Some((s.clone(), ti, c.clone(), edge, t))
+    });
     ui.container(col, Frame { fill: t.palette.bg_panel, clip: true, ..Frame::none() }, |ui| {
         chips(ui, app, clip.as_ref().map(|(c, _)| &**c));
+        if let Some((seq, ti, c, edge, tr)) = &transition {
+            transition_panel(ui, app, seq, *ti, c, *edge, tr);
+            footer(ui, app);
+            return;
+        }
         match &clip {
             Some((c, video)) => tree(ui, app, c, *video),
             None => {
@@ -68,7 +79,7 @@ fn chips(ui: &mut Ui, app: &EditorUi, clip: Option<&Clip>) {
         .align(Align::Start, Align::Center);
     let name = clip.map(|c| c.name.replace(" [V]", "").replace(" [A]", "")).unwrap_or_else(|| "(no clip)".into());
     let seq = app.snap().active().map(|s| s.name.clone()).unwrap_or_default();
-    ui.container(row, Frame { fill: Color::hex(0x1f1f1f), ..Frame::none() }, |ui| {
+    ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         chip(ui, "src", Icon::Panel, &format!("Source • {name}"), false);
         chip(ui, "seq", Icon::Effects, &format!("{seq} • {name}"), true);
         ui.flex();
@@ -85,8 +96,8 @@ fn chip(ui: &mut Ui, key: &str, icon: Icon, label: &str, on: bool) {
     let w = ui.fonts.measure(ui.font, size, label).x + 34.0;
     let text = ui.frame_text(label);
     ui.add_leaf(id, Layout::leaf(Size::Fixed(w), Size::Fixed(22.0)), Vec2::ZERO, true, move |p, rect| {
-        let fill = if on { Color::hex(0x2f2f2f) } else { Color::hex(0x272727) };
-        p.rect_bordered(rect, fill.lerp(Color::hex(0x3a3a3a), hot), 3.0, 1.0, Color::hex(0x161616));
+        let fill = if on { REEL.raised } else { REEL.panel };
+        p.rect_bordered(rect, fill.lerp(REEL.raised_hi, hot), 3.0, 1.0, REEL.inset);
         let ic = Rect::new(rect.x + 4.0, rect.center().y - 7.0, 14.0, 14.0);
         draw_icon(p, ic, icon, if on { t.palette.accent } else { t.palette.text_faint });
         p.text_left(rect.shrink(22.0, 0.0, 6.0, 0.0), size, if on { t.palette.text } else { t.palette.text_muted }, text);
@@ -122,6 +133,7 @@ fn tree(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, video: bool) {
     ui.scroll_area_with("fx", opts, |ui| {
         let (_, s) = row(ui, "head", 42.0, |ui| section(ui, if video { "Video" } else { "Audio" }), |ui| ruler_lane(ui, rate, span, &name));
         seek = seek.or(s);
+        seek = seek.or(clip_rows(ui, app, clip, video, span));
         for e in &clip.effects {
             let info = registry.find(&e.plugin);
             let label = info.map(|i| i.name.clone()).unwrap_or_else(|| format!("{} (missing)", e.plugin.id));
@@ -146,6 +158,169 @@ fn tree(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, video: bool) {
     }
 }
 
+/// The clip's own rows above its effects: speed, and the audio channels or
+/// the multicam angle.
+fn clip_rows(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, video: bool, span: Span) -> Option<Time> {
+    let t = ui.theme.clone();
+    let mut seek = None;
+    let speed = match &clip.retime {
+        Retime::Speed(r) if r.num == r.den => "100%".to_string(),
+        Retime::Speed(r) => format!("{}{:.1}%", if r.num < 0 { "Reverse " } else { "" }, r.as_f64().abs() * 100.0),
+        Retime::Remap(k) if k.len() == 1 => "Frame Hold".into(),
+        Retime::Remap(k) => format!("Time Remap ({} keys)", k.len()),
+    };
+    let (r, s) = row(
+        ui,
+        "speed",
+        20.0,
+        |ui| {
+            prop_row(ui, ("clip", "speed"), Prop::new("Speed"), |ui| {
+                ui.text_with(&speed, t.metrics.font_size, t.palette.text);
+                ui.button_keyed("speed-dlg", "Speed/Duration…").clicked
+            })
+        },
+        |ui| lane(ui, span, None),
+    );
+    seek = seek.or(s);
+    if r.out {
+        app.view.selection = vec![clip.id];
+        app.open_speed_dialog();
+    }
+    if r.reset_clicked && clip.retime != Retime::Speed(Ratio::ONE) {
+        app.apply_speed(clip.id, 100.0, false, false);
+    }
+    if !video {
+        if let Some(n) = app.source_channels(clip) {
+            let label = if clip.channels.is_empty() {
+                format!("All {n}")
+            } else {
+                clip.channels.iter().map(|c| (c + 1).to_string()).collect::<Vec<_>>().join(", ")
+            };
+            let (r, s) = row(
+                ui,
+                "channels",
+                20.0,
+                |ui| {
+                    prop_row(ui, ("clip", "channels"), Prop::new("Channels"), |ui| {
+                        ui.text_with(&label, t.metrics.font_size, t.palette.text);
+                        ui.button_keyed("channels-dlg", "Audio Channels…").clicked
+                    })
+                },
+                |ui| lane(ui, span, None),
+            );
+            seek = seek.or(s);
+            if r.out {
+                app.view.selection = vec![clip.id];
+                app.open_channels_dialog();
+            }
+            if r.reset_clicked && !clip.channels.is_empty() {
+                let mut c = (**clip).clone();
+                c.channels = Vec::new();
+                app.run(Command::SetClip { clip: Arc::new(c) });
+            }
+        }
+    }
+    if let ClipSource::Sequence { sequence, angle } = &clip.source {
+        // Multicam: which video track of the nest shows (all of them, composited, by default).
+        let mut opts: Vec<String> = vec!["All tracks".into()];
+        if let Some(s) = app.snap().sequences.get(sequence) {
+            let video = s.tracks.iter().filter(|t| t.kind == TrackKind::Video);
+            opts.extend(video.enumerate().map(|(i, t)| format!("Angle {} ({})", i + 1, t.name)));
+        }
+        let mut sel = angle.map_or(0, |a| a as usize + 1);
+        let before = sel;
+        let (_, s) = row(
+            ui,
+            "angle",
+            20.0,
+            |ui| {
+                let refs: Vec<&str> = opts.iter().map(String::as_str).collect();
+                prop_row(ui, ("clip", "angle"), Prop::new("Angle").no_reset(), |ui| {
+                    ui.container(Layout::row().width(Size::Fixed(150.0)).height(Size::Fixed(20.0)), Frame::none(), |ui| {
+                        ui.combo("angle", &mut sel, &refs);
+                    });
+                });
+            },
+            |ui| lane(ui, span, None),
+        );
+        seek = seek.or(s);
+        if sel != before {
+            let mut c = (**clip).clone();
+            c.source = ClipSource::Sequence { sequence: *sequence, angle: sel.checked_sub(1).map(|a| a as u32) };
+            app.run(Command::SetClip { clip: Arc::new(c) });
+        }
+    }
+    seek
+}
+
+/// A transition's properties: its duration, how it sits on the cut, its
+/// parameters, and Remove.
+fn transition_panel(ui: &mut Ui, app: &mut EditorUi, seq: &Sequence, ti: usize, clip: &Arc<Clip>, edge: Edge, tr: &Arc<Transition>) {
+    let t = ui.theme.clone();
+    let rate = app.rate();
+    let info = app.st.plugins.find(&tr.plugin).cloned();
+    let name = info.as_ref().map(|i| i.name.clone()).unwrap_or_else(|| tr.plugin.id.clone());
+    // On a cut (both sides have a clip) it can sit centred or to one side;
+    // a fade only ever reaches into its own clip.
+    let track = &seq.tracks[ti];
+    let i = track.clips.iter().position(|c| c.id == clip.id).unwrap_or(0);
+    let on_cut = edge == Edge::Start && i > 0 && track.clips[i - 1].timeline_range().end() == clip.timeline_start;
+    let frames = |d: Time| d.to_frame(rate) as f32;
+    let total = frames(tr.before + tr.after);
+    let opts = ScrollOptions { padding: Insets::all(10.0), gap: 6.0, ..ScrollOptions::new(Size::Grow(1.0)) };
+    let mut next: Option<Transition> = None;
+    let mut remove = false;
+    ui.scroll_area_with("transition", opts, |ui| {
+        ui.text_with(&name, t.metrics.font_size_heading, t.palette.text);
+        let place = match (edge, on_cut) {
+            (Edge::Start, true) => "On the cut",
+            (Edge::Start, false) => "Fade in",
+            (Edge::End, _) => "Fade out",
+        };
+        ui.text_with(&format!("{place} · {}", clip.name), t.metrics.font_size_small, t.palette.text_muted);
+        ui.space(4.0);
+        let mut d = app.view.transition_frames.unwrap_or(total);
+        let r = ui.drag_value_range("Duration (frames)", &mut d, 0.2, 1.0..=(rate.nominal_fps() as f32 * 60.0));
+        ui.text_with(&app.timecode(rate.frame_to_time(d.round() as i64)), t.metrics.font_size_small, t.palette.text_faint);
+        if r.active {
+            app.view.transition_frames = Some(d);
+        }
+        // Alignment: centred, or wholly after (start at cut) or before (end at cut).
+        let align = if tr.before == Time::ZERO { 1 } else if tr.after == Time::ZERO { 2 } else { 0 };
+        let mut new_align = align;
+        if on_cut {
+            ui.combo("Alignment", &mut new_align, &["Center at Cut", "Start at Cut", "End at Cut"]);
+        }
+        let commit_d = r.released || (new_align != align);
+        if commit_d {
+            let d = rate.frame_to_time(d.round().max(1.0) as i64);
+            let (before, after) = match (edge, on_cut, new_align) {
+                (Edge::Start, true, 0) => (Time(d.ticks() / 2), d - Time(d.ticks() / 2)),
+                (Edge::Start, true, 2) => (d, Time::ZERO),
+                (Edge::Start, _, _) => (Time::ZERO, d),
+                (Edge::End, _, _) => (d, Time::ZERO),
+            };
+            next = Some(Transition { before, after, ..(**tr).clone() });
+        }
+        if let Some(info) = &info {
+            for p in &info.params {
+                ui.text_with(&p.label, t.metrics.font_size_small, t.palette.text_muted);
+            }
+        }
+        ui.space(8.0);
+        remove = ui.button_keyed("rm-transition", "Remove Transition").clicked;
+        ui.space(4.0);
+        ui.text_with("Delete removes it too. Drag another from Effects onto the edge to replace it.", t.metrics.font_size_small, t.palette.text_faint);
+    });
+    if remove {
+        app.remove_transition(clip.id, edge);
+    } else if let Some(n) = next {
+        app.view.transition_frames = None;
+        let r = edit::set_transition(app.snap(), clip.id, edge, Some(n));
+        app.run_edit(r);
+    }
+}
+
 fn section(ui: &mut Ui, label: &str) {
     let t = ui.theme.clone();
     let id = ui.make_id(("section", label));
@@ -153,7 +328,7 @@ fn section(ui: &mut Ui, label: &str) {
     let size = t.metrics.font_size;
     ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, false, move |p, r| {
         let strip = Rect::new(r.x, r.bottom() - 20.0, r.w, 20.0);
-        p.rect(strip, Color::hex(0x272727), 0.0);
+        p.rect(strip, REEL.panel, 0.0);
         p.text_left(strip.shrink(8.0, 0.0, 0.0, 0.0), size, t.palette.text, text);
     });
 }
@@ -169,7 +344,7 @@ fn group(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>, lab
         .padding(Insets::xy(4.0, 0.0))
         .gap(4.0)
         .align(Align::Start, Align::Center);
-    ui.container(row, Frame { fill: Color::hex(0x202020), ..Frame::none() }, |ui| {
+    ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         let r = icon_button(ui, ("tw", e.id), if *open { Icon::Chevron } else { Icon::ChevronRight }, 14.0, false);
         if r.clicked {
             *open = !*open;
@@ -258,6 +433,7 @@ fn param_row(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>,
     let stored = e.params.get(&p.id).cloned().unwrap_or_else(|| Param::Constant(ve_engine::default_value(&p.kind, p.default)));
     let animated = matches!(stored, Param::Animated(_));
     let editing = app.view.param_edit.as_ref().filter(|pe| pe.clip == clip.id && pe.effect == e.id && pe.param == p.id).map(|pe| pe.value.clone());
+    let was_editing = editing.is_some();
     let current = editing.unwrap_or_else(|| stored.value_at(t));
     let keys: Vec<f64> = match &stored {
         Param::Animated(k) => k.iter().map(|k| span.clip_start + k.time.as_seconds_f64()).collect(),
@@ -343,14 +519,28 @@ fn param_row(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>,
                             commit = Some(Value::Color([col.r, col.g, col.b, col.a]));
                         }
                     }
+                    (ParamKind::Text(_), Value::Text(mut text)) => {
+                        // Edited in place; committed on Enter or when focus leaves.
+                        let r = ui.text_input(&format!("{}-{}", e.id, p.id), &mut text, "");
+                        if r.cancelled {
+                            cancel_preview = true;
+                        } else if r.submitted || (was_editing && !r.focused) {
+                            commit = Some(Value::Text(text));
+                        } else if r.changed {
+                            preview = Some(Value::Text(text));
+                        }
+                    }
                     (_, other) => {
-                        ui.text_with(&format!("{other:?}"), 11.0, Color::hex(0x8a8a8a));
+                        ui.text_with(&format!("{other:?}"), 11.0, REEL.label);
                     }
                 }
             })
         },
         |ui| lane(ui, span, Some(&keys)),
     );
+    if cancel_preview {
+        app.view.param_edit = None;
+    }
     if let Some(v) = preview {
         app.view.param_edit = Some(ParamEdit { clip: clip.id, effect: e.id, param: p.id.clone(), value: v });
     }
@@ -386,17 +576,17 @@ fn lane(ui: &mut Ui, span: Span, keys: Option<&[f64]>) -> Option<Time> {
     let keys: Vec<f64> = keys.map(|k| k.to_vec()).unwrap_or_default();
     let has_keys = !keys.is_empty();
     ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, true, move |p, rect| {
-        p.rect(rect, Color::hex(0x1d1d1d), 0.0);
-        p.rect(Rect::new(rect.x, rect.bottom() - 1.0, rect.w, 1.0), Color::hex(0x262626), 0.0);
+        p.rect(rect, REEL.chrome, 0.0);
+        p.rect(Rect::new(rect.x, rect.bottom() - 1.0, rect.w, 1.0), REEL.panel, 0.0);
         if has_keys {
             let y = rect.center().y;
-            p.rect(Rect::new(span.x(rect, keys[0]), y - 0.5, span.x(rect, *keys.last().unwrap()) - span.x(rect, keys[0]), 1.0), Color::hex(0x5a5a5a), 0.0);
+            p.rect(Rect::new(span.x(rect, keys[0]), y - 0.5, span.x(rect, *keys.last().unwrap()) - span.x(rect, keys[0]), 1.0), REEL.tick, 0.0);
             for k in &keys {
                 let x = span.x(rect, *k);
                 // A diamond from stacked rows.
                 for i in 0..5i32 {
                     let w = (5 - (i - 2).abs() * 2) as f32;
-                    p.rect(Rect::new(x - w * 0.5, y - 2.5 + i as f32, w.max(1.0), 1.0), Color::hex(0xcfcfcf), 0.0);
+                    p.rect(Rect::new(x - w * 0.5, y - 2.5 + i as f32, w.max(1.0), 1.0), REEL.text_soft, 0.0);
                 }
             }
         }
@@ -427,16 +617,16 @@ fn ruler_lane(ui: &mut Ui, rate: ve_time::Rate, span: Span, name: &str) -> Optio
     let name = ui.frame_text(name);
     let size = ui.theme.metrics.font_size_small;
     ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, true, move |p, rect| {
-        p.rect(rect, Color::hex(0x1d1d1d), 0.0);
+        p.rect(rect, REEL.chrome, 0.0);
         let ruler = Rect::new(rect.x, rect.y, rect.w, 18.0);
-        p.rect(ruler, Color::hex(0x252525), 0.0);
-        p.rect(Rect::new(rect.x, ruler.bottom(), rect.w, 1.0), Color::hex(0x101010), 0.0);
+        p.rect(ruler, REEL.panel, 0.0);
+        p.rect(Rect::new(rect.x, ruler.bottom(), rect.w, 1.0), REEL.line, 0.0);
         // Every label when there is room, every other one when the panel is narrow.
         let every = if rect.w / 4.0 < 78.0 { 2 } else { 1 };
         for (i, label) in ticks.iter().enumerate().step_by(every) {
             let x = (rect.x + rect.w * (i as f32 / 4.0)).round();
-            p.rect(Rect::new(x, ruler.y + 5.0, 1.0, 13.0), Color::hex(0x484848), 0.0);
-            p.text_left(Rect::new(x + 3.0, ruler.y + 2.0, 72.0, 14.0), size - 1.0, Color::hex(0x7a7a7a), *label);
+            p.rect(Rect::new(x, ruler.y + 5.0, 1.0, 13.0), REEL.raised_hi, 0.0);
+            p.text_left(Rect::new(x + 3.0, ruler.y + 2.0, 72.0, 14.0), size - 1.0, REEL.label, *label);
         }
         let x0 = span.x(rect, span.clip_start);
         let x1 = span.x(rect, span.clip_start + span.clip_len);
@@ -461,7 +651,7 @@ fn footer(ui: &mut Ui, app: &mut EditorUi) {
         .padding(Insets::xy(8.0, 0.0))
         .gap(4.0)
         .align(Align::Start, Align::Center);
-    ui.container(row, Frame { fill: Color::hex(0x1f1f1f), ..Frame::none() }, |ui| {
+    ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         ui.text_with(&app.timecode(app.playhead), 11.0, REEL.timecode);
         ui.flex();
         let _ = icon_button(ui, "filter", Icon::Sort, 20.0, false);

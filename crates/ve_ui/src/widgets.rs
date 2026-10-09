@@ -5,6 +5,7 @@
 //! triangle or a padlock, and a missing glyph is a tofu box in the middle of
 //! your toolbar — so every one of these is rectangles, lines and circles.
 
+use crate::theme::REEL;
 use libgui::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -344,7 +345,7 @@ pub fn icon_button(ui: &mut Ui, key: impl std::hash::Hash, icon: Icon, size: f32
         } else if hot > 0.01 {
             p.rect(rect, bg.with_alpha(bg.a * hot), 2.0);
         }
-        let c = if on { Color::WHITE } else { fg.lerp(Color::hex(0xe4e4e4), hot) };
+        let c = if on { Color::WHITE } else { fg.lerp(REEL.bright, hot) };
         draw_icon(p, rect.shrink(3.0, 3.0, 3.0, 3.0), icon, c);
     });
     r

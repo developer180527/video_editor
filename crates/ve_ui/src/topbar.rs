@@ -1,6 +1,7 @@
-//! The application bar: workspace tabs (Import / Edit / Export), the project
-//! title, and the right side's utilities.
+//! The application bar: the menus, workspace tabs (Import / Edit / Export),
+//! the project title, and the right side's utilities.
 
+use crate::theme::REEL;
 use libgui::*;
 
 use crate::widgets::{icon_button, Icon};
@@ -13,12 +14,13 @@ pub fn bar(ui: &mut Ui, app: &mut EditorUi) {
         .padding(Insets::xy(10.0, 0.0))
         .gap(6.0)
         .align(Align::Start, Align::Center);
-    ui.container(row, Frame { fill: Color::hex(0x1c1c1c), ..Frame::none() }, |ui| {
+    ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         let home = icon_button(ui, "home", Icon::Home, 24.0, false);
         ui.tooltip(&home, "Open Project…");
         if home.clicked {
             app.requests.push(HostRequest::OpenProject);
         }
+        app.menu_bar(ui);
         ui.space(8.0);
         for (i, name) in ["Import", "Edit", "Export"].iter().enumerate() {
             if workspace_tab(ui, i, name, &mut app.view.workspace) && i != 1 {
@@ -56,7 +58,6 @@ pub fn bar(ui: &mut Ui, app: &mut EditorUi) {
         if share.clicked {
             app.show_export = true;
         }
-        let _ = icon_button(ui, "menu", Icon::Menu, 24.0, false);
         let _ = icon_button(ui, "full", Icon::Expand, 24.0, false);
     });
 }
@@ -78,11 +79,11 @@ fn workspace_tab(ui: &mut Ui, i: usize, name: &str, selected: &mut usize) -> boo
     let w = ui.fonts.measure(ui.font, size, name).x + 20.0;
     let text = ui.frame_text(name);
     ui.add_leaf(id, Layout::leaf(Size::Fixed(w), Size::Fixed(30.0)), Vec2::ZERO, true, move |p, rect| {
-        let c = if on { Color::hex(0xf2f2f2) } else { t.palette.text_muted.lerp(Color::hex(0xd8d8d8), hot) };
+        let c = if on { REEL.bright } else { t.palette.text_muted.lerp(REEL.text_soft, hot) };
         p.text_centered(rect, size, c, text);
         if on {
             let tw = p.measure(size, text).x;
-            p.rect(Rect::new(rect.center().x - tw * 0.5, rect.bottom() - 5.0, tw, 2.0), Color::hex(0xf2f2f2), 1.0);
+            p.rect(Rect::new(rect.center().x - tw * 0.5, rect.bottom() - 5.0, tw, 2.0), REEL.bright, 1.0);
         }
     });
     r.clicked
@@ -96,7 +97,7 @@ fn title(ui: &mut Ui, app: &EditorUi) {
     let size = 14.0;
     ui.add_leaf(id, Layout::leaf(Size::Fit, Size::Fixed(20.0)), Vec2::new(150.0, 20.0), false, move |p, rect| {
         let w = p.measure(size, name).x;
-        p.text_left(rect, size, Color::hex(0xe8e8e8), name);
+        p.text_left(rect, size, REEL.bright, name);
         p.text_left(rect.shrink(w, 0.0, 0.0, 0.0), size, t.palette.text_muted, state);
     });
 }

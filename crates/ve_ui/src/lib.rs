@@ -10,6 +10,7 @@
 
 mod dock;
 mod effects;
+mod features;
 mod program;
 mod project;
 pub mod theme;
@@ -27,6 +28,7 @@ use ve_render::Compositor;
 use ve_time::{Rate, Time, Timecode};
 
 pub use dock::Tab;
+pub use features::Dialog;
 pub use theme::theme;
 
 /// Payload kind the shell uses for files dragged in from the OS, carrying
@@ -44,6 +46,10 @@ pub enum HostRequest {
     OpenProject,
     /// Ask where to export; answer with [`EditorUi::start_export`].
     ExportAs { default_name: String, extension: String },
+    /// Pick a file to be `asset`'s proxy; answer with [`EditorUi::attach_proxy`].
+    AttachProxy(AssetId),
+    /// Pick the file `asset` now lives at; answer with [`EditorUi::relink`].
+    RelinkMedia(AssetId),
 }
 
 /// The timeline tools, in the order of the tool column.
@@ -93,6 +99,15 @@ pub struct View {
     /// Effect Controls twirls, closed when present.
     pub closed: HashSet<EffectId>,
     pub param_edit: Option<ParamEdit>,
+    /// Play proxies where assets have them.
+    pub proxies: bool,
+    /// The dialog in front, if any.
+    pub dialog: Option<features::Dialog>,
+    /// A selected transition: the clip that owns it, and which edge.
+    pub selected_transition: Option<(ClipId, ve_engine::Edge)>,
+    pub selected_marker: Option<MarkerId>,
+    /// A transition's duration, in frames, while it is being dragged.
+    pub transition_frames: Option<f32>,
 }
 
 pub struct EditorUi {
@@ -154,6 +169,11 @@ impl EditorUi {
                 search: String::new(),
                 closed: HashSet::new(),
                 param_edit: None,
+                proxies: false,
+                dialog: None,
+                selected_transition: None,
+                selected_marker: None,
+                transition_frames: None,
             },
             dock,
             compositor: None,
@@ -211,8 +231,8 @@ impl EditorUi {
     }
 
     pub fn prepare_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui_wgpu::Renderer) {
-        let quality = [ve_render::Quality::FULL, ve_render::Quality::PREVIEW, ve_render::Quality { scale: 0.25, use_proxies: true }]
-            [self.view.quality.min(2)];
+        // Resolution from the quality menu; proxies from their toggle.
+        let quality = ve_render::Quality { scale: [1.0, 0.5, 0.25][self.view.quality.min(2)], use_proxies: self.view.proxies };
         if self.gpu.is_none() {
             self.gpu = Some((device.clone(), queue.clone()));
         }
@@ -283,6 +303,16 @@ impl EditorUi {
     /// second), once computed.
     pub(crate) fn peaks(&self, asset: &Asset, stream: usize) -> Option<std::sync::Arc<Vec<f32>>> {
         self.engine.stills().peaks(asset.id, &asset.media, stream)
+    }
+
+    /// The host's answer to [`HostRequest::AttachProxy`].
+    pub fn attach_proxy(&mut self, asset: AssetId, path: &std::path::Path) {
+        self.engine.attach_proxy(asset, path.to_string_lossy().into_owned());
+    }
+
+    /// The host's answer to [`HostRequest::RelinkMedia`].
+    pub fn relink(&mut self, asset: AssetId, path: &std::path::Path) {
+        self.engine.relink(asset, path.to_string_lossy().into_owned());
     }
 
     /// Export to `path` with the chosen preset (after the host's save dialog).
@@ -439,6 +469,7 @@ impl EditorUi {
         });
         if surface == SurfaceId::MAIN {
             self.export_ui(ui);
+            self.dialogs(ui);
             self.shortcuts(ui);
             ui.drag_ghost();
             ui.show_toasts();
@@ -491,6 +522,37 @@ impl EditorUi {
         }
         if cmd(ui, Key::M) {
             self.show_export = true;
+        }
+        if cmd(ui, Key::R) {
+            self.open_speed_dialog();
+        }
+        if cmd_shift(ui, Key::D) {
+            self.apply_default_transition(TrackKind::Audio);
+        } else if cmd(ui, Key::D) {
+            self.apply_default_transition(TrackKind::Video);
+        }
+        if ui.consume_shortcut(Shortcut::plain(Key::X).alt()) {
+            self.clear_in_out();
+        }
+        if ui.consume_shortcut(Shortcut::plain(Key::M).alt().shift()) {
+            self.go_to_marker(false);
+        } else if ui.consume_shortcut(Shortcut::plain(Key::M).shift()) {
+            self.go_to_marker(true);
+        }
+        if key(ui, Key::I) {
+            self.mark_in();
+        }
+        if key(ui, Key::O) {
+            self.mark_out();
+        }
+        if key(ui, Key::M) {
+            self.add_marker();
+        }
+        // Multicam: 1–9 switch the angle from the playhead on.
+        for (n, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9].into_iter().enumerate() {
+            if key(ui, k) {
+                self.switch_angle(n as u32 + 1);
+            }
         }
         if cmd(ui, Key::O) {
             self.requests.push(HostRequest::OpenProject);
@@ -547,6 +609,17 @@ impl EditorUi {
         }
         let shift_delete = ui.consume_shortcut(Shortcut::plain(Key::Delete).shift()) || ui.consume_shortcut(Shortcut::plain(Key::Backspace).shift());
         let delete = key(ui, Key::Delete) || key(ui, Key::Backspace);
+        // A selected transition or marker goes first; then clips.
+        if delete {
+            if let Some((clip, edge)) = self.view.selected_transition.take() {
+                self.remove_transition(clip, edge);
+                return;
+            }
+            if let Some(id) = self.view.selected_marker.take() {
+                self.put_marker(id, None);
+                return;
+            }
+        }
         if (shift_delete || delete) && !self.view.selection.is_empty() {
             let sel = std::mem::take(&mut self.view.selection);
             let r = if shift_delete {

@@ -15,6 +15,7 @@ use ve_engine::{edit, Command, CommandError, Edge, Snapshot};
 use ve_model::*;
 use ve_time::{Time, Timecode};
 
+use crate::features::{marker_color, GENERATOR_PAYLOAD, TRANSITION_PAYLOAD};
 use crate::project::{add_effect, EFFECT_PAYLOAD};
 use crate::theme::REEL;
 use crate::widgets::{divider, draw_icon, icon_button, Icon};
@@ -25,6 +26,10 @@ const RULER_H: f32 = 26.0;
 const BAR: f32 = 11.0;
 /// How close, in px, the pointer must be to an edge to grab it.
 const EDGE_PX: f32 = 6.0;
+/// How close, in px, the pointer must be to a marker to pick it.
+const MARKER_PX: f32 = 5.0;
+/// The name strip along a clip's top; below it is the body.
+const STRIP_H: f32 = 15.0;
 /// How close, in px, an edge must come to another to snap.
 const SNAP_PX: f32 = 8.0;
 
@@ -103,10 +108,15 @@ fn toolbar(ui: &mut Ui, app: &mut EditorUi) {
         .padding(Insets::xy(8.0, 0.0))
         .gap(3.0)
         .align(Align::Start, Align::Center);
-    ui.container(row, Frame { fill: Color::hex(0x1f1f1f), ..Frame::none() }, |ui| {
+    ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         ui.text_with(&app.timecode(app.playhead), 14.0, REEL.timecode);
         ui.space(10.0);
-        let _ = icon_button(ui, "nest", Icon::Insert, 22.0, false);
+        sequence_picker(ui, app);
+        let nest = icon_button(ui, "nest", Icon::Insert, 22.0, false);
+        ui.tooltip(&nest, "Nest… (the selected clips into a new sequence)");
+        if nest.clicked {
+            app.open_nest_dialog();
+        }
         let snap = icon_button(ui, "snap", Icon::Snap, 22.0, app.view.snap);
         ui.tooltip(&snap, "Snap (S)");
         if snap.clicked {
@@ -117,7 +127,11 @@ fn toolbar(ui: &mut Ui, app: &mut EditorUi) {
         if link.clicked {
             app.view.linked = !app.view.linked;
         }
-        let _ = icon_button(ui, "markers", Icon::Marker, 22.0, false);
+        let marker = icon_button(ui, "markers", Icon::Marker, 22.0, false);
+        ui.tooltip(&marker, "Add Marker (M)");
+        if marker.clicked {
+            app.add_marker();
+        }
         divider(ui, "tb", true, 18.0);
         let _ = icon_button(ui, "tl-wrench", Icon::Wrench, 22.0, false);
         let _ = icon_button(ui, "tl-cc", Icon::Captions, 22.0, false);
@@ -138,6 +152,25 @@ fn toolbar(ui: &mut Ui, app: &mut EditorUi) {
     });
 }
 
+/// Which sequence the timeline shows, when there is more than one.
+fn sequence_picker(ui: &mut Ui, app: &mut EditorUi) {
+    let seqs: Vec<(SequenceId, String)> = app.snap().sequences.values().map(|s| (s.id, s.name.clone())).collect();
+    if seqs.len() < 2 {
+        return;
+    }
+    let active = app.snap().active_sequence;
+    let mut i = seqs.iter().position(|(id, _)| Some(*id) == active).unwrap_or(0);
+    let before = i;
+    let names: Vec<&str> = seqs.iter().map(|(_, n)| n.as_str()).collect();
+    ui.container(Layout::row().width(Size::Fixed(150.0)).height(Size::Fixed(20.0)), Frame::none(), |ui| {
+        ui.combo("sequence", &mut i, &names);
+    });
+    if i != before {
+        app.open_sequence(seqs[i].0);
+    }
+    ui.space(4.0);
+}
+
 fn tools(ui: &mut Ui, app: &mut EditorUi) {
     let col = Layout::column()
         .width(Size::Fixed(30.0))
@@ -145,7 +178,7 @@ fn tools(ui: &mut Ui, app: &mut EditorUi) {
         .padding(Insets::xy(3.0, 6.0))
         .gap(2.0)
         .align(Align::Center, Align::Start);
-    ui.container(col, Frame { fill: Color::hex(0x1c1c1c), ..Frame::none() }, |ui| {
+    ui.container(col, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         for (i, (icon, tool, name)) in TOOLS.iter().enumerate() {
             let r = icon_button(ui, ("tool", i), *icon, 24.0, app.view.tool == *tool);
             ui.tooltip(&r, name);
@@ -163,6 +196,10 @@ enum Hit {
     HBar,
     VBar,
     Header(TrackId, f32),
+    /// A sequence marker on the ruler.
+    Marker(MarkerId),
+    /// A transition: the clip that owns it, and which edge.
+    Transition { clip: ClipId, edge: Edge },
     Clip { clip: ClipId, track: TrackId, edge: Option<Edge> },
     /// Between two adjacent clips.
     Cut { left: ClipId, right: ClipId },
@@ -205,7 +242,19 @@ fn hit(g: &Geo, rows: &[Row], seq: &Sequence, pos: Vec2) -> Hit {
         return Hit::VBar;
     }
     if pos.y < g.tracks_y {
-        return if pos.x >= g.track_x { Hit::Ruler } else { Hit::Nothing };
+        if pos.x < g.track_x {
+            return Hit::Nothing;
+        }
+        // Markers sit along the ruler's lower half.
+        if pos.y > r.y + RULER_H * 0.45 {
+            let m = seq.marks.markers.iter().filter(|m| (g.x_of(m.time) - pos.x).abs() <= MARKER_PX).min_by(|a, b| {
+                (g.x_of(a.time) - pos.x).abs().total_cmp(&(g.x_of(b.time) - pos.x).abs())
+            });
+            if let Some(m) = m {
+                return Hit::Marker(m.id);
+            }
+        }
+        return Hit::Ruler;
     }
     let Some(row) = g.row_at(rows, pos.y) else { return Hit::Nothing };
     if pos.x < g.track_x {
@@ -213,7 +262,17 @@ fn hit(g: &Geo, rows: &[Row], seq: &Sequence, pos: Vec2) -> Hit {
     }
     let Some((_, track)) = seq.track(row.id) else { return Hit::Nothing };
     let t = g.time_at(pos.x);
-    // Edges first: they are thin targets on top of the clip bodies.
+    // In a clip's body a transition wins (it sits on the cut); in the name
+    // strip the edges do, so a cut under a transition can still be trimmed.
+    let in_body = pos.y - g.tracks_y + g.scroll_y - row.top >= STRIP_H;
+    if in_body {
+        for (clip, edge, a, b) in transition_spans(track) {
+            if pos.x >= g.x_of(a) && pos.x <= g.x_of(b) {
+                return Hit::Transition { clip, edge };
+            }
+        }
+    }
+    // Edges next: they are thin targets on top of the clip bodies.
     let near = |x: f32| (pos.x - x).abs() <= EDGE_PX;
     for (i, c) in track.clips.iter().enumerate() {
         let (x0, x1) = (g.x_of(c.timeline_start), g.x_of(c.timeline_range().end()));
@@ -231,6 +290,24 @@ fn hit(g: &Geo, rows: &[Row], seq: &Sequence, pos: Vec2) -> Hit {
         Some(c) => Hit::Clip { clip: c.id, track: row.id, edge: None },
         None => Hit::Empty(row.id),
     }
+}
+
+/// Every transition on `track` that plays: its owner, edge, and the
+/// timeline span it covers.
+fn transition_spans(track: &Track) -> Vec<(ClipId, Edge, Time, Time)> {
+    let mut v = Vec::new();
+    for (i, c) in track.clips.iter().enumerate() {
+        if let Some(t) = &c.transition_in {
+            v.push((c.id, Edge::Start, c.timeline_start - t.before, c.timeline_start + t.after));
+        }
+        let end = c.timeline_range().end();
+        // A tail fade only plays where no clip follows directly.
+        let followed = track.clips.get(i + 1).is_some_and(|n| n.timeline_start == end);
+        if let (Some(t), false) = (&c.transition_out, followed) {
+            v.push((c.id, Edge::End, end - t.before, end + t.after));
+        }
+    }
+    v
 }
 
 /// Nearest snap point to any of `edges` within the snap distance: the
@@ -330,7 +407,7 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
     let rows = rows(app, &seq);
 
     // Media and effects dropped onto the timeline.
-    let zone = ui.drop_zone(&[ASSET_PAYLOAD, FILES_PAYLOAD, EFFECT_PAYLOAD]);
+    let zone = ui.drop_zone(&[ASSET_PAYLOAD, FILES_PAYLOAD, EFFECT_PAYLOAD, TRANSITION_PAYLOAD, GENERATOR_PAYLOAD]);
 
     let id = ui.make_id("timeline");
     let r = ui.interact_drag(id);
@@ -376,6 +453,12 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
 
     // --- press: what the drag will be ---------------------------------------
     if r.pressed {
+        // A press anywhere else in the tracks lets go of a picked transition
+        // or marker, so Delete then means the clips.
+        if matches!(under, Hit::Clip { .. } | Hit::Cut { .. } | Hit::Empty(_) | Hit::Ruler) {
+            app.view.selected_transition = None;
+            app.view.selected_marker = None;
+        }
         app.view.drag = match under {
             Hit::HBar if max_x > 0.0 => Some(Drag::ScrollX),
             Hit::VBar if max_y > 0.0 => Some(Drag::ScrollY),
@@ -388,9 +471,39 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
                 header_click(app, &seq, track, x);
                 None
             }
+            Hit::Marker(id) => {
+                app.engine.stop();
+                app.view.selected_marker = Some(id);
+                app.view.selected_transition = None;
+                if let Some(m) = seq.marks.markers.iter().find(|m| m.id == id) {
+                    app.seek(m.time);
+                }
+                None
+            }
+            Hit::Transition { clip, edge } => {
+                app.view.selected_transition = Some((clip, edge));
+                app.view.selected_marker = None;
+                app.view.selection.clear();
+                None
+            }
             _ if app.view.tool == Tool::Hand => Some(Drag::Hand),
             hit => press_tool(app, &snap_proj, &seq, &g, hit, r.mouse_pos, shift, alt),
         };
+    }
+
+    // --- double-click: edit a marker, open a nest -------------------------------
+    if r.double_clicked {
+        match under {
+            Hit::Marker(id) => app.edit_marker(id),
+            Hit::Clip { clip, .. } => {
+                if let Some(ClipSource::Sequence { sequence, .. }) = snap_proj.find_clip(clip).map(|(_, _, c)| c.source.clone()) {
+                    app.view.drag = None;
+                    app.open_sequence(sequence);
+                    return;
+                }
+            }
+            _ => {}
+        }
     }
 
     // --- drag ----------------------------------------------------------------
@@ -443,7 +556,7 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
             (Tool::Slip, Hit::Clip { .. }) => Cursor::ResizeHorizontal,
             (Tool::Select | Tool::Ripple, Hit::Clip { edge: Some(_), .. }) => Cursor::ResizeHorizontal,
             (_, Hit::Cut { .. }) => Cursor::ResizeHorizontal,
-            (_, Hit::Header(..)) => Cursor::Pointer,
+            (_, Hit::Header(..) | Hit::Marker(_) | Hit::Transition { .. }) => Cursor::Pointer,
             _ => Cursor::Default,
         };
     }
@@ -474,6 +587,33 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
                         }
                         None => app.errors.push("Drop effects onto a clip.".into()),
                     }
+                }
+            }
+            TRANSITION_PAYLOAD => {
+                if let Ok(plugin) = p.take::<PluginRef>() {
+                    let exact = g.time_at(zone.pointer.x);
+                    let near = |at: Time| ((at - exact).as_seconds_f64() as f32 * g.pps).abs();
+                    let target = track.and_then(|tr| seq.track(tr)).and_then(|(_, tr)| match tr.clip_at(exact) {
+                        // On a clip: its nearer edge.
+                        Some(c) => Some(if near(c.timeline_start) <= near(c.timeline_range().end()) { (c.id, Edge::Start) } else { (c.id, Edge::End) }),
+                        // In a gap: the nearest edge, if it is close.
+                        None => tr
+                            .clips
+                            .iter()
+                            .flat_map(|c| [(c.timeline_start, c.id, Edge::Start), (c.timeline_range().end(), c.id, Edge::End)])
+                            .filter(|(at, ..)| near(*at) < 40.0)
+                            .min_by(|a, b| near(a.0).total_cmp(&near(b.0)))
+                            .map(|(_, c, e)| (c, e)),
+                    });
+                    match target {
+                        Some((clip, edge)) => app.add_transition(clip, edge, plugin),
+                        None => app.errors.push("Drop transitions onto a clip's edge.".into()),
+                    }
+                }
+            }
+            GENERATOR_PAYLOAD => {
+                if let Ok(id) = p.take::<String>() {
+                    app.new_generator(&id, t, track);
                 }
             }
             _ => {
@@ -573,7 +713,7 @@ fn press_tool(app: &mut EditorUi, proj: &Project, seq: &Sequence, g: &Geo, hit: 
     }
 }
 
-/// Header buttons: lock, target patch, eye / mute, solo.
+/// Header buttons: lock, target patch, eye / mute, solo, mono / stereo.
 fn header_click(app: &mut EditorUi, seq: &Sequence, track: TrackId, x: f32) {
     let Some((_, t)) = seq.track(track) else { return };
     let mut st = ve_engine::TrackState::of(t);
@@ -594,6 +734,10 @@ fn header_click(app: &mut EditorUi, seq: &Sequence, track: TrackId, x: f32) {
             }
         }
         x if (104.0..124.0).contains(&x) && !video => st.solo = !st.solo,
+        x if (126.0..144.0).contains(&x) && !video => {
+            app.toggle_layout(track);
+            return;
+        }
         _ => return,
     }
     app.run(Command::SetTrackState { sequence: seq.id, track, state: st });
@@ -618,6 +762,12 @@ struct Shot {
     view_h: f32,
     valid: bool,
     drop_line: Option<f32>,
+    /// In and out points, seconds.
+    mark_in: Option<f32>,
+    mark_out: Option<f32>,
+    /// Markers: seconds, colour, selected.
+    markers: Vec<(f32, Color, bool)>,
+    transitions: Vec<TransitionShot>,
     text: Color,
     faint: Color,
     accent: Color,
@@ -633,6 +783,17 @@ struct RowShot {
     on: bool,
     solo: bool,
     targeted: bool,
+    /// Audio tracks: "S" or "M".
+    layout: Option<FrameText>,
+}
+
+struct TransitionShot {
+    row: usize,
+    /// Seconds.
+    start: f32,
+    end: f32,
+    name: FrameText,
+    selected: bool,
 }
 
 struct ClipShot {
@@ -658,6 +819,7 @@ enum ClipKind {
     Video,
     Audio,
     Title,
+    Nest,
 }
 
 fn tint_of(name: &str) -> Color {
@@ -680,6 +842,7 @@ impl Shot {
         }
         let mut row_shots = Vec::new();
         let mut clips = Vec::new();
+        let mut transitions = Vec::new();
         for (ri, row) in rows.iter().enumerate() {
             let Some((_, tr)) = seq.track(row.id) else { continue };
             row_shots.push(RowShot {
@@ -691,10 +854,28 @@ impl Shot {
                 on: if row.kind == TrackKind::Video { tr.enabled } else { !tr.muted },
                 solo: tr.solo,
                 targeted: app.view.targeted.contains(&row.id),
+                layout: (row.kind == TrackKind::Audio).then(|| ui.frame_text(if tr.layout == ChannelLayout::Mono { "M" } else { "S" })),
             });
+            for (clip, edge, a, b) in transition_spans(tr) {
+                let name = tr
+                    .clips
+                    .iter()
+                    .find(|c| c.id == clip)
+                    .and_then(|c| if edge == Edge::Start { c.transition_in.clone() } else { c.transition_out.clone() })
+                    .and_then(|t| app.st.plugins.find(&t.plugin).map(|i| i.name.clone()))
+                    .unwrap_or_default();
+                transitions.push(TransitionShot {
+                    row: ri,
+                    start: a.as_seconds_f64() as f32,
+                    end: b.as_seconds_f64() as f32,
+                    name: ui.frame_text(&name),
+                    selected: app.view.selected_transition == Some((clip, edge)),
+                });
+            }
             for c in &tr.clips {
                 let kind = match (&c.source, row.kind) {
                     (ClipSource::Generator { .. }, _) => ClipKind::Title,
+                    (ClipSource::Sequence { .. }, _) => ClipKind::Nest,
                     (_, TrackKind::Video) => ClipKind::Video,
                     (_, TrackKind::Audio) => ClipKind::Audio,
                 };
@@ -734,8 +915,17 @@ impl Shot {
                     (ClipKind::Audio, Some(a), ClipSource::Asset { audio_stream, .. }) => app.peaks(a, *audio_stream as usize),
                     _ => None,
                 };
+                // The name, with what is unusual about its timing, and the
+                // angle a multicam clip shows.
+                let mut label = c.name.clone();
+                if let ClipSource::Sequence { angle: Some(a), .. } = &c.source {
+                    label = format!("{label} · Angle {}", a + 1);
+                }
+                if let Some(b) = speed_badge(&c.retime) {
+                    label = format!("{label} [{b}]");
+                }
                 clips.push(ClipShot {
-                    name: ui.frame_text(&c.name),
+                    name: ui.frame_text(&label),
                     row: ri,
                     start,
                     len,
@@ -766,6 +956,15 @@ impl Shot {
             view_h: g.view_h,
             valid,
             drop_line: drop_line.map(|t| t.as_seconds_f64() as f32),
+            mark_in: seq.marks.in_point.map(|t| t.as_seconds_f64() as f32),
+            mark_out: seq.marks.out_point.map(|t| t.as_seconds_f64() as f32),
+            markers: seq
+                .marks
+                .markers
+                .iter()
+                .map(|m| (m.time.as_seconds_f64() as f32, marker_color(m.color), app.view.selected_marker == Some(m.id)))
+                .collect(),
+            transitions,
             text: t.palette.text,
             faint: t.palette.text_faint,
             accent: t.palette.accent,
@@ -788,18 +987,54 @@ impl Shot {
     fn ruler(&self, p: &mut Painter, rect: Rect, track_x: f32) {
         let r = Rect::new(rect.x, rect.y, rect.w, RULER_H);
         p.rect(r, REEL.ruler_bg, 0.0);
-        p.rect(Rect::new(rect.x, r.bottom() - 1.0, rect.w, 1.0), Color::hex(0x101010), 0.0);
+        p.rect(Rect::new(rect.x, r.bottom() - 1.0, rect.w, 1.0), REEL.line, 0.0);
         if let Some(clip) = p.draw.clip().intersect(&Rect::new(track_x, r.y, self.view_w, r.h)) {
             p.draw.push_clip(clip);
             // The work area: the sequence's length.
             p.rect(Rect::new(track_x - self.scroll_x, r.y, self.work_end * self.pps, 3.0), REEL.in_out.with_alpha(0.85), 0.0);
             for (time, label) in &self.ticks {
                 let x = (track_x + time * self.pps - self.scroll_x).round();
-                p.rect(Rect::new(x, r.y + 6.0, 1.0, RULER_H - 7.0), Color::hex(0x4d4d4d), 0.0);
+                p.rect(Rect::new(x, r.y + 6.0, 1.0, RULER_H - 7.0), REEL.tick, 0.0);
                 p.text_left(Rect::new(x + 4.0, r.y + 5.0, 90.0, 14.0), self.size - 1.0, self.faint, *label);
+            }
+            let xs = |t: f32| (track_x + t * self.pps - self.scroll_x).round();
+            if let Some((a, b)) = self.in_out_span() {
+                p.rect(Rect::new(xs(a), r.y + 3.0, xs(b) - xs(a), RULER_H - 4.0), REEL.in_out_range, 0.0);
+                // Brackets: [ at the in, ] at the out.
+                if let Some(t) = self.mark_in {
+                    let x = xs(t);
+                    p.rect(Rect::new(x, r.y + 3.0, 2.0, RULER_H - 4.0), REEL.in_out, 0.0);
+                    p.rect(Rect::new(x, r.y + 3.0, 6.0, 2.0), REEL.in_out, 0.0);
+                    p.rect(Rect::new(x, r.bottom() - 3.0, 6.0, 2.0), REEL.in_out, 0.0);
+                }
+                if let Some(t) = self.mark_out {
+                    let x = xs(t);
+                    p.rect(Rect::new(x - 2.0, r.y + 3.0, 2.0, RULER_H - 4.0), REEL.in_out, 0.0);
+                    p.rect(Rect::new(x - 6.0, r.y + 3.0, 6.0, 2.0), REEL.in_out, 0.0);
+                    p.rect(Rect::new(x - 6.0, r.bottom() - 3.0, 6.0, 2.0), REEL.in_out, 0.0);
+                }
+            }
+            // Markers: a flag along the ruler's foot.
+            for (t, c, selected) in &self.markers {
+                let x = xs(*t);
+                let (top, mid) = (r.bottom() - 13.0, r.bottom() - 6.0);
+                if *selected {
+                    p.rect(Rect::new(x - 5.0, top - 1.0, 10.0, 8.0), REEL.selected, 1.0);
+                }
+                p.rect(Rect::new(x - 4.0, top, 8.0, mid - top), *c, 1.0);
+                p.draw.triangle(Vec2::new(x - 4.0, mid), Vec2::new(x + 4.0, mid), Vec2::new(x, r.bottom() - 2.0), 0b110, *c);
             }
             p.draw.pop_clip();
         }
+    }
+
+    /// The in-to-out span in seconds, when either is set (to the sequence's
+    /// ends otherwise).
+    fn in_out_span(&self) -> Option<(f32, f32)> {
+        if self.mark_in.is_none() && self.mark_out.is_none() {
+            return None;
+        }
+        Some((self.mark_in.unwrap_or(0.0), self.mark_out.unwrap_or(self.work_end)))
     }
 
     fn tracks(&self, p: &mut Painter, view: Rect, track_x: f32, tracks_y: f32) {
@@ -809,7 +1044,7 @@ impl Shot {
             let y = tracks_y + tr.top - self.scroll_y;
             let bg = if i % 2 == 0 { REEL.track_bg } else { REEL.track_bg_alt };
             p.rect(Rect::new(track_x, y, self.view_w, tr.height), bg, 0.0);
-            p.rect(Rect::new(track_x, y + tr.height, self.view_w, 1.0), Color::hex(0x141414), 0.0);
+            p.rect(Rect::new(track_x, y + tr.height, self.view_w, 1.0), REEL.line, 0.0);
         }
         for c in &self.clips {
             let Some(tr) = self.rows.get(c.row) else { continue };
@@ -820,6 +1055,18 @@ impl Shot {
             }
             let y = tracks_y + tr.top - self.scroll_y;
             self.clip(p, Rect::new(x, y, w, tr.height - 1.0), c);
+        }
+        for t in &self.transitions {
+            let Some(tr) = self.rows.get(t.row) else { continue };
+            let x0 = track_x + t.start * self.pps - self.scroll_x;
+            let x1 = track_x + t.end * self.pps - self.scroll_x;
+            let y = tracks_y + tr.top - self.scroll_y;
+            transition(p, Rect::new(x0, y + STRIP_H, (x1 - x0).max(4.0), (tr.height - 1.0 - STRIP_H).max(4.0)), t, self.size, self.accent);
+        }
+        // The in-to-out range, faintly across the tracks.
+        if let Some((a, b)) = self.in_out_span() {
+            let (xa, xb) = (track_x + a * self.pps - self.scroll_x, track_x + b * self.pps - self.scroll_x);
+            p.rect(Rect::new(xa, view.y, xb - xa, view.h), REEL.in_out_range.with_alpha(REEL.in_out_range.a * 0.35), 0.0);
         }
         if let Some(t) = self.drop_line {
             let x = (track_x + t * self.pps - self.scroll_x).round();
@@ -836,6 +1083,7 @@ impl Shot {
             ClipKind::Video => (REEL.video_fill, REEL.video_head),
             ClipKind::Audio => (REEL.audio_fill, REEL.audio_head),
             ClipKind::Title => (REEL.title_fill, REEL.title_head),
+            ClipKind::Nest => (REEL.nest_fill, REEL.nest_head),
         };
         let dim = if c.enabled { 1.0 } else { 0.45 };
         p.rect(r, fill.with_alpha(dim), 3.0);
@@ -855,6 +1103,7 @@ impl Shot {
             match c.kind {
                 ClipKind::Audio => waveform(p, body, c.peaks.as_ref().map(|v| v.as_slice()), c.src_start, self.pps),
                 ClipKind::Title => p.rect(body.shrink(4.0, 3.0, 4.0, 3.0), Color::WHITE.with_alpha(0.10), 2.0),
+                ClipKind::Nest => nest_body(p, body),
                 ClipKind::Video => filmstrip(p, body, c.tint, &c.cells),
             }
         }
@@ -866,23 +1115,23 @@ impl Shot {
         let col = Rect::new(rect.x, tracks_y, HEADER_W, self.view_h);
         let Some(clip) = p.draw.clip().intersect(&col) else { return };
         p.draw.push_clip(clip);
-        p.rect(col, Color::hex(0x1a1a1a), 0.0);
+        p.rect(col, REEL.chrome_deep, 0.0);
         for tr in &self.rows {
             let y = tracks_y + tr.top - self.scroll_y;
             let r = Rect::new(col.x, y, HEADER_W, tr.height);
             p.rect(r, REEL.track_head, 0.0);
-            p.rect(Rect::new(r.x, r.bottom(), r.w, 1.0), Color::hex(0x141414), 0.0);
+            p.rect(Rect::new(r.x, r.bottom(), r.w, 1.0), REEL.line, 0.0);
             let mid = r.y + 9.0;
             let icon = |p: &mut Painter, x: f32, icon: Icon, on: bool| {
                 let b = Rect::new(r.x + x, mid, 16.0, 16.0);
                 if on {
-                    p.rect(b, Color::hex(0x3d3d3d), 2.0);
+                    p.rect(b, REEL.raised_hi, 2.0);
                 }
-                draw_icon(p, b.shrink(3.0, 3.0, 3.0, 3.0), icon, if on { Color::hex(0xe8e8e8) } else { Color::hex(0x7a7a7a) });
+                draw_icon(p, b.shrink(3.0, 3.0, 3.0, 3.0), icon, if on { REEL.bright } else { REEL.label });
             };
             icon(p, 5.0, Icon::Lock, tr.locked);
             let patch = Rect::new(r.x + 28.0, mid, 20.0, 16.0);
-            p.rect(patch, if tr.targeted { self.accent } else { Color::hex(0x2f2f2f) }, 2.0);
+            p.rect(patch, if tr.targeted { self.accent } else { REEL.raised }, 2.0);
             p.text_centered(patch, self.size - 1.0, if tr.targeted { Color::WHITE } else { self.faint }, tr.name);
             p.text_left(Rect::new(r.x + 54.0, mid, 30.0, 16.0), self.size, self.text, tr.name);
             if tr.video {
@@ -890,6 +1139,11 @@ impl Shot {
             } else {
                 icon(p, 86.0, Icon::Speaker, tr.on);
                 icon(p, 106.0, Icon::Mic, tr.solo);
+                if let Some(l) = tr.layout {
+                    let b = Rect::new(r.x + 127.0, mid, 16.0, 16.0);
+                    p.rect(b, REEL.raised, 2.0);
+                    p.text_centered(b, self.size - 1.0, REEL.text_soft, l);
+                }
             }
             if tr.locked {
                 // Locked tracks wear diagonal hatching, as NLEs show them.
@@ -915,21 +1169,57 @@ impl Shot {
 
     fn scrollbars(&self, p: &mut Painter, rect: Rect) {
         let track = Rect::new(rect.x + HEADER_W, rect.bottom() - BAR, self.view_w, BAR);
-        p.rect(Rect::new(rect.x, track.y, rect.w, BAR), Color::hex(0x1a1a1a), 0.0);
+        p.rect(Rect::new(rect.x, track.y, rect.w, BAR), REEL.chrome_deep, 0.0);
         if self.content_w > self.view_w {
             let span = (self.view_w / self.content_w * self.view_w).max(28.0);
             let travel = (self.view_w - span).max(1.0);
             let t = (self.scroll_x / (self.content_w - self.view_w).max(1.0)).clamp(0.0, 1.0);
-            p.rect(Rect::new(track.x + travel * t, track.y + 2.0, span, BAR - 4.0), Color::hex(0x4d4d4d), (BAR - 4.0) * 0.5);
+            p.rect(Rect::new(track.x + travel * t, track.y + 2.0, span, BAR - 4.0), REEL.tick, (BAR - 4.0) * 0.5);
         }
         let vt = Rect::new(rect.right() - BAR, rect.y + RULER_H, BAR, self.view_h);
-        p.rect(vt, Color::hex(0x1a1a1a), 0.0);
+        p.rect(vt, REEL.chrome_deep, 0.0);
         if self.content_h > self.view_h {
             let span = (self.view_h / self.content_h * self.view_h).max(28.0);
             let travel = (self.view_h - span).max(1.0);
             let t = (self.scroll_y / (self.content_h - self.view_h).max(1.0)).clamp(0.0, 1.0);
-            p.rect(Rect::new(vt.x + 2.0, vt.y + travel * t, BAR - 4.0, span), Color::hex(0x4d4d4d), (BAR - 4.0) * 0.5);
+            p.rect(Rect::new(vt.x + 2.0, vt.y + travel * t, BAR - 4.0, span), REEL.tick, (BAR - 4.0) * 0.5);
         }
+    }
+}
+
+/// A transition across the body of the clip(s) it joins: a light box with
+/// the diagonal NLEs draw, and its name when there is room.
+fn transition(p: &mut Painter, r: Rect, t: &TransitionShot, size: f32, accent: Color) {
+    p.rect(r, REEL.transition.with_alpha(0.88), 2.0);
+    p.line(Vec2::new(r.x + 1.0, r.bottom() - 1.0), Vec2::new(r.right() - 1.0, r.y + 1.0), 1.0, REEL.clip_border.with_alpha(0.55));
+    if r.w > 60.0 && r.h > 12.0 {
+        p.text_centered(r, size - 1.0, REEL.line, t.name);
+    }
+    let (w, c) = if t.selected { (2.0, accent) } else { (1.0, REEL.clip_border) };
+    p.rect_bordered(r, Color::TRANSPARENT, 2.0, w, c);
+}
+
+/// A nest's body: stacked bars, standing for the tracks inside.
+fn nest_body(p: &mut Painter, r: Rect) {
+    let inner = r.shrink(4.0, 3.0, 4.0, 3.0);
+    let n = ((inner.h / 7.0) as usize).clamp(1, 4);
+    for k in 0..n {
+        let y = inner.y + k as f32 * (inner.h / n as f32);
+        p.rect(Rect::new(inner.x, y, inner.w, (inner.h / n as f32 - 2.0).max(1.0)), Color::WHITE.with_alpha(0.08), 1.5);
+    }
+}
+
+/// "200%", "Reverse 50%", "Hold", "Remap" — or nothing at normal speed.
+fn speed_badge(r: &Retime) -> Option<String> {
+    match r {
+        Retime::Speed(s) if s.num == s.den => None,
+        Retime::Speed(s) => {
+            let pct = s.as_f64().abs() * 100.0;
+            let pct = if (pct - pct.round()).abs() < 0.05 { format!("{pct:.0}%") } else { format!("{pct:.1}%") };
+            Some(if s.num < 0 { format!("Reverse {pct}") } else { pct })
+        }
+        Retime::Remap(k) if k.len() == 1 => Some("Hold".into()),
+        Retime::Remap(_) => Some("Remap".into()),
     }
 }
 
@@ -997,20 +1287,20 @@ fn meters(ui: &mut Ui, levels: [f32; 2]) {
     let db = ui.frame_text("dB");
     let ss = ui.frame_text("S");
     ui.add_leaf(id, Layout::leaf(Size::Fixed(62.0), Size::Grow(1.0)), Vec2::ZERO, false, move |p, r| {
-        p.rect(r, Color::hex(0x1c1c1c), 0.0);
-        p.rect(Rect::new(r.x, r.y, 1.0, r.h), Color::hex(0x101010), 0.0);
+        p.rect(r, REEL.chrome, 0.0);
+        p.rect(Rect::new(r.x, r.y, 1.0, r.h), REEL.line, 0.0);
         let top = r.y + 8.0;
         let bottom = r.bottom() - 30.0;
         let h = (bottom - top).max(10.0);
         for (i, label) in labels.iter().enumerate() {
             let y = top + h * (i as f32 / (labels.len() - 1) as f32);
-            p.text_right(Rect::new(r.x + 24.0, y - 6.0, 34.0, 12.0), size - 1.0, Color::hex(0x8a8a8a), *label);
-            p.rect(Rect::new(r.x + 20.0, y, 3.0, 1.0), Color::hex(0x3d3d3d), 0.0);
+            p.text_right(Rect::new(r.x + 24.0, y - 6.0, 34.0, 12.0), size - 1.0, REEL.label, *label);
+            p.rect(Rect::new(r.x + 20.0, y, 3.0, 1.0), REEL.raised_hi, 0.0);
         }
-        p.text_right(Rect::new(r.x + 24.0, bottom + 4.0, 34.0, 12.0), size - 1.0, Color::hex(0x8a8a8a), db);
+        p.text_right(Rect::new(r.x + 24.0, bottom + 4.0, 34.0, 12.0), size - 1.0, REEL.label, db);
         for (i, level) in levels.iter().enumerate() {
             let bar = Rect::new(r.x + 5.0 + i as f32 * 8.0, top, 6.0, h);
-            p.rect(bar, Color::hex(0x0d0d0d), 1.0);
+            p.rect(bar, REEL.inset, 1.0);
             // The scale runs 0 dB at the top to -48 at the bottom.
             let lit = ((level + 48.0) / 48.0).clamp(0.0, 1.0) * h;
             if lit > 0.0 {
@@ -1019,7 +1309,7 @@ fn meters(ui: &mut Ui, levels: [f32; 2]) {
                 let clip = top + h * (0.5 / 48.0);
                 p.rect(Rect::new(bar.x, y0.max(warn), bar.w, bar.bottom() - y0.max(warn)), REEL.meter_lo, 1.0);
                 if y0 < warn {
-                    p.rect(Rect::new(bar.x, y0.max(clip), bar.w, warn - y0.max(clip)), Color::hex(0xd8c552), 0.0);
+                    p.rect(Rect::new(bar.x, y0.max(clip), bar.w, warn - y0.max(clip)), REEL.meter_mid, 0.0);
                 }
                 if y0 < clip {
                     p.rect(Rect::new(bar.x, y0, bar.w, clip - y0), REEL.meter_hi, 0.0);
@@ -1028,8 +1318,8 @@ fn meters(ui: &mut Ui, levels: [f32; 2]) {
         }
         for i in 0..2 {
             let b = Rect::new(r.x + 5.0 + i as f32 * 8.0, r.bottom() - 16.0, 6.0, 10.0);
-            p.rect(b, Color::hex(0x2a2a2a), 1.0);
-            p.text_centered(b, size - 2.0, Color::hex(0x8a8a8a), ss);
+            p.rect(b, REEL.raised, 1.0);
+            p.text_centered(b, size - 2.0, REEL.label, ss);
         }
     });
 }

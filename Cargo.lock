@@ -2788,6 +2788,7 @@ dependencies = [
  "libgui_wgpu",
  "platform_headless",
  "png",
+ "toml",
  "ve_engine",
  "ve_model",
  "ve_render",

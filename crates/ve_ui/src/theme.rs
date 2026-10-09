@@ -1,120 +1,145 @@
-//! Ported from the libgui_cut mock-up.
+//! The look a video editor wears, from `theme.toml`: neutral near-black
+//! chrome so the picture is the brightest thing on screen, a blue accent,
+//! and small dense type.
 //!
-//! The look a video editor wears: near-black chrome so the picture is the
-//! brightest thing on screen, a blue accent, and small dense type.
-//!
-//! As with every libgui theme, this is [`Theme`] with different numbers — the
-//! app owns its whole visual identity.
+//! The file is a libgui theme plus a `[reel]` table of the editor's own
+//! colours — the timeline, clips and the neutral tones the panels are drawn
+//! in — so the whole look changes from one place. It is compiled in; a typo
+//! in it fails the app's tests, not a user's launch.
+
+use std::sync::LazyLock;
 
 use libgui::*;
 
-/// Clip and timeline colours, which are the app's own vocabulary rather than
-/// anything the library knows about.
+/// The theme file, compiled in.
+const THEME_TOML: &str = include_str!("../theme.toml");
+
+/// The editor's own colours (`[reel]` in `theme.toml`).
 pub struct Reel {
+    // Neutral tones, darkest to lightest.
+    pub line: Color,
+    pub inset: Color,
+    pub chrome_deep: Color,
+    pub chrome: Color,
+    pub panel: Color,
+    pub raised: Color,
+    pub raised_hi: Color,
+    pub tick: Color,
+    pub label: Color,
+    pub text_soft: Color,
+    pub bright: Color,
+    // Timeline.
     pub ruler_bg: Color,
     pub track_bg: Color,
     pub track_bg_alt: Color,
     pub track_head: Color,
     pub grid: Color,
+    pub playhead: Color,
+    pub in_out: Color,
+    pub in_out_range: Color,
+    pub timecode: Color,
+    pub selected: Color,
+    // Clips.
     pub video_fill: Color,
     pub video_head: Color,
     pub audio_fill: Color,
     pub audio_head: Color,
     pub title_fill: Color,
     pub title_head: Color,
+    pub nest_fill: Color,
+    pub nest_head: Color,
     pub wave: Color,
     pub clip_text: Color,
     pub clip_border: Color,
-    pub selected: Color,
-    pub playhead: Color,
-    pub in_out: Color,
-    pub timecode: Color,
+    pub transition: Color,
+    pub badge: Color,
+    // Meters.
     pub meter_lo: Color,
+    pub meter_mid: Color,
     pub meter_hi: Color,
 }
 
-pub const REEL: Reel = Reel {
-    ruler_bg: Color::hex(0x1b1b1b),
-    track_bg: Color::hex(0x1f1f1f),
-    track_bg_alt: Color::hex(0x232323),
-    track_head: Color::hex(0x2b2b2b),
-    grid: Color::hex(0x333333),
-    video_fill: Color::hex(0x2d6e9e),
-    video_head: Color::hex(0x1e4f74),
-    audio_fill: Color::hex(0x2a6079),
-    audio_head: Color::hex(0x1d4557),
-    title_fill: Color::hex(0xa05fc8),
-    title_head: Color::hex(0x7a3fa8),
-    wave: Color::hex(0x7fc6e8),
-    clip_text: Color::hex(0xdfe9f2),
-    clip_border: Color::hex(0x14293a),
-    selected: Color::hex(0xffffff),
-    playhead: Color::hex(0x3a9ae8),
-    in_out: Color::hex(0xe0c341),
-    timecode: Color::hex(0x4aa3e8),
-    meter_lo: Color::hex(0x4caf50),
-    meter_hi: Color::hex(0xd94c4c),
-};
+/// The editor's colours, parsed once from `theme.toml`.
+pub static REEL: LazyLock<Reel> = LazyLock::new(|| parse().expect("theme.toml").1);
 
+/// The libgui theme from `theme.toml`.
 pub fn theme() -> Theme {
-    let mut t = Theme::dark();
-    t.name = "Cut".into();
+    parse().expect("theme.toml").0
+}
 
-    let p = &mut t.palette;
-    p.bg_app = Color::hex(0x191919);
-    p.bg_panel = Color::hex(0x232323);
-    p.bg_inset = Color::hex(0x141414);
-    p.surface = Color::hex(0x333333);
-    p.surface_hover = Color::hex(0x3d3d3d);
-    p.surface_active = Color::hex(0x2a2a2a);
-    p.border = Color::hex(0x101010);
-    p.border_strong = Color::hex(0x454545);
-    p.accent = Color::hex(0x2d8ceb);
-    p.accent_hover = Color::hex(0x459ef0);
-    p.accent_active = Color::hex(0x1f6fc0);
-    p.focus_ring = Color::hex(0x2d8ceb);
-    p.text = Color::hex(0xd6d6d6);
-    p.text_muted = Color::hex(0x9d9d9d);
-    p.text_faint = Color::hex(0x6f6f6f);
-    p.text_on_accent = Color::hex(0xffffff);
-    p.shadow = Color::rgba(0.0, 0.0, 0.0, 0.5);
+/// Split `theme.toml` into its libgui theme and the `[reel]` colours.
+fn parse() -> Result<(Theme, Reel), String> {
+    let mut doc: toml::Table = THEME_TOML.parse().map_err(|e: toml::de::Error| e.to_string())?;
+    let reel = doc.remove("reel").and_then(|v| v.as_table().cloned()).ok_or("theme.toml has no [reel] table")?;
+    let mut theme = Theme::from_toml(&toml::to_string(&doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // Not part of libgui's theme file: follow the accent, keep the sizes.
+    theme.palette.focus_ring = theme.palette.accent;
+    theme.metrics.indent = 14.0;
+    theme.metrics.focus_ring_width = 1.0;
+    let c = |k: &str| -> Result<Color, String> {
+        let v = reel.get(k).and_then(|v| v.as_str()).ok_or(format!("[reel] is missing `{k}`"))?;
+        Color::parse_hex(v).ok_or(format!("[reel] `{k}` = `{v}` is not a colour"))
+    };
+    let r = Reel {
+        line: c("line")?,
+        inset: c("inset")?,
+        chrome_deep: c("chrome_deep")?,
+        chrome: c("chrome")?,
+        panel: c("panel")?,
+        raised: c("raised")?,
+        raised_hi: c("raised_hi")?,
+        tick: c("tick")?,
+        label: c("label")?,
+        text_soft: c("text_soft")?,
+        bright: c("bright")?,
+        ruler_bg: c("ruler_bg")?,
+        track_bg: c("track_bg")?,
+        track_bg_alt: c("track_bg_alt")?,
+        track_head: c("track_head")?,
+        grid: c("grid")?,
+        playhead: c("playhead")?,
+        in_out: c("in_out")?,
+        in_out_range: c("in_out_range")?,
+        timecode: c("timecode")?,
+        selected: c("selected")?,
+        video_fill: c("video_fill")?,
+        video_head: c("video_head")?,
+        audio_fill: c("audio_fill")?,
+        audio_head: c("audio_head")?,
+        title_fill: c("title_fill")?,
+        title_head: c("title_head")?,
+        nest_fill: c("nest_fill")?,
+        nest_head: c("nest_head")?,
+        wave: c("wave")?,
+        clip_text: c("clip_text")?,
+        clip_border: c("clip_border")?,
+        transition: c("transition")?,
+        badge: c("badge")?,
+        meter_lo: c("meter_lo")?,
+        meter_mid: c("meter_mid")?,
+        meter_hi: c("meter_hi")?,
+    };
+    let known = [
+        "line", "inset", "chrome_deep", "chrome", "panel", "raised", "raised_hi", "tick", "label", "text_soft", "bright", "ruler_bg", "track_bg", "track_bg_alt",
+        "track_head", "grid", "playhead", "in_out", "in_out_range", "timecode", "selected", "video_fill", "video_head", "audio_fill", "audio_head", "title_fill",
+        "title_head", "nest_fill", "nest_head", "wave", "clip_text", "clip_border", "transition", "badge", "meter_lo", "meter_mid", "meter_hi",
+    ];
+    if let Some(k) = reel.keys().find(|k| !known.contains(&k.as_str())) {
+        return Err(format!("[reel] has an unknown key `{k}`"));
+    }
+    Ok((theme, r))
+}
 
-    let m = &mut t.metrics;
-    m.font_size = 11.0;
-    m.font_size_small = 10.0;
-    m.font_size_heading = 12.0;
-    m.radius = 2.0;
-    m.radius_large = 3.0;
-    m.space = 6.0;
-    m.control_height = 20.0;
-    m.row_height = 18.0;
-    m.tab_height = 24.0;
-    m.indent = 14.0;
-    m.focus_ring_width = 1.0;
-
-    let (pal, met, d) = (t.palette, t.metrics, t.density);
-    let mut t = Theme::from_parts("Cut", pal, d, met);
-    t.button.height = 20.0;
-    t.button.radius = 2.0;
-    t.button.shadow.color = Color::TRANSPARENT;
-    t.button_primary.shadow.color = Color::TRANSPARENT;
-    t.selectable.height = 18.0;
-    t.selectable.radius = 2.0;
-    t.selectable.indicator_width = 0.0;
-    t.text_input.height = 20.0;
-    t.text_input.radius = 2.0;
-    t.panel.radius = 0.0;
-    t.panel.border = Color::hex(0x101010);
-    t.panel.fill = Color::hex(0x232323);
-    t.tab.height = 24.0;
-    t.tab.radius = 0.0;
-    t.tab.accent_height = 2.0;
-    t.tab.bar_fill = Color::hex(0x1c1c1c);
-    t.tab.fill_active = Color::hex(0x232323);
-    t.scrollbar.width = 8.0;
-    t.scrollbar.width_hover = 11.0;
-    t.scrollbar.rest_alpha = 0.55;
-    t.slider.track_height = 3.0;
-    t.slider.knob_radius = 5.5;
-    t
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn theme_toml_parses() {
+        let (t, r) = super::parse().unwrap();
+        assert_eq!(t.name, "Cut");
+        // Near-black, never pure black, and neutral (no colour cast).
+        for c in [t.palette.bg_app, t.palette.bg_panel, t.palette.bg_inset, r.chrome, r.track_bg, r.line] {
+            assert!(c.r > 0.0 && c.r < 0.1, "{c:?}");
+            assert!((c.r - c.g).abs() < 1e-6 && (c.g - c.b).abs() < 1e-6, "neutral: {c:?}");
+        }
+    }
 }

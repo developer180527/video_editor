@@ -33,7 +33,7 @@ fn picture(ui: &mut Ui, app: &mut EditorUi) {
     let catching_up = app.catching_up && !app.engine.is_playing();
     let faint = ui.theme.palette.text_faint;
     ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, true, move |p, rect| {
-        p.rect(rect, Color::hex(0x141414), 0.0);
+        p.rect(rect, REEL.line, 0.0);
         let scale = match zoom {
             None => (rect.w / fw).min(rect.h / fh),
             Some(z) => z,
@@ -77,7 +77,11 @@ fn readout(ui: &mut Ui, app: &mut EditorUi) {
         ui.container(Layout::row().width(Size::Fixed(96.0)).height(Size::Fixed(20.0)), Frame::none(), |ui| {
             ui.combo("quality", &mut app.view.quality, &["Full", "1/2", "1/4"]);
         });
-        let _ = icon_button(ui, "settings", Icon::Wrench, 20.0, false);
+        let proxies = icon_button(ui, "proxies", Icon::Wrench, 20.0, app.view.proxies);
+        ui.tooltip(&proxies, if app.view.proxies { "Playing proxies (click for original media)" } else { "Toggle Proxies" });
+        if proxies.clicked {
+            app.toggle_proxies();
+        }
         ui.text_with(&app.timecode(end), 12.0, t.palette.text_muted);
     });
 }
@@ -96,15 +100,35 @@ fn scrub(ui: &mut Ui, app: &mut EditorUi) {
         ui.cursor = Cursor::ResizeHorizontal;
     }
     let frac = (app.playhead.as_seconds_f64() / end.as_seconds_f64()).clamp(0.0, 1.0) as f32;
+    let at = move |t: Time| (t.as_seconds_f64() / end.as_seconds_f64()).clamp(0.0, 1.0) as f32;
+    let marks = app.snap().active().map(|s| s.marks.clone()).unwrap_or_default();
+    let (mark_in, mark_out) = (marks.in_point.map(at), marks.out_point.map(at));
+    let markers: Vec<(f32, Color)> = marks.markers.iter().map(|m| (at(m.time), crate::features::marker_color(m.color))).collect();
     ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Fixed(22.0)), Vec2::ZERO, true, move |p, rect| {
         let bar = Rect::new(rect.x + 6.0, rect.y + 8.0, rect.w - 12.0, 5.0);
-        p.rect(bar, Color::hex(0x3a3a3a), 2.5);
+        p.rect(bar, REEL.raised_hi, 2.5);
         for i in 0..=10 {
             let x = bar.x + bar.w * (i as f32 / 10.0);
-            p.rect(Rect::new(x, bar.bottom() + 2.0, 1.0, 4.0), Color::hex(0x4a4a4a), 0.0);
+            p.rect(Rect::new(x, bar.bottom() + 2.0, 1.0, 4.0), REEL.tick, 0.0);
         }
         let x = bar.x + bar.w * frac;
-        p.rect(Rect::new(bar.x, bar.y, (x - bar.x).max(0.0), bar.h), Color::hex(0x4a4a4a), 2.5);
+        p.rect(Rect::new(bar.x, bar.y, (x - bar.x).max(0.0), bar.h), REEL.tick, 2.5);
+        // In/out: the range shaded, brackets at its ends.
+        if mark_in.is_some() || mark_out.is_some() {
+            let a = bar.x + bar.w * mark_in.unwrap_or(0.0);
+            let b = bar.x + bar.w * mark_out.unwrap_or(1.0);
+            p.rect(Rect::new(a, bar.y - 2.0, (b - a).max(1.0), bar.h + 4.0), REEL.in_out_range, 0.0);
+            if mark_in.is_some() {
+                p.rect(Rect::new(a, bar.y - 3.0, 2.0, bar.h + 6.0), REEL.in_out, 0.0);
+            }
+            if mark_out.is_some() {
+                p.rect(Rect::new(b - 2.0, bar.y - 3.0, 2.0, bar.h + 6.0), REEL.in_out, 0.0);
+            }
+        }
+        for (f, c) in &markers {
+            let mx = (bar.x + bar.w * f).round();
+            p.rect(Rect::new(mx - 2.0, rect.y + 1.0, 4.0, 5.0), *c, 1.0);
+        }
         p.rect(Rect::new(x - 5.0, rect.y + 3.0, 10.0, 14.0), REEL.playhead, 2.0);
     });
 }
@@ -117,12 +141,24 @@ fn transport(ui: &mut Ui, app: &mut EditorUi) {
         .gap(2.0)
         .align(Align::Center, Align::Center);
     let playing = app.engine.is_playing();
-    ui.container(row, Frame { fill: Color::hex(0x1f1f1f), ..Frame::none() }, |ui| {
-        let _ = icon_button(ui, "add-marker", Icon::Marker, 22.0, false);
-        let _ = icon_button(ui, "in", Icon::MarkIn, 22.0, false);
-        let _ = icon_button(ui, "out", Icon::MarkOut, 22.0, false);
-        divider(ui, "t1", true, 18.0);
+    ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         let tip = |ui: &mut Ui, r: &Response, s: &str| ui.tooltip(r, s);
+        let r = icon_button(ui, "add-marker", Icon::Marker, 22.0, false);
+        tip(ui, &r, "Add Marker (M)");
+        if r.clicked {
+            app.add_marker();
+        }
+        let r = icon_button(ui, "in", Icon::MarkIn, 22.0, false);
+        tip(ui, &r, "Mark In (I)");
+        if r.clicked {
+            app.mark_in();
+        }
+        let r = icon_button(ui, "out", Icon::MarkOut, 22.0, false);
+        tip(ui, &r, "Mark Out (O)");
+        if r.clicked {
+            app.mark_out();
+        }
+        divider(ui, "t1", true, 18.0);
         let r = icon_button(ui, "start", Icon::JumpStart, 22.0, false);
         tip(ui, &r, "Go to Start (Home)");
         if r.clicked {

@@ -57,6 +57,7 @@ rtrb = "0.4"
 bindgen = "0.72"
 imbl = { version = "7", features = ["serde"] }
 fontdue = "0.9"
+toml = "1"
 ulid = { version = "3", features = ["serde", "std"] }
 
 [profile.dev.package."*"]

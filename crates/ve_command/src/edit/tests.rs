@@ -316,3 +316,16 @@ fn marks_media_and_layouts_change_and_undo() {
     run(&f, Command::SetAssetMedia { asset: f.asset, media: MediaRef("file:moved/a".into()), info: None });
     run(&f, Command::SetTrackLayout { sequence: f.seq, track: f.a1, layout: ChannelLayout::Mono });
 }
+
+#[test]
+fn frame_hold_freezes_from_the_cut() {
+    let mut f = fixture();
+    let a = clip(&f, 0, 10, 8);
+    put(&mut f, true, &a);
+    let p = run(&f, frame_hold(&f.p, a.id, s(3)).unwrap());
+    let clips = p.sequence(f.seq).unwrap().track(f.v1).unwrap().1.clips.clone();
+    assert_eq!(clips.len(), 2);
+    assert_eq!(clips[1].source_time(s(3)), s(13));
+    assert_eq!(clips[1].source_time(s(7)), s(13), "held");
+    assert_eq!(clips[0].source_time(s(2)), s(12), "before the cut it plays");
+}

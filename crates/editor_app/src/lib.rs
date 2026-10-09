@@ -10,7 +10,9 @@ use ve_engine::Engine;
 use ve_model::MediaRef;
 use ve_ui::{EditorUi, HostRequest};
 
-struct App(EditorUi);
+/// The editor, and what the open media picker is for when it is not an
+/// import (the dialog itself does not say).
+struct App(EditorUi, Option<HostRequest>);
 
 fn file_ref(p: &std::path::Path) -> MediaRef {
     MediaRef(format!("file:{}", p.display()))
@@ -25,7 +27,14 @@ impl ShellApp for App {
         self.0.ui_for(ui, surface);
         for r in self.0.take_requests() {
             shell.file_dialog(match r {
-                HostRequest::ImportMedia => FileDialog::OpenMedia,
+                HostRequest::ImportMedia => {
+                    self.1 = None;
+                    FileDialog::OpenMedia
+                }
+                HostRequest::AttachProxy(_) | HostRequest::RelinkMedia(_) => {
+                    self.1 = Some(r);
+                    FileDialog::OpenMedia
+                }
                 HostRequest::OpenProject => FileDialog::OpenProject,
                 HostRequest::SaveProjectAs => FileDialog::SaveProject { default_name: format!("{}.veproj", self.0.project_name()) },
                 HostRequest::ExportAs { default_name, extension } => FileDialog::SaveMedia { default_name, extension },
@@ -38,8 +47,14 @@ impl ShellApp for App {
     }
 
     fn dialog_result(&mut self, dialog: FileDialog, paths: Vec<PathBuf>) {
+        let purpose = if matches!(dialog, FileDialog::OpenMedia) { self.1.take() } else { None };
         if paths.is_empty() {
             return;
+        }
+        match purpose {
+            Some(HostRequest::AttachProxy(asset)) => return self.0.attach_proxy(asset, &paths[0]),
+            Some(HostRequest::RelinkMedia(asset)) => return self.0.relink(asset, &paths[0]),
+            _ => {}
         }
         let e = &self.0.engine;
         match dialog {
@@ -112,6 +127,6 @@ pub fn run(engine: Engine, touch: bool) {
         // Hardware-decoded frames go to the compositor without a copy where
         // the platform can import them.
         ui.set_importer(gpu_import::importer());
-        App(ui)
+        App(ui, None)
     });
 }

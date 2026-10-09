@@ -3,10 +3,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::theme::REEL;
 use libgui::*;
 use ve_engine::Command;
 use ve_model::*;
-use ve_engine::{EffectInfo, Implementation};
+use ve_engine::{EffectInfo, EffectKind, Implementation};
+
+use crate::features::{GENERATOR_PAYLOAD, TRANSITION_PAYLOAD};
 use ve_time::{Rate, Time, Timecode};
 
 
@@ -98,6 +101,7 @@ fn grid(ui: &mut Ui, app: &mut EditorUi, drop_hover: bool) {
     let opts = ScrollOptions { padding: Insets::all(8.0), gap: 8.0, ..ScrollOptions::new(Size::Grow(1.0)) };
     let mut picked = None;
     let mut append = None;
+    let mut menu = None;
     ui.scroll_area_with("bin", opts, |ui| {
         if assets.is_empty() {
             let msg = if drop_hover { "Drop to import" } else { "Drop media here, or use Import (Cmd+I)." };
@@ -117,6 +121,28 @@ fn grid(ui: &mut Ui, app: &mut EditorUi, drop_hover: bool) {
                     if r.double_clicked {
                         append = Some(a.id);
                     }
+                    let has_proxy = a.variants.iter().any(|v| v.kind == VariantKind::Proxy);
+                    let id = a.id;
+                    if let Some(Some(m)) = ui.context_menu(&r, |ui| {
+                        let mut m = None;
+                        if ui.menu_item("Attach Proxy…").clicked {
+                            m = Some(AssetMenu::AttachProxy(id));
+                        }
+                        if ui.menu_item_ex("Remove Proxy", None, has_proxy).clicked {
+                            m = Some(AssetMenu::RemoveProxy(id));
+                        }
+                        ui.menu_separator();
+                        if ui.menu_item("Link Media…").clicked {
+                            m = Some(AssetMenu::Relink(id));
+                        }
+                        ui.menu_separator();
+                        if ui.menu_item("Remove from Project").clicked {
+                            m = Some(AssetMenu::Remove(id));
+                        }
+                        m
+                    }) {
+                        menu = Some(m);
+                    }
                 }
                 for _ in chunk.len()..across {
                     ui.container(Layout::column().width(Size::Grow(1.0)).height(Size::Grow(1.0)), Frame::none(), |_| {});
@@ -127,11 +153,31 @@ fn grid(ui: &mut Ui, app: &mut EditorUi, drop_hover: bool) {
     if let Some(id) = picked {
         app.view.selected_asset = Some(id);
     }
+    match menu {
+        Some(AssetMenu::AttachProxy(id)) => app.requests.push(HostRequest::AttachProxy(id)),
+        Some(AssetMenu::RemoveProxy(id)) => app.remove_proxy(id),
+        Some(AssetMenu::Relink(id)) => app.requests.push(HostRequest::RelinkMedia(id)),
+        Some(AssetMenu::Remove(id)) => {
+            if app.view.selected_asset == Some(id) {
+                app.view.selected_asset = None;
+            }
+            app.run(Command::RemoveAsset { asset: id });
+        }
+        None => {}
+    }
     if let Some(id) = append {
         // Double-click: onto the end of the sequence.
         let end = app.snap().active().map(|s| s.duration()).unwrap_or(Time::ZERO);
         app.place_asset(id, end, None, false);
     }
+}
+
+/// What a bin card's context menu asked for.
+enum AssetMenu {
+    AttachProxy(AssetId),
+    RemoveProxy(AssetId),
+    Relink(AssetId),
+    Remove(AssetId),
 }
 
 /// Two colours from the name, standing in for a frame until thumbnails are
@@ -156,6 +202,8 @@ fn thumbnail(ui: &mut Ui, a: &Arc<Asset>, selected: bool, rate: Rate, tex: Optio
     let (c0, c1) = tint(&a.name);
     let audio_only = a.info.as_ref().is_some_and(|i| i.video.is_none() && !i.audio.is_empty());
     let has_audio = a.info.as_ref().is_some_and(|i| !i.audio.is_empty());
+    let has_proxy = a.variants.iter().any(|v| v.kind == VariantKind::Proxy);
+    let proxy_text = ui.frame_text("P");
     let dur = a
         .info
         .as_ref()
@@ -168,8 +216,8 @@ fn thumbnail(ui: &mut Ui, a: &Arc<Asset>, selected: bool, rate: Rate, tex: Optio
     let size = t.metrics.font_size_small;
     let accent = t.palette.accent;
     ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, true, move |p, rect| {
-        let fill = if selected { Color::hex(0x3a3a3a) } else { Color::hex(0x2a2a2a).lerp(Color::hex(0x333333), hot) };
-        p.rect_bordered(rect, fill, 3.0, if selected { 2.0 } else { 1.0 }, if selected { accent } else { Color::hex(0x191919) });
+        let fill = if selected { REEL.raised_hi } else { REEL.raised.lerp(REEL.raised, hot) };
+        p.rect_bordered(rect, fill, 3.0, if selected { 2.0 } else { 1.0 }, if selected { accent } else { REEL.chrome_deep });
         let img = Rect::new(rect.x + 4.0, rect.y + 4.0, rect.w - 8.0, rect.h - 32.0);
         if let Some(tex) = tex {
             // The picture, fitted (16:9 into the card), on black.
@@ -219,8 +267,14 @@ fn thumbnail(ui: &mut Ui, a: &Arc<Asset>, selected: bool, rate: Rate, tex: Optio
                 p.rect(Rect::new(badge.x + 2.0 + k as f32 * 4.0, badge.center().y - h * 0.5, 2.0, h), Color::hex(0x7fc6e8), 0.0);
             }
         }
-        p.text_left(Rect::new(rect.x + 6.0, rect.bottom() - 26.0, rect.w - 60.0, 14.0), size, Color::hex(0xdcdcdc), name);
-        p.text_right(Rect::new(rect.x, rect.bottom() - 26.0, rect.w - 6.0, 14.0), size, Color::hex(0x9a9a9a), dur);
+        if has_proxy {
+            // "P": a proxy is attached.
+            let badge = Rect::new(img.x + 3.0, img.y + 3.0, 14.0, 12.0);
+            p.rect(badge, REEL.badge, 1.5);
+            p.text_centered(badge, size, REEL.bright, proxy_text);
+        }
+        p.text_left(Rect::new(rect.x + 6.0, rect.bottom() - 26.0, rect.w - 60.0, 14.0), size, REEL.text_soft, name);
+        p.text_right(Rect::new(rect.x, rect.bottom() - 26.0, rect.w - 6.0, 14.0), size, REEL.label, dur);
     });
     r
 }
@@ -238,9 +292,9 @@ fn thumb_slider(ui: &mut Ui, app: &mut EditorUi) {
     let f = app.view.thumb;
     ui.add_leaf(id, Layout::leaf(Size::Fixed(104.0), Size::Fixed(20.0)), Vec2::ZERO, true, move |p, rect| {
         let line = Rect::new(rect.x + 6.0, rect.center().y - 1.0, rect.w - 12.0, 2.0);
-        p.rect(line, Color::hex(0x3d3d3d), 1.0);
+        p.rect(line, REEL.raised_hi, 1.0);
         let x = line.x + line.w * f;
-        p.rect(Rect::new(x - 5.0, rect.center().y - 5.0, 10.0, 10.0), Color::hex(0xb0b0b0), 5.0);
+        p.rect(Rect::new(x - 5.0, rect.center().y - 5.0, 10.0, 10.0), REEL.text_soft, 5.0);
     });
 }
 
@@ -251,7 +305,7 @@ fn footer(ui: &mut Ui, app: &mut EditorUi) {
         .padding(Insets::xy(6.0, 0.0))
         .gap(3.0)
         .align(Align::Start, Align::Center);
-    ui.container(row, Frame { fill: Color::hex(0x1f1f1f), ..Frame::none() }, |ui| {
+    ui.container(row, Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
         let _ = icon_button(ui, "pen", Icon::Pen, 20.0, true);
         let _ = icon_button(ui, "list", Icon::List, 20.0, false);
         let _ = icon_button(ui, "grid", Icon::Grid, 20.0, true);
@@ -276,41 +330,84 @@ fn footer(ui: &mut Ui, app: &mut EditorUi) {
     });
 }
 
-/// The Effects panel: every effect the engine knows, by category. Drag one
-/// onto a clip, or double-click to apply it to the selected clip.
+/// The Effects panel: transitions, generators and effects. Drag one onto
+/// the timeline (a transition onto a clip's edge, a generator onto a video
+/// track, an effect onto a clip), or double-click: a transition goes to the
+/// nearest edit point, a generator to the playhead, an effect to the
+/// selected clip.
 pub fn effects_list(ui: &mut Ui, app: &mut EditorUi) {
     let t = ui.theme.clone();
     let registry = app.st.plugins.clone();
-    let mut effects: Vec<&EffectInfo> =
-        registry.effects().iter().filter(|e| !matches!(e.implementation, Implementation::Intrinsic)).collect();
-    effects.sort_by(|a, b| (&a.category, &a.name).cmp(&(&b.category, &b.name)));
-    if effects.is_empty() {
-        ui.label_muted("No plugin effects loaded.");
+    let all = registry.effects();
+    let of = |f: &dyn Fn(&EffectInfo) -> bool| {
+        let mut v: Vec<&EffectInfo> = all.iter().filter(|e| f(e)).collect();
+        v.sort_by(|a, b| (&a.category, &a.name).cmp(&(&b.category, &b.name)));
+        v
+    };
+    let video_tr = of(&|e| e.kind == EffectKind::Transition && e.wgsl.is_some());
+    let audio_tr = of(&|e| e.kind == EffectKind::Transition && e.wgsl.is_none());
+    let generators = of(&|e| e.kind == EffectKind::Generator);
+    let filters = of(&|e| e.kind == EffectKind::Filter && !matches!(e.implementation, Implementation::Intrinsic));
+
+    #[derive(Clone)]
+    enum Pick {
+        Transition(TrackKind, PluginRef),
+        Generator(String),
+        Effect(PluginRef),
+    }
+    let mut pick = None;
+    for (title, list, kind) in [("Video Transitions", &video_tr, Some(TrackKind::Video)), ("Audio Transitions", &audio_tr, Some(TrackKind::Audio))] {
+        ui.section(title);
+        for e in list.iter() {
+            let r = ui.selectable_keyed(&e.plugin.id, &e.name, false);
+            let (plugin, label) = (e.plugin.clone(), e.name.clone());
+            ui.drag_source_from(&r, move || Payload::new(TRANSITION_PAYLOAD, plugin).with_label(label));
+            ui.tooltip(&r, "Drag onto a clip's edge, or double-click for the nearest edit point");
+            if r.double_clicked {
+                pick = Some(Pick::Transition(kind.unwrap(), e.plugin.clone()));
+            }
+        }
+    }
+    ui.section("Generators");
+    for e in &generators {
+        let r = ui.selectable_keyed(&e.plugin.id, &e.name, false);
+        let (id, label) = (e.plugin.id.clone(), e.name.clone());
+        ui.drag_source_from(&r, move || Payload::new(GENERATOR_PAYLOAD, id).with_label(label));
+        ui.tooltip(&r, "Drag onto a video track, or double-click to add at the playhead");
+        if r.double_clicked {
+            pick = Some(Pick::Generator(e.plugin.id.clone()));
+        }
     }
     let mut last = String::new();
-    let mut apply = None;
-    for e in effects {
+    if filters.is_empty() {
+        ui.section("Video Effects");
+        ui.label_muted("No plugin effects loaded.");
+    }
+    for e in filters {
         if e.category != last {
             ui.section(&e.category);
             last = e.category.clone();
         }
-        let id = ui.make_id(("effect", &e.plugin.id));
         let r = ui.selectable_keyed(&e.plugin.id, &e.name, false);
         let plugin = e.plugin.clone();
         let label = e.name.clone();
         ui.drag_source_from(&r, move || Payload::new(EFFECT_PAYLOAD, plugin).with_label(label));
         ui.tooltip(&r, &format!("{} · {:?} v{} · {} parameter(s){}", e.plugin.id, e.plugin.api, e.plugin.major_version, e.params.len(), if e.wgsl.is_some() { " · GPU" } else { "" }));
         if r.double_clicked {
-            apply = Some(e.plugin.clone());
+            pick = Some(Pick::Effect(e.plugin.clone()));
         }
-        let _ = id;
     }
     ui.space(8.0);
-    ui.text_with("Drag onto a clip, or double-click to apply to the selection.", t.metrics.font_size_small, t.palette.text_faint);
-    if let Some(plugin) = apply {
-        if let Some(&clip) = app.view.selection.first() {
-            add_effect(app, clip, &plugin);
+    ui.text_with("Drag onto the timeline, or double-click to apply.", t.metrics.font_size_small, t.palette.text_faint);
+    match pick {
+        Some(Pick::Transition(kind, plugin)) => app.apply_transition(kind, plugin),
+        Some(Pick::Generator(id)) => app.new_generator(&id, app.playhead, None),
+        Some(Pick::Effect(plugin)) => {
+            if let Some(&clip) = app.view.selection.first() {
+                add_effect(app, clip, &plugin);
+            }
         }
+        None => {}
     }
 }
 

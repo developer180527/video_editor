@@ -56,6 +56,8 @@ enum Request {
     /// both sides share one anchor and the playhead never jumps.
     Transport(Transport),
     Looping(bool),
+    AttachProxy(ve_model::AssetId, String),
+    Relink(ve_model::AssetId, String),
 }
 
 pub struct EngineClient {
@@ -160,6 +162,16 @@ impl Engine {
                         }
                         Request::Transport(t) => self.adopt_transport(t),
                         Request::Looping(on) => self.set_looping(on),
+                        Request::AttachProxy(asset, path) => {
+                            if let Err(err) = self.attach_proxy(asset, &path) {
+                                let _ = etx.send(Event::Error(format!("{path}: {err}")));
+                            }
+                        }
+                        Request::Relink(asset, path) => {
+                            if let Err(err) = self.relink(asset, &path) {
+                                let _ = etx.send(Event::Error(format!("{path}: {err}")));
+                            }
+                        }
                     }
                     flush(&mut self, None);
                 }
@@ -209,6 +221,17 @@ impl EngineClient {
 
     pub fn new_project(&self, name: &str) {
         self.send(Request::NewProject(name.into()));
+    }
+
+    /// Attach the file at `path` as `asset`'s proxy (probed on the engine
+    /// thread).
+    pub fn attach_proxy(&self, asset: ve_model::AssetId, path: String) {
+        self.send(Request::AttachProxy(asset, path));
+    }
+
+    /// Relink `asset` to the file at `path`.
+    pub fn relink(&self, asset: ve_model::AssetId, path: String) {
+        self.send(Request::Relink(asset, path));
     }
 
     pub fn save_as(&self, to: MediaRef) {

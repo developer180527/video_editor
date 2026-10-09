@@ -303,6 +303,33 @@ pub fn set_angle(p: &Project, clip: ClipId, angle: Option<u32>) -> Result<Comman
     b.finish("Switch Angle")
 }
 
+/// Multicam switching: from `at` on, `clip` shows `angle` (cut there first
+/// if `at` is inside it; from its start if `at` is its start).
+pub fn switch_angle(p: &Project, clip: ClipId, at: Time, angle: u32) -> Result<Command, CommandError> {
+    let mut b = Builder::new(p);
+    let mut links = HashMap::new();
+    let target = split(&mut b, clip, at, &mut links)?.unwrap_or(clip);
+    let (_, _, c) = find(b.project(), target)?;
+    let ClipSource::Sequence { sequence, .. } = c.source else { return Err(CommandError::NotFound("multicam clip")) };
+    let mut new = (*c).clone();
+    new.source = ClipSource::Sequence { sequence, angle: Some(angle) };
+    b.push(Command::SetClip { clip: Arc::new(new) })?;
+    b.finish("Switch Angle")
+}
+
+/// Frame hold: from `at` to the clip's end, show the frame at `at` (cut
+/// there; the held part is a one-key remap).
+pub fn frame_hold(p: &Project, clip: ClipId, at: Time) -> Result<Command, CommandError> {
+    let mut b = Builder::new(p);
+    let mut links = HashMap::new();
+    let target = split(&mut b, clip, at, &mut links)?.unwrap_or(clip);
+    let (_, _, c) = find(b.project(), target)?;
+    let mut new = (*c).clone();
+    new.retime = Retime::Remap(vec![RemapKey { time: Time::ZERO, offset: Time::ZERO }]);
+    b.push(Command::SetClip { clip: Arc::new(new) })?;
+    b.finish("Frame Hold")
+}
+
 /// Nest `clips` of sequence `seq` into a new sequence (a compound clip):
 /// they move into it on matching tracks, keeping their timing relative to
 /// the earliest, and are replaced by one clip of the new sequence per kind

@@ -1,0 +1,127 @@
+# The editor's look.
+#
+# Neutral near-black chrome — no blue cast — so the picture is the brightest
+# thing on screen; a blue accent; small, dense type.
+#
+# Everything above [reel] is a libgui theme (see libgui's theme_file.rs):
+# colours are "#rrggbb", "#rrggbbaa", "transparent", a palette name, a
+# palette name with alpha ("accent@0.3") or "mix(a, b, t)". [reel] holds the
+# editor's own colours: the timeline, clips and the neutral tones the panels
+# are drawn in.
+
+name = "Cut"
+extends = "dark"
+
+[palette]
+bg_app = "#0d0d0d"
+bg_panel = "#141414"
+bg_inset = "#0a0a0a"
+surface = "#232323"
+surface_hover = "#2c2c2c"
+surface_active = "#1b1b1b"
+border = "#070707"
+border_strong = "#2f2f2f"
+accent = "#2d8ceb"
+accent_hover = "#459ef0"
+accent_active = "#1f6fc0"
+text = "#d6d6d6"
+text_muted = "#9a9a9a"
+text_faint = "#686868"
+text_on_accent = "#ffffff"
+shadow = "#00000080"
+
+[metrics]
+font_size = 11
+font_size_small = 10
+font_size_heading = 12
+radius = 2
+radius_large = 3
+space = 6
+control_height = 20
+row_height = 18
+tab_height = 24
+
+[button]
+height = 20
+radius = 2
+shadow = { color = "transparent" }
+
+[button_primary]
+shadow = { color = "transparent" }
+
+[selectable]
+height = 18
+radius = 2
+indicator_width = 0
+
+[text_input]
+height = 20
+radius = 2
+fill = "#0f0f0f"
+
+[panel]
+radius = 0
+border = "border"
+fill = "bg_panel"
+
+[tab]
+height = 24
+radius = 0
+accent_height = 2
+bar_fill = "#101010"
+fill_active = "bg_panel"
+
+[scrollbar]
+width = 8
+width_hover = 11
+rest_alpha = 0.55
+
+[slider]
+track_height = 3
+knob_radius = 5.5
+
+[reel]
+# Neutral tones the panels are drawn in, darkest to lightest.
+line = "#070707"         # hairlines between panels, rows and headers
+inset = "#0a0a0a"        # wells: the monitor surround, meter troughs
+chrome_deep = "#0e0e0e"  # track-header column, scrollbar troughs
+chrome = "#121212"       # toolbars, the tool column, the app bar
+panel = "#161616"        # raised panel areas
+raised = "#222222"       # off buttons, patches
+raised_hi = "#2c2c2c"    # lit buttons, hover
+tick = "#3a3a3a"         # ruler ticks, scrollbar thumbs
+label = "#7d7d7d"        # small labels and scales
+text_soft = "#c4c4c4"
+bright = "#ececec"
+
+# The timeline.
+ruler_bg = "#0f0f0f"
+track_bg = "#111111"
+track_bg_alt = "#141414"
+track_head = "#181818"
+grid = "#262626"
+playhead = "#3a9ae8"
+in_out = "#e0c341"
+in_out_range = "#e0c34126"
+timecode = "#4aa3e8"
+selected = "#ffffff"
+
+# Clips.
+video_fill = "#2d6e9e"
+video_head = "#1e4f74"
+audio_fill = "#2a6079"
+audio_head = "#1d4557"
+title_fill = "#a05fc8"
+title_head = "#7a3fa8"
+nest_fill = "#3c7d5a"
+nest_head = "#2a5c41"
+wave = "#7fc6e8"
+clip_text = "#dfe9f2"
+clip_border = "#0b1620"
+transition = "#d7d7d7"
+badge = "#00000080"
+
+# Meters.
+meter_lo = "#4caf50"
+meter_mid = "#d8c552"
+meter_hi = "#d94c4c"
