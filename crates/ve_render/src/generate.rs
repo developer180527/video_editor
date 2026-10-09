@@ -23,9 +23,11 @@ fn font() -> &'static fontdue::Font {
 }
 
 /// The generator `id`'s picture at `w`×`h` for these parameter values, or
-/// `None` if `id` is not a built-in generator.
-pub fn picture(id: &str, params: &[(String, Value)], w: u32, h: u32) -> Option<Arc<VideoFrame>> {
-    let key = format!("{id} {w}x{h} {params:?}");
+/// `None` if `id` is not a built-in generator. `scale` is picture pixels
+/// per sequence pixel (below 1 at preview quality): sizes and positions in
+/// the parameters are in sequence pixels.
+pub fn picture(id: &str, params: &[(String, Value)], w: u32, h: u32, scale: f32) -> Option<Arc<VideoFrame>> {
+    let key = format!("{id} {w}x{h} {scale} {params:?}");
     /// The most recent pictures, newest first, by parameters.
     type Cache = Mutex<Vec<(String, Arc<VideoFrame>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -47,11 +49,11 @@ pub fn picture(id: &str, params: &[(String, Value)], w: u32, h: u32) -> Option<A
                 _ => "Title".into(),
             };
             let size = match get("size") {
-                Some(Value::Float(s)) => s as f32,
-                _ => 96.0,
+                Some(Value::Float(s)) => s as f32 * scale,
+                _ => 96.0 * scale,
             };
             let at = match get("position") {
-                Some(Value::Vec2([x, y])) => [x as f32, y as f32],
+                Some(Value::Vec2([x, y])) => [x as f32 * scale, y as f32 * scale],
                 _ => [w as f32 / 2.0, h as f32 / 2.0],
             };
             title(w, h, &text, size, color("color", [1.0; 4]), at)
@@ -161,18 +163,27 @@ mod tests {
 
     #[test]
     fn bars_matte_and_title_draw() {
-        let b = picture("ve.bars", &[], 700, 300).unwrap();
+        let b = picture("ve.bars", &[], 700, 300, 1.0).unwrap();
         assert_eq!(px(&b, 50, 10), [191, 191, 191, 255], "75% white");
         assert_eq!(px(&b, 150, 10), [191, 191, 0, 255], "yellow");
-        let m = picture("ve.color", &[("color".into(), Value::Color([1.0, 0.0, 0.0, 1.0]))], 8, 8).unwrap();
+        let m = picture("ve.color", &[("color".into(), Value::Color([1.0, 0.0, 0.0, 1.0]))], 8, 8, 1.0).unwrap();
         assert_eq!(px(&m, 3, 3), [255, 0, 0, 255]);
-        let t = picture("ve.title", &[("text".into(), Value::Text("IIII".into())), ("size".into(), Value::Float(64.0))], 400, 200).unwrap();
+        let t = picture("ve.title", &[("text".into(), Value::Text("IIII".into())), ("size".into(), Value::Float(64.0))], 400, 200, 1.0).unwrap();
         let FrameData::Cpu { planes, .. } = &t.data else { panic!() };
         let inked = planes[0].chunks(4).filter(|p| p[3] > 128).count();
         assert!(inked > 200, "the text is drawn ({inked} px)");
         assert_eq!(px(&t, 5, 5)[3], 0, "transparent around it");
         // Cached: the same parameters give the same frame.
-        assert!(Arc::ptr_eq(&b, &picture("ve.bars", &[], 700, 300).unwrap()));
-        assert!(picture("com.example.unknown", &[], 4, 4).is_none());
+        assert!(Arc::ptr_eq(&b, &picture("ve.bars", &[], 700, 300, 1.0).unwrap()));
+        assert!(picture("com.example.unknown", &[], 4, 4, 1.0).is_none());
+        // At half resolution a title centred at sequence (200, 100) is
+        // centred at (100, 50), half the size.
+        let p = [("text".into(), Value::Text("IIII".into())), ("size".into(), Value::Float(64.0)), ("position".into(), Value::Vec2([200.0, 100.0]))];
+        let half = picture("ve.title", &p, 200, 100, 0.5).unwrap();
+        let FrameData::Cpu { planes, .. } = &half.data else { panic!() };
+        let xs: Vec<u32> = planes[0].chunks(4).enumerate().filter(|(_, p)| p[3] > 128).map(|(i, _)| i as u32 % 200).collect();
+        let mid = (xs.iter().min().unwrap() + xs.iter().max().unwrap()) / 2;
+        assert!((95..=105).contains(&mid), "centred at {mid}");
+        assert!(xs.len() * 4 < inked + 40, "drawn at half size");
     }
 }

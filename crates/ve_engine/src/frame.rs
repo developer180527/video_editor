@@ -108,7 +108,7 @@ impl Resolver<'_> {
             ClipSource::Generator { plugin } => {
                 // Its parameters are its own effect on the clip.
                 let params = l.effects.iter().find(|e| e.plugin == *plugin).map(|e| e.params.clone()).unwrap_or_default();
-                let source = match ve_render::generate::picture(&plugin.id, &params, out(seq_size.0), out(seq_size.1)) {
+                let source = match ve_render::generate::picture(&plugin.id, &params, out(seq_size.0), out(seq_size.1), self.scale) {
                     Some(f) => LayerSource::Frame(f),
                     None => {
                         let info = self.registry.find(plugin).filter(|i| i.kind == EffectKind::Generator)?;
