@@ -60,11 +60,58 @@ fn rec709_round_trips_through_acescg() {
     let Some(img) = render(&[layer(gray(64, 36, 126), 100.0, 1.0)], WorkingSpace::AcesCg) else {
         return eprintln!("skipped: no GPU");
     };
-    // Luma 126 (limited) is 0.502 encoded; it must come back as 128 ± 2.
+    // Luma 126 (limited) is 0.502 encoded; it must come back as 128 ± 1 —
+    // and grey: chroma 128 is exactly neutral (a 0.5 midpoint tinted it).
     let p = px(&img, 32, 18);
-    for c in &p[..3] {
-        assert!((126..=130).contains(c), "{p:?}");
+    assert!((127..=129).contains(&p[1]), "{p:?}");
+    assert!(p[0] == p[1] && p[1] == p[2], "neutral grey picked up a tint: {p:?}");
+}
+
+/// The texture values of 10-bit limited-range levels: P010 keeps them in
+/// the top bits of 16, so they read as v·64/65535.
+#[test]
+fn levels_are_exact() {
+    let read10 = |v: u32| (v * 64) as f32 / 65535.0;
+    let (yo, ys, cs, cm) = yuv_levels(true, false);
+    assert!(((read10(64) - yo) * ys).abs() < 1e-6, "10-bit black");
+    assert!(((read10(940) - yo) * ys - 1.0).abs() < 1e-6, "10-bit white");
+    assert!((read10(512) - cm).abs() < 1e-7, "10-bit neutral chroma");
+    assert!(((read10(960) - cm) * cs - 0.5).abs() < 1e-6, "10-bit chroma maximum");
+    let (yo, ys, _, cm) = yuv_levels(false, false);
+    assert!(((235.0 / 255.0 - yo) * ys - 1.0).abs() < 1e-6, "8-bit white");
+    assert_eq!(cm, 128.0 / 255.0, "8-bit neutral chroma");
+}
+
+/// 10-bit white and grey through the GPU (where 16-bit textures exist).
+#[test]
+fn p010_white_is_white_and_grey_is_grey() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    if !device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+        return eprintln!("skipped: no 16-bit textures");
     }
+    let p010 = |y10: u16| {
+        let (w, h) = (64u32, 36u32);
+        let word = |v: u16| (v << 6).to_le_bytes();
+        let luma: Vec<u8> = (0..w * h).flat_map(|_| word(y10)).collect();
+        let chroma: Vec<u8> = (0..w * h / 2).flat_map(|_| word(512)).collect();
+        Arc::new(VideoFrame {
+            pts: Time::ZERO,
+            duration: Time::from_seconds(1),
+            width: w,
+            height: h,
+            format: PixelFormat::P010,
+            color: ColorTags { primaries: "bt709".into(), transfer: "bt709".into(), matrix: "bt709".into(), full_range: false },
+            data: FrameData::Cpu { planes: vec![luma, chroma], strides: vec![w as usize * 2, w as usize * 2] },
+        })
+    };
+    let mut c = Compositor::new(&device);
+    let mut shot = |f| {
+        c.render(&device, &queue, &plan(64, 36), &[layer(f, 100.0, 1.0)], (64, 36), WorkingSpace::AcesCg);
+        px(&c.read_output(&device, &queue).unwrap(), 32, 18)
+    };
+    assert_eq!(&shot(p010(940))[..3], &[255, 255, 255], "10-bit white");
+    let grey = shot(p010(505)); // (505-64)/876 = 0.503: clear of a rounding edge
+    assert!(grey[0] == grey[1] && grey[1] == grey[2] && (127..=129).contains(&grey[1]), "10-bit grey: {grey:?}");
 }
 
 #[test]

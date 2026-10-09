@@ -4,8 +4,12 @@
  * A plugin is C (or anything that exports C): no C++ types, exceptions or
  * allocator crossings at this boundary. Every struct starts with
  * `struct_size`; a newer host or plugin appends fields and checks the size
- * before reading them, so old binaries keep working. Capabilities beyond v1
- * are asked for by name through VeHost.get_extension.
+ * before reading them, so old binaries keep working. An appended field's
+ * zero value (0, NULL) must mean "not provided": that is what a reader sees
+ * when the other side's struct is older and shorter. In an array of structs
+ * (VeEffectDesc.params) every element has the same `struct_size`, which is
+ * the array's stride. Capabilities beyond v1 are asked for by name through
+ * VeHost.get_extension.
  *
  * The host owns parameters, keyframes, undo and UI. A plugin declares its
  * parameters and renders; it never draws interface.
@@ -122,7 +126,7 @@ typedef struct VeEffectDesc {
     const char *category;
     uint32_t major_version, minor_version;
     uint32_t flags;
-    const VeParamDesc *params;
+    const VeParamDesc *params; /* stride: params[0].struct_size */
     uint32_t param_count;
 
     /* GPU path (preferred): WGSL fragment shader source, or NULL. The host's

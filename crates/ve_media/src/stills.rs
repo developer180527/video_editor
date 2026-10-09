@@ -143,9 +143,17 @@ fn to_thumb(f: &VideoFrame) -> Option<Thumb> {
             } else {
                 planes[0][sy * strides[0] + sx] as f32 / 255.0
             };
-            let (cb, cr) = (sample(&planes[1], strides[1], sx / 2, sy / 2, 0) - 0.5, sample(&planes[1], strides[1], sx / 2, sy / 2, 1) - 0.5);
-            let y = (y - 16.0 / 255.0) * (255.0 / 219.0);
-            let (cb, cr) = (cb * (255.0 / 224.0), cr * (255.0 / 224.0));
+            // Limited range, as the textures read it (P010 values sit in the
+            // top 10 of 16 bits; 8-bit chroma is centred on 128, not 127.5).
+            let (yo, ys, cs, cm) = if deep {
+                let q = 64.0 / 65535.0;
+                (64.0 * q, 1.0 / (876.0 * q), 1.0 / (896.0 * q), 512.0 * q)
+            } else {
+                (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0, 128.0 / 255.0)
+            };
+            let (cb, cr) = (sample(&planes[1], strides[1], sx / 2, sy / 2, 0) - cm, sample(&planes[1], strides[1], sx / 2, sy / 2, 1) - cm);
+            let y = (y - yo) * ys;
+            let (cb, cr) = (cb * cs, cr * cs);
             let r = y + 1.5748 * cr;
             let g = y - 0.1873 * cb - 0.4681 * cr;
             let b = y + 1.8556 * cb;

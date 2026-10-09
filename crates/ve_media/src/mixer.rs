@@ -137,14 +137,24 @@ impl Mixer {
                 Ok(None) | Err(_) => s.ended = true,
             }
         }
+        // Volume and pan at both ends of this span, ramped per sample in
+        // between: a stepped gain (one value per block) buzzes audibly on
+        // fades. The next span starts where this one ends, so the ramp is
+        // continuous across blocks too.
         let clip_t = src_t - clip.source_range.start;
-        let gain = db_to_gain(param(clip, "ve.volume", "level", clip_t).unwrap_or(0.0));
-        let balance = (param(clip, "ve.panner", "balance", clip_t).unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0) as f32;
-        // Constant-power pan.
-        let angle = (balance + 1.0) * std::f32::consts::FRAC_PI_4;
-        let (gl, gr) = (gain * angle.cos() * std::f32::consts::SQRT_2, gain * angle.sin() * std::f32::consts::SQRT_2);
+        let span = Time((n as i128 * ve_time::TICKS_PER_SECOND as i128 / rate as i128) as i64);
+        let gains = |t: Time| {
+            let gain = db_to_gain(param(clip, "ve.volume", "level", t).unwrap_or(0.0));
+            let balance = (param(clip, "ve.panner", "balance", t).unwrap_or(0.0) / 100.0).clamp(-1.0, 1.0) as f32;
+            // Constant-power pan.
+            let angle = (balance + 1.0) * std::f32::consts::FRAC_PI_4;
+            (gain * angle.cos() * std::f32::consts::SQRT_2, gain * angle.sin() * std::f32::consts::SQRT_2)
+        };
+        let ((l0, r0), (l1, r1)) = (gains(clip_t), gains(clip_t + span));
         let take = n.min(s.buf.len() / 2);
         for i in 0..take {
+            let x = i as f32 / n as f32;
+            let (gl, gr) = (l0 + (l1 - l0) * x, r0 + (r1 - r0) * x);
             let (l, r) = (s.buf.pop_front().unwrap(), s.buf.pop_front().unwrap());
             out[(first + i) * 2] += l * gl;
             out[(first + i) * 2 + 1] += r * gr;
@@ -207,6 +217,50 @@ mod tests {
         fn open_encoder(&self, _: &Resolved, _: &EncoderSettings) -> Result<Box<dyn Encoder>, MediaError> {
             unimplemented!()
         }
+    }
+
+    /// A one-clip sequence of `Counting`'s constant 1.0 audio, with `volume`
+    /// as the clip's level parameter.
+    fn one_clip(volume: Param) -> (Project, Sequence) {
+        let mut p = Project::new("t");
+        let asset = Asset { id: AssetId::new(), name: "a".into(), media: MediaRef("a".into()), info: None };
+        let mut params = OrdMap::new();
+        params.insert("level".to_string(), volume);
+        let plugin = PluginRef { api: PluginApi::Builtin, id: "ve.volume".into(), major_version: 1 };
+        let mut track = Track::new(TrackKind::Audio, "A1");
+        track.clips.push_back(Arc::new(Clip {
+            id: ClipId::new(),
+            name: "c".into(),
+            source: ClipSource::Asset { asset: asset.id },
+            source_range: TimeRange::new(Time::ZERO, Time::from_seconds(60)),
+            timeline_start: Time::ZERO,
+            enabled: true,
+            link: None,
+            effects: [Arc::new(Effect { id: EffectId::new(), plugin, enabled: true, params })].into_iter().collect(),
+        }));
+        p.assets.insert(asset.id, Arc::new(asset));
+        let seq = Sequence { id: SequenceId::new(), name: "s".into(), format: SequenceFormat::default(), tracks: [Arc::new(track)].into_iter().collect() };
+        (p, seq)
+    }
+
+    #[test]
+    fn keyframed_volume_ramps_smoothly_within_and_across_blocks() {
+        // A fade from silence to full over 0.1 s (about five blocks).
+        let key = |t: Time, db: f64| Keyframe { time: t, value: Value::Float(db), interp: Interp::Linear };
+        let (p, seq) = one_clip(Param::Animated(vec![key(Time::ZERO, -60.0), key(Time::from_ticks(ve_time::TICKS_PER_SECOND / 10), 0.0)]));
+        let mut mixer = Mixer::new(Arc::new(crate::fakes::AnyFile), Arc::new(Counting::default()), 48_000);
+        let mut heard = Vec::new();
+        let mut out = vec![0f32; 1024 * 2];
+        for b in 0..6 {
+            mixer.render(&p, &seq, Time::from_ticks(b * 1024 * ve_time::TICKS_PER_SECOND / 48_000), &mut out);
+            heard.extend(out.iter().step_by(2).copied());
+        }
+        // The level rises sample by sample: no step bigger than the steepest
+        // part of the curve needs (a stepped gain jumps ~7% per block here).
+        let worst = heard.windows(2).map(|w| w[1] - w[0]).fold(0f32, f32::max);
+        assert!(worst < 0.002, "largest step between samples: {worst}");
+        assert!(heard.windows(2).all(|w| w[1] >= w[0] - 1e-6), "fade never dips");
+        assert!((heard.last().unwrap() - 1.0).abs() < 1e-3, "reaches full level");
     }
 
     #[test]

@@ -32,11 +32,13 @@ static HOST: abi::VeHost = abi::VeHost {
 /// One effect inside a loaded native library. Holds the library open.
 pub struct NativeEffect {
     _lib: Arc<dyn NativeLibrary>,
-    desc: *const abi::VeEffectDesc,
+    /// Our copy, at our layout (see `read_versioned`): reading the plugin's
+    /// own struct could run past the end of an older, smaller one.
+    desc: abi::VeEffectDesc,
 }
 
-// The descriptor is immutable static data in the plugin; instances are
-// created per use.
+// The descriptor's pointers are to immutable static data in the plugin;
+// instances are created per use.
 unsafe impl Send for NativeEffect {}
 unsafe impl Sync for NativeEffect {}
 
@@ -51,13 +53,10 @@ pub fn load(lib: Arc<dyn NativeLibrary>, static_name: Option<&str>) -> Result<Ve
     if desc.is_null() {
         return Err(PluginError::Declined);
     }
-    let desc = unsafe { &*desc };
+    let bad = |what: &str| PluginError::Malformed(lib_name.clone(), what.into());
+    let desc = unsafe { read_versioned(desc, abi::VE_PLUGIN_DESC_MIN_SIZE) }.ok_or_else(|| bad("VePluginDesc too small"))?;
     if desc.abi_version > abi::VE_ABI_VERSION || desc.abi_version == 0 {
         return Err(PluginError::AbiMismatch(lib_name, desc.abi_version, abi::VE_ABI_VERSION));
-    }
-    let bad = |what: &str| PluginError::Malformed(lib_name.clone(), what.into());
-    if (desc.struct_size as usize) < std::mem::size_of::<abi::VePluginDesc>() {
-        return Err(bad("VePluginDesc too small"));
     }
     let mut out = Vec::new();
     for i in 0..desc.effect_count as usize {
@@ -65,37 +64,67 @@ pub fn load(lib: Arc<dyn NativeLibrary>, static_name: Option<&str>) -> Result<Ve
         if e.is_null() {
             return Err(bad("null effect"));
         }
-        let ed = unsafe { &*e };
-        if (ed.struct_size as usize) < std::mem::size_of::<abi::VeEffectDesc>() {
-            return Err(bad("VeEffectDesc too small"));
-        }
+        let ed = unsafe { read_versioned(e, abi::VE_EFFECT_DESC_MIN_SIZE) }.ok_or_else(|| bad("VeEffectDesc too small"))?;
         let id = cstr(ed.id).ok_or_else(|| bad("effect without id"))?;
+        // An inline array of structs: its stride is the plugin's struct
+        // size (the first element's), not ours.
+        let stride = match ed.param_count {
+            0 => 0,
+            _ if ed.params.is_null() => return Err(bad("null parameters")),
+            _ => (unsafe { *(ed.params as *const u32) }) as usize,
+        };
         let params = (0..ed.param_count as usize)
-            .map(|p| param_info(unsafe { &*ed.params.add(p) }).ok_or_else(|| bad("parameter without id")))
+            .map(|p| {
+                let at = unsafe { (ed.params as *const u8).add(p * stride) } as *const abi::VeParamDesc;
+                let pd = unsafe { read_versioned(at, abi::VE_PARAM_DESC_MIN_SIZE) }.ok_or_else(|| bad("VeParamDesc too small"))?;
+                param_info(&pd).ok_or_else(|| bad("parameter without id"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let wgsl = cstr(ed.wgsl);
+        let (name, category, major_version) = (cstr(ed.name).unwrap_or(id.clone()), cstr(ed.category).unwrap_or_default(), ed.major_version);
+        let kind = match ed.kind {
+            abi::VeEffectKind::Filter => EffectKind::Filter,
+            abi::VeEffectKind::Transition => EffectKind::Transition,
+            abi::VeEffectKind::Generator => EffectKind::Generator,
+        };
         let implementation = if ed.render_cpu.is_some() {
-            Implementation::Native(Arc::new(NativeEffect { _lib: lib.clone(), desc: e }))
+            Implementation::Native(Arc::new(NativeEffect { _lib: lib.clone(), desc: ed }))
         } else if wgsl.is_some() {
             Implementation::ShaderOnly
         } else {
             return Err(bad("effect with neither wgsl nor render_cpu"));
         };
         out.push(EffectInfo {
-            plugin: PluginRef { api: PluginApi::Native, id: id.clone(), major_version: ed.major_version },
-            name: cstr(ed.name).unwrap_or(id),
-            category: cstr(ed.category).unwrap_or_default(),
-            kind: match ed.kind {
-                abi::VeEffectKind::Filter => EffectKind::Filter,
-                abi::VeEffectKind::Transition => EffectKind::Transition,
-                abi::VeEffectKind::Generator => EffectKind::Generator,
-            },
+            plugin: PluginRef { api: PluginApi::Native, id, major_version },
+            name,
+            category,
+            kind,
             params,
             wgsl,
             implementation,
         });
     }
     Ok(out)
+}
+
+/// Read a struct that begins with `struct_size`, whatever version the plugin
+/// was built against: fields both sides know are copied; fields an older,
+/// smaller struct lacks are zero (null / `None` / the 0 variant — "not
+/// provided", by the ABI's rule for appended fields); fields a newer, larger
+/// struct adds are ignored. `None` if smaller than `min` (the v1 layout).
+///
+/// # Safety
+/// `p` points to a readable struct of at least its own `struct_size` bytes.
+unsafe fn read_versioned<T>(p: *const T, min: usize) -> Option<T> {
+    let size = unsafe { *(p as *const u32) } as usize;
+    if size < min {
+        return None;
+    }
+    let mut out = std::mem::MaybeUninit::<T>::zeroed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr() as *mut u8, size.min(std::mem::size_of::<T>()));
+        Some(out.assume_init())
+    }
 }
 
 fn cstr(p: *const c_char) -> Option<String> {
@@ -157,7 +186,7 @@ impl NativeEffect {
         inputs: &mut [&mut CpuImage],
         output: &mut CpuImage,
     ) -> Result<(), PluginError> {
-        let d = unsafe { &*self.desc };
+        let d = &self.desc;
         let render = d.render_cpu.ok_or(PluginError::Unavailable("CPU rendering"))?;
         let instance = d.create.map(|c| unsafe { c(&HOST) }).unwrap_or(std::ptr::null_mut());
         let args = abi::VeRenderArgs {
@@ -180,5 +209,45 @@ impl NativeEffect {
         } else {
             Err(PluginError::RenderFailed(code))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    struct V1 {
+        struct_size: u32,
+        a: u64,
+    }
+
+    #[repr(C)]
+    struct V2 {
+        struct_size: u32,
+        a: u64,
+        b: *const c_char,
+        f: Option<extern "C" fn()>,
+    }
+
+    #[test]
+    fn older_structs_read_with_new_fields_absent() {
+        let old = V1 { struct_size: std::mem::size_of::<V1>() as u32, a: 7 };
+        let new: V2 = unsafe { read_versioned(&old as *const V1 as *const V2, std::mem::size_of::<V1>()) }.unwrap();
+        assert_eq!(new.a, 7);
+        assert!(new.b.is_null() && new.f.is_none());
+    }
+
+    #[test]
+    fn newer_structs_read_what_we_know() {
+        let newer = V2 { struct_size: std::mem::size_of::<V2>() as u32, a: 9, b: std::ptr::null(), f: None };
+        let ours: V1 = unsafe { read_versioned(&newer as *const V2 as *const V1, std::mem::size_of::<V1>()) }.unwrap();
+        assert_eq!(ours.a, 9);
+    }
+
+    #[test]
+    fn structs_below_version_one_are_refused() {
+        let tiny = V1 { struct_size: 4, a: 0 };
+        assert!(unsafe { read_versioned(&tiny as *const V1, std::mem::size_of::<V1>()) }.is_none());
     }
 }

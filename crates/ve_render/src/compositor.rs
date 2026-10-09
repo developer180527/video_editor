@@ -130,7 +130,8 @@ struct Decode {
     m1: vec4<f32>,
     m2: vec4<f32>,
     range: vec4<f32>,
-    // Columns of the source-primaries → working-space matrix.
+    // Columns of the source-primaries → working-space matrix; p0.w is the
+    // chroma midpoint as the texture reads it.
     p0: vec4<f32>,
     p1: vec4<f32>,
     p2: vec4<f32>,
@@ -184,7 +185,7 @@ fn shoulder(x: f32) -> f32 {
 @fragment
 fn fs_decode(i: VsOut) -> @location(0) vec4<f32> {
     let y = (textureSample(luma, samp, i.uv).r - d.range.x) * d.range.y;
-    let c = (textureSample(chroma, samp, i.uv).rg - vec2<f32>(0.5, 0.5)) * d.range.z;
+    let c = (textureSample(chroma, samp, i.uv).rg - vec2<f32>(d.p0.w, d.p0.w)) * d.range.z;
     let m = mat3x3<f32>(d.m0.xyz, d.m1.xyz, d.m2.xyz);
     let encoded = clamp(m * vec3<f32>(y, c.x, c.y), vec3<f32>(0.0), vec3<f32>(1.0));
     let p = mat3x3<f32>(d.p0.xyz, d.p1.xyz, d.p2.xyz);
@@ -317,6 +318,26 @@ fn ycbcr(matrix: &str, height: u32) -> M3 {
     };
     let kg = 1.0 - kr - kb;
     [[1.0, 0.0, 2.0 - 2.0 * kr], [1.0, -(2.0 - 2.0 * kb) * kb / kg, -(2.0 - 2.0 * kr) * kr / kg], [1.0, 2.0 - 2.0 * kb, 0.0]]
+}
+
+/// Luma offset, luma scale, chroma scale and chroma midpoint that turn
+/// normalised texture values into Y' in 0..1 and Cb/Cr in -0.5..0.5.
+/// `deep`: P010 in a 16-bit texture, i.e. a 10-bit value `v` reads as
+/// `v·64/65535` (it sits in the top bits), not `v/1023`. Otherwise 8-bit,
+/// reading `v/255`, whose midpoint is 128/255 — not 0.5.
+pub fn yuv_levels(deep: bool, full_range: bool) -> (f32, f32, f32, f32) {
+    if deep {
+        let q = 64.0 / 65535.0; // one 10-bit step, as the texture reads it
+        if full_range {
+            (0.0, 1.0 / (1023.0 * q), 1.0 / (1023.0 * q), 512.0 * q)
+        } else {
+            (64.0 * q, 1.0 / (876.0 * q), 1.0 / (896.0 * q), 512.0 * q)
+        }
+    } else if full_range {
+        (0.0, 1.0, 1.0, 128.0 / 255.0)
+    } else {
+        (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0, 128.0 / 255.0)
+    }
 }
 
 fn transfer_id(transfer: &str) -> f32 {
@@ -758,9 +779,12 @@ impl Compositor {
 
             // 1. Decode.
             let m = columns(ycbcr(&f.color.matrix, f.height));
-            let deep = f.format == PixelFormat::P010;
-            let (yo, ys, cs) = if f.color.full_range { (0.0, 1.0, 1.0) } else if deep { (64.0 / 1023.0, 1023.0 / 876.0, 1023.0 / 896.0) } else { (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0) };
-            let pm = columns(primaries_to(space, &f.color.primaries));
+            // How the planes in the textures read (16-bit textures hold
+            // P010 at full depth; otherwise everything is 8-bit).
+            let deep = self.slots[i].planes.as_ref().is_some_and(|p| p.key.2);
+            let (yo, ys, cs, cm) = yuv_levels(deep, f.color.full_range);
+            let mut pm = columns(primaries_to(space, &f.color.primaries));
+            pm[0][3] = cm; // the chroma midpoint rides in the spare lane
             let mut u = Vec::with_capacity(28);
             for c in m {
                 u.extend(c);

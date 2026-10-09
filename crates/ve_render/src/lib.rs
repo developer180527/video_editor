@@ -11,7 +11,7 @@
 
 mod compositor;
 
-pub use compositor::{quad, Blend, Compositor, Readback, GpuEffect, Motion, RenderLayer, TextureImporter, WorkingSpace, DISPLAY_FORMAT, WORKING_FORMAT};
+pub use compositor::{quad, yuv_levels, Blend, Compositor, Readback, GpuEffect, Motion, RenderLayer, TextureImporter, WorkingSpace, DISPLAY_FORMAT, WORKING_FORMAT};
 
 use std::sync::Arc;
 use ve_model::*;

@@ -120,6 +120,13 @@ pub struct VePluginDesc {
     pub effect_count: u32,
 }
 
+/// Smallest sizes the host accepts: the layouts of ABI version 1. Frozen —
+/// later versions only append, and fields a smaller (older) struct lacks read
+/// as zero/null, which every appended field must treat as "not provided".
+pub const VE_PLUGIN_DESC_MIN_SIZE: usize = std::mem::size_of::<VePluginDesc>();
+pub const VE_EFFECT_DESC_MIN_SIZE: usize = std::mem::size_of::<VeEffectDesc>();
+pub const VE_PARAM_DESC_MIN_SIZE: usize = std::mem::size_of::<VeParamDesc>();
+
 pub type VePluginEntryFn = unsafe extern "C" fn(*const VeHost) -> *const VePluginDesc;
 
 /// The entry symbol: `ve_plugin_entry`, or `ve_plugin_entry_<name>` for a
