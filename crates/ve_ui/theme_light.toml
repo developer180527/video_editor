@@ -1,0 +1,121 @@
+# The editor's light look: the same layout and accent as theme.toml, on
+# neutral light greys. Edges are grey, never black, so panels separate
+# without hard lines. Same format as theme.toml; every [reel] key is needed.
+
+name = "Cut Light"
+extends = "light"
+
+[palette]
+bg_app = "#d9d9d9"
+bg_panel = "#ececec"
+bg_inset = "#f7f7f7"
+surface = "#dcdcdc"
+surface_hover = "#d0d0d0"
+surface_active = "#c6c6c6"
+border = "#b4b4b4"
+border_strong = "#9c9c9c"
+accent = "#1f78d1"
+accent_hover = "#3a8be0"
+accent_active = "#185fa8"
+text = "#1e1e1e"
+text_muted = "#555555"
+text_faint = "#888888"
+text_on_accent = "#ffffff"
+shadow = "#00000033"
+
+[metrics]
+font_size = 11
+font_size_small = 10
+font_size_heading = 12
+radius = 2
+radius_large = 3
+space = 6
+control_height = 20
+row_height = 18
+tab_height = 24
+
+[button]
+height = 20
+radius = 2
+shadow = { color = "transparent" }
+
+[button_primary]
+shadow = { color = "transparent" }
+
+[selectable]
+height = 18
+radius = 2
+indicator_width = 0
+
+[text_input]
+height = 20
+radius = 2
+fill = "#fafafa"
+
+[panel]
+radius = 0
+border = "border"
+fill = "bg_panel"
+
+[tab]
+height = 24
+radius = 0
+accent_height = 2
+bar_fill = "#dedede"
+fill_active = "bg_panel"
+
+[scrollbar]
+width = 8
+width_hover = 11
+rest_alpha = 0.55
+
+[slider]
+track_height = 3
+knob_radius = 5.5
+
+[reel]
+# Neutral tones the panels are drawn in. Edges are mid greys, not black.
+line = "#b8b8b8"         # hairlines between panels, rows and headers
+inset = "#3c3c3c"        # wells: the monitor surround stays dark for the picture
+chrome_deep = "#dddddd"  # track-header column, scrollbar troughs
+chrome = "#e4e4e4"       # toolbars, the tool column, the app bar
+panel = "#e9e9e9"        # raised panel areas
+raised = "#d4d4d4"       # off buttons, patches
+raised_hi = "#c4c4c4"    # lit buttons, hover
+tick = "#9a9a9a"         # ruler ticks, scrollbar thumbs
+label = "#6a6a6a"        # small labels and scales
+text_soft = "#333333"
+bright = "#111111"
+
+# The timeline.
+ruler_bg = "#e2e2e2"
+track_bg = "#dadada"
+track_bg_alt = "#d4d4d4"
+track_head = "#e6e6e6"
+grid = "#c2c2c2"
+playhead = "#1f78d1"
+in_out = "#c9a414"
+in_out_range = "#c9a41426"
+timecode = "#1f6fc0"
+selected = "#111111"
+
+# Clips: the same hues, a touch lighter.
+video_fill = "#4a8cbc"
+video_head = "#2f6d99"
+audio_fill = "#4a86a1"
+audio_head = "#336a82"
+title_fill = "#b47ad8"
+title_head = "#8f55bd"
+nest_fill = "#58a07a"
+nest_head = "#3d7d5a"
+wave = "#d4ecf8"
+clip_text = "#ffffff"
+clip_border = "#2b4a63"
+transition = "#f2f2f2"
+transition_text = "#1e1e1e"
+badge = "#00000059"
+
+# Meters.
+meter_lo = "#3f9f45"
+meter_mid = "#c9b23c"
+meter_hi = "#d43f3f"

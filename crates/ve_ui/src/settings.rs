@@ -27,6 +27,33 @@ pub struct Settings {
     pub still_seconds: f32,
     /// Put the saved window layout back at startup.
     pub restore_layout: bool,
+    /// Light, dark, or as the system is set.
+    #[serde(default)]
+    pub theme: ThemeMode,
+}
+
+/// The Theme setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    /// The look to show, given whether the system is in dark mode (unknown
+    /// counts as dark: the editor's home look).
+    pub fn appearance(self, system_dark: Option<bool>) -> crate::theme::Appearance {
+        use crate::theme::Appearance;
+        match self {
+            ThemeMode::Light => Appearance::Light,
+            ThemeMode::Dark => Appearance::Dark,
+            ThemeMode::System if system_dark == Some(false) => Appearance::Light,
+            ThemeMode::System => Appearance::Dark,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -39,6 +66,7 @@ impl Default for Settings {
             transition_seconds: 1.0,
             still_seconds: 5.0,
             restore_layout: true,
+            theme: ThemeMode::System,
         }
     }
 }
@@ -86,6 +114,14 @@ pub(crate) fn panel(ui: &mut Ui, app: &mut EditorUi) {
     let t = ui.theme.clone();
     let mut s = app.settings.clone();
     let mut commit = false;
+
+    ui.text_with("Appearance", t.metrics.font_size_heading, t.palette.text);
+    let mut mode = s.theme as usize;
+    row(ui, "Theme", |ui| ui.combo_keyed("set-theme", &mut mode, &["System", "Light", "Dark"]));
+    let picked = [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark][mode.min(2)];
+    commit |= picked != s.theme;
+    s.theme = picked;
+    ui.space(10.0);
 
     ui.text_with("Playback", t.metrics.font_size_heading, t.palette.text);
     ui.text_with("Used when the editor starts.", t.metrics.font_size_small, t.palette.text_faint);

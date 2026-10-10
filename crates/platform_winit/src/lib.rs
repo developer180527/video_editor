@@ -157,11 +157,17 @@ pub struct ShellCtx {
     menu: Option<Vec<NativeMenu>>,
     windows: Vec<WindowRequest>,
     strip: Option<f32>,
+    dark: Option<bool>,
 }
 
 impl ShellCtx {
     pub fn file_dialog(&mut self, d: FileDialog) {
         self.dialogs.push(d);
+    }
+
+    /// Whether the OS is in dark mode (`None` where it cannot say).
+    pub fn system_dark(&self) -> Option<bool> {
+        self.dark
     }
 
     /// How this window is framed.
@@ -343,13 +349,27 @@ fn vec(p: PhysicalPosition<i32>) -> Vec2 {
     Vec2::new(p.x as f32, p.y as f32)
 }
 
-/// iOS reports the safe area as the inner size, but the layer covers the screen.
+/// iOS reports the safe area as the inner size, but the layer covers the
+/// screen. On macOS the size comes from AppKit itself (see `macos::backing`).
 fn surface_size(w: &Window) -> winit::dpi::PhysicalSize<u32> {
+    #[cfg(target_os = "macos")]
+    if let Some((x, y, _)) = macos::backing(w) {
+        return winit::dpi::PhysicalSize::new(x, y);
+    }
     if IOS {
         w.outer_size()
     } else {
         w.inner_size()
     }
+}
+
+/// Pixels per logical pixel: AppKit's own on macOS, winit's elsewhere.
+fn scale_of(w: &Window) -> f32 {
+    #[cfg(target_os = "macos")]
+    if let Some((_, _, s)) = macos::backing(w) {
+        return s as f32;
+    }
+    w.scale_factor() as f32
 }
 
 /// Top-left of the window's content in screen px: the dock hit-tests there.
@@ -533,11 +553,12 @@ impl<A: ShellApp> Shell<A> {
             w.config.height = px.height.max(1);
             w.surface.configure(&g.gpu.device, &w.config);
             w.presented = false;
+            w.rebuild = true;
         }
         let now = Instant::now();
         w.idle += (now - w.last).as_secs_f32();
         w.last = now;
-        let scale = w.window.scale_factor() as f32;
+        let scale = scale_of(&w.window);
         let info = FrameInfo {
             screen_size: Vec2::new(w.config.width as f32 / scale, w.config.height as f32 / scale),
             scale,
@@ -558,7 +579,8 @@ impl<A: ShellApp> Shell<A> {
             size: Vec2::new(w.config.width as f32 / scale, w.config.height as f32 / scale),
             maximized: w.window.is_maximized(),
         };
-        let mut ctx = ShellCtx { chrome, geometry, ..ShellCtx::default() };
+        let dark = w.window.theme().map(|t| t == winit::window::Theme::Dark);
+        let mut ctx = ShellCtx { chrome, geometry, dark, ..ShellCtx::default() };
         if w.rebuild || self.app.animating() || dock_wants || w.ui.needs_frame_for(&info, w.idle) {
             w.idle = 0.0;
             w.rebuild = false;
@@ -820,13 +842,21 @@ impl<A: ShellApp> ApplicationHandler<UserEvent> for Shell<A> {
         let origin = w.window.inner_position().ok().map(vec);
         match event {
             WindowEvent::CloseRequested => self.close(dock_id),
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Focused(_) => {
+            // Back from Mission Control, Exposé or another Space too: redraw
+            // at whatever size the window really is now.
+            WindowEvent::Resized(_)
+            | WindowEvent::ScaleFactorChanged { .. }
+            | WindowEvent::Focused(_)
+            | WindowEvent::Occluded(false)
+            | WindowEvent::ThemeChanged(_) => {
                 // AppKit puts the traffic lights back on these.
                 #[cfg(target_os = "macos")]
                 {
                     w.inset = macos::place_traffic_lights(&w.window, w.strip as f64);
-                    w.rebuild = true;
                 }
+                // Rebuilt, not just re-presented: the size, scale or theme
+                // the last build used may be stale.
+                w.rebuild = true;
                 w.window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.draw(wid),

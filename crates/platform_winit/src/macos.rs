@@ -24,6 +24,42 @@ fn ns_view(window: &Window) -> Option<Retained<NSView>> {
     unsafe { Retained::retain(h.ns_view.as_ptr().cast::<NSView>()) }
 }
 
+/// The content's true size in pixels and its backing scale, read from
+/// AppKit, with the Metal layer's scale kept in step. winit caches both and
+/// can be left stale — Mission Control, a display change — which would
+/// configure the swapchain at the wrong size and leave the picture small
+/// in the window's corner until the next resize.
+pub fn backing(window: &Window) -> Option<(u32, u32, f64)> {
+    let view = ns_view(window)?;
+    let win = view.window()?;
+    let scale: f64 = unsafe { msg_send![&*win, backingScaleFactor] };
+    if scale.is_nan() || scale <= 0.0 {
+        return None;
+    }
+    let size = view.frame().size;
+    // The CAMetalLayer wgpu draws into: the view's layer, or one of its
+    // sublayers. Its scale decides how big a drawable looks.
+    unsafe {
+        let layer: *mut AnyObject = msg_send![&*view, layer];
+        if let Some(layer) = layer.as_ref() {
+            let subs: *mut AnyObject = msg_send![layer, sublayers];
+            let count: usize = subs.as_ref().map_or(0, |s| msg_send![s, count]);
+            let mut all = vec![layer as *const AnyObject];
+            for i in 0..count {
+                let sub: *mut AnyObject = msg_send![&*subs, objectAtIndex: i];
+                all.push(sub);
+            }
+            for l in all.into_iter().filter_map(|l| l.as_ref()) {
+                let current: f64 = msg_send![l, contentsScale];
+                if current != scale {
+                    let _: () = msg_send![l, setContentsScale: scale];
+                }
+            }
+        }
+    }
+    Some(((size.width * scale).round() as u32, (size.height * scale).round() as u32, scale))
+}
+
 /// Centre the traffic lights vertically in a bar `bar_h` logical px tall at
 /// the window's top, and say how far right they reach (what the bar keeps
 /// clear). AppKit puts them back on some changes, so call after resizes,

@@ -263,6 +263,32 @@ fn tabs_scroll_when_they_do_not_fit() {
     enc.write_header().unwrap().write_image_data(&img.data).unwrap();
 }
 
+/// The light theme, chosen in Settings (and Settings itself in it).
+#[test]
+fn light_theme() {
+    let mut app = editor();
+    let mut s = app.settings().clone();
+    s.theme = ve_ui::ThemeMode::Light;
+    app.load_settings(s);
+    render(&mut app, 2000, 1129, "editor-light.png", |app| {
+        let snap = app.engine.snapshot();
+        app.view.selection = edit::linked(&snap, snap.active().unwrap().tracks[0].clips[0].id);
+    });
+    assert_eq!(app.appearance(), ve_ui::Appearance::Light);
+    render(&mut app, 2000, 1129, "settings-light.png", |app| {
+        let at = app.dock().find_tab(|t| *t == ve_ui::Tab::Settings).or_else(|| app.dock().find_tab(|t| *t == ve_ui::Tab::Info)).unwrap();
+        app.dock_mut().focus_tab(at);
+    });
+    // System, with the OS in dark mode: dark.
+    let mut s = app.settings().clone();
+    s.theme = ve_ui::ThemeMode::System;
+    app.load_settings(s);
+    app.set_system_dark(Some(true));
+    assert_eq!(app.appearance(), ve_ui::Appearance::Dark);
+    app.set_system_dark(Some(false));
+    assert_eq!(app.appearance(), ve_ui::Appearance::Light);
+}
+
 /// The title bar as the editor draws it: the window buttons it draws
 /// itself (Windows, Linux), and room left for the OS's (macOS).
 #[test]

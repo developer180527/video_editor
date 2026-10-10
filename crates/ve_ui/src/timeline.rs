@@ -1201,7 +1201,7 @@ fn transition(p: &mut Painter, r: Rect, t: &TransitionShot, size: f32, accent: C
     p.rect(r, REEL.transition.with_alpha(0.88), 2.0);
     p.line(Vec2::new(r.x + 1.0, r.bottom() - 1.0), Vec2::new(r.right() - 1.0, r.y + 1.0), 1.0, REEL.clip_border.with_alpha(0.55));
     if r.w > 60.0 && r.h > 12.0 {
-        p.text_centered(r, size - 1.0, REEL.line, t.name);
+        p.text_centered(r, size - 1.0, REEL.transition_text, t.name);
     }
     let (w, c) = if t.selected { (2.0, accent) } else { (1.0, REEL.clip_border) };
     p.rect_bordered(r, Color::TRANSPARENT, 2.0, w, c);

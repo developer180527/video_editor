@@ -127,6 +127,7 @@ impl ShellApp for App {
             Chrome::Leading { inset } => WindowControls::Leading { inset },
             Chrome::Drawn { maximized } => WindowControls::Drawn { maximized },
         };
+        self.ui.set_system_dark(shell.system_dark());
         self.ui.ui_framed(ui, surface, WindowFrame { controls, system_menu: shell.system_menu() });
         shell.set_title_strip(self.ui.title_strip(surface));
         if surface == SurfaceId::MAIN {

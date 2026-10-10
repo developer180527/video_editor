@@ -119,6 +119,7 @@ wave = "#7fc6e8"
 clip_text = "#dfe9f2"
 clip_border = "#0b1620"
 transition = "#d7d7d7"
+transition_text = "#070707"
 badge = "#00000080"
 
 # Meters.

@@ -41,8 +41,8 @@ use ve_time::{Rate, Time, Timecode};
 pub use dock::Tab;
 pub use features::Dialog;
 pub use menu::{Action, Entry, Menu, MenuItem};
-pub use settings::Settings;
-pub use theme::theme;
+pub use settings::{Settings, ThemeMode};
+pub use theme::{theme, theme_for, Appearance};
 
 /// Payload kind the shell uses for files dragged in from the OS, carrying
 /// `Vec<PathBuf>`. (Matches `libgui_winit::FILES`.)
@@ -246,6 +246,9 @@ pub struct EditorUi {
     window_actions: Vec<(SurfaceId, WindowAction)>,
     tab_height: f32,
     settings: Settings,
+    /// Whether the OS is in dark mode, as the host last said (`None`: it
+    /// cannot tell).
+    system_dark: Option<bool>,
     scopes: Option<ve_render::scopes::Scopes>,
     /// The scope image, as the UI shows it, and its view (for other windows).
     scope_tex: Option<TextureId>,
@@ -366,6 +369,7 @@ impl EditorUi {
             window_actions: Vec::new(),
             tab_height: 24.0,
             settings: Settings::default(),
+            system_dark: None,
             scopes: None,
             scope_tex: None,
             scope_view: None,
@@ -887,6 +891,13 @@ impl EditorUi {
     /// the editor draws the title bar (or keeps clear of the OS's buttons).
     pub fn ui_framed(&mut self, ui: &mut Ui, surface: SurfaceId, frame: WindowFrame) {
         self.frame = frame;
+        // The look the Theme setting asks for; every window follows it.
+        let look = self.appearance();
+        theme::set_appearance(look);
+        let want = theme::theme_for(look);
+        if ui.theme.name != want.name {
+            ui.theme = want;
+        }
         // A torn-off window's tab bar is its title bar: as tall as one. Each
         // window has its own `Ui`, so docked tabs keep the theme's height.
         if surface != SurfaceId::MAIN && frame.controls != WindowControls::Os {
@@ -968,6 +979,16 @@ impl EditorUi {
             ui.drag_ghost();
             ui.show_toasts();
         }
+    }
+
+    /// Tell the editor whether the OS is in dark mode (for Theme: System).
+    pub fn set_system_dark(&mut self, dark: Option<bool>) {
+        self.system_dark = dark;
+    }
+
+    /// The look showing now: the Theme setting, applied to the system's.
+    pub fn appearance(&self) -> Appearance {
+        self.settings.theme.appearance(self.system_dark)
     }
 
     pub fn ui(&mut self, ui: &mut Ui) {
