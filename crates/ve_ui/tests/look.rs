@@ -125,22 +125,26 @@ fn render(app: &mut EditorUi, w: u32, h: u32, name: &str, setup: impl Fn(&mut Ed
 }
 
 fn render_framed(app: &mut EditorUi, w: u32, h: u32, name: &str, frame: ve_ui::WindowFrame, setup: impl Fn(&mut EditorUi)) {
+    render_surface(app, w, h, name, SurfaceId::MAIN, frame, setup);
+}
+
+fn render_surface(app: &mut EditorUi, w: u32, h: u32, name: &str, surface: SurfaceId, frame: ve_ui::WindowFrame, setup: impl Fn(&mut EditorUi)) {
     let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
     ui.reserve(8_000);
     let info = FrameInfo { screen_size: Vec2::new(w as f32, h as f32), scale: 1.0, dt: 1.0 / 60.0 };
     for _ in 0..4 {
         ui.begin_frame(info);
-        app.ui_framed(&mut ui, SurfaceId::MAIN, frame);
+        app.ui_framed(&mut ui, surface, frame);
         let _ = ui.end_frame();
     }
     setup(app);
     for _ in 0..3 {
         ui.begin_frame(info);
-        app.ui_framed(&mut ui, SurfaceId::MAIN, frame);
+        app.ui_framed(&mut ui, surface, frame);
         let _ = ui.end_frame();
     }
     ui.begin_frame(info);
-    app.ui_framed(&mut ui, SurfaceId::MAIN, frame);
+    app.ui_framed(&mut ui, surface, frame);
     let out = ui.end_frame();
     let img = SoftRenderer::new().render_to_image(&out, w, h);
     drop(out);
@@ -155,7 +159,8 @@ fn render_framed(app: &mut EditorUi, w: u32, h: u32, name: &str, frame: ve_ui::W
     println!("{}", path.display());
     // Everything the frame showed, cached subtrees and modals included.
     let nodes = ui.frame_cost().described_nodes();
-    assert!(nodes > 120, "the editor did not build ({nodes} nodes)");
+    let min = if surface == SurfaceId::MAIN { 120 } else { 20 };
+    assert!(nodes > min, "the window did not build ({nodes} nodes)");
 }
 
 #[test]
@@ -205,6 +210,38 @@ fn title_bars() {
     assert!(checked(&app, "Program"), "back");
     app.perform(&ve_ui::Action::ResetWorkspace);
     assert!(checked(&app, "Timeline"));
+}
+
+/// Torn-off windows with the editor's own title bar (Windows, Linux): the
+/// tab bar is the title bar, taller than a docked one, with the window
+/// buttons at its right end.
+#[test]
+fn torn_off_windows() {
+    let mut app = editor();
+    let drawn = ve_ui::WindowFrame { controls: ve_ui::WindowControls::Drawn { maximized: false }, system_menu: false };
+    let floating = |app: &EditorUi, tab: ve_ui::Tab| {
+        app.dock()
+            .surfaces()
+            .iter()
+            .find(|s| s.floating && s.first_tab() == Some(&tab))
+            .map(|s| s.id)
+            .expect("a window for the panel")
+    };
+    // As if torn off: out of the main window, into one of its own.
+    app.perform(&ve_ui::Action::TogglePanel(ve_ui::Tab::Program));
+    app.open_floating(ve_ui::Tab::Program, Vec2::new(960.0, 600.0));
+    let program = floating(&app, ve_ui::Tab::Program);
+    render_surface(&mut app, 960, 600, "torn-off-program.png", program, drawn, |_| {});
+    app.open_floating(ve_ui::Tab::Settings, Vec2::new(560.0, 520.0));
+    let settings = floating(&app, ve_ui::Tab::Settings);
+    render_surface(&mut app, 560, 520, "settings-window.png", settings, drawn, |_| {});
+    assert_eq!(app.title_strip(settings), ve_ui::FLOATING_TAB_HEIGHT, "a torn-off title bar is the tall one");
+    // The layout survives a round trip, torn-off windows included.
+    let saved = app.layout_toml().expect("layout");
+    app.perform(&ve_ui::Action::ResetWorkspace);
+    assert!(app.dock().surfaces().len() == 1);
+    assert!(app.restore_layout(&saved));
+    assert_eq!(app.dock().surfaces().len(), 3);
 }
 
 fn frame(ui: &mut Ui, app: &mut EditorUi) {

@@ -42,6 +42,9 @@ pub enum Action {
     NewTitle,
     NewColorMatte,
     NewBars,
+    OpenSettings,
+    /// Keep the current window layout for the next start.
+    SaveLayout,
     /// Show a panel that is closed, or close one that is open.
     TogglePanel(Tab),
     ResetWorkspace,
@@ -123,7 +126,9 @@ impl EditorUi {
             .item("Remove Proxy", Action::RemoveProxy, None, has_proxy)
             .item("Link Media…", Action::LinkMedia, None, asset.is_some())
             .sep()
-            .on("Export Media…", Action::Export, primary(Key::M));
+            .on("Export Media…", Action::Export, primary(Key::M))
+            .sep()
+            .on("Settings…", Action::OpenSettings, primary(Key::Comma));
         out.push(b.menu("File"));
 
         let undo = self.st.undo_label.clone().map_or("Undo".into(), |l| format!("Undo {l}"));
@@ -171,7 +176,7 @@ impl EditorUi {
         for tab in Tab::ALL {
             b.check(tab.name(), Action::TogglePanel(tab), open.contains(&tab));
         }
-        b.sep().on("Reset Workspace", Action::ResetWorkspace, None);
+        b.sep().on("Save Window Layout", Action::SaveLayout, None).on("Reset Workspace", Action::ResetWorkspace, None);
         out.push(b.menu("View"));
         out
     }
@@ -225,6 +230,8 @@ impl EditorUi {
             Action::NewTitle => self.new_generator(intrinsic::TITLE, self.playhead, None),
             Action::NewColorMatte => self.new_generator(intrinsic::COLOR_MATTE, self.playhead, None),
             Action::NewBars => self.new_generator(intrinsic::BARS, self.playhead, None),
+            Action::OpenSettings => self.open_floating(Tab::Settings, Vec2::new(560.0, 520.0)),
+            Action::SaveLayout => self.requests.push(HostRequest::SaveLayout),
             Action::TogglePanel(tab) => dock::toggle_tab(&mut self.dock, *tab),
             Action::ResetWorkspace => dock::reset(&mut self.dock, self.touch),
         }

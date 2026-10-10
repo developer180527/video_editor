@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 toml.workspace = true
+serde.workspace = true
 ve_time.workspace = true
 ve_model.workspace = true
 ve_engine.workspace = true

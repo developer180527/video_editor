@@ -18,10 +18,11 @@ pub enum Tab {
     MediaBrowser,
     Info,
     Timeline,
+    Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 10] = [
+    pub const ALL: [Tab; 11] = [
         Tab::Source,
         Tab::EffectControls,
         Tab::AudioClipMixer,
@@ -32,6 +33,7 @@ impl Tab {
         Tab::MediaBrowser,
         Tab::Info,
         Tab::Timeline,
+        Tab::Settings,
     ];
 
     /// Identity in a saved layout: a name, never a position.
@@ -47,6 +49,7 @@ impl Tab {
             Tab::MediaBrowser => "media-browser",
             Tab::Info => "info",
             Tab::Timeline => "timeline",
+            Tab::Settings => "settings",
         })
         .0
     }
@@ -64,6 +67,7 @@ impl Tab {
             Tab::MediaBrowser => "Media Browser",
             Tab::Info => "Info",
             Tab::Timeline => "Timeline",
+            Tab::Settings => "Settings",
         }
     }
 
@@ -114,6 +118,7 @@ impl TabViewer for Viewer<'_> {
             Tab::MediaBrowser => "Media Browser".into(),
             Tab::Info => "Info".into(),
             Tab::Timeline => seq,
+            Tab::Settings => "Settings".into(),
         }
     }
 
@@ -122,7 +127,7 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn scroll(&self, tab: &Tab) -> bool {
-        matches!(tab, Tab::Metadata | Tab::MediaBrowser | Tab::Info | Tab::Effects)
+        matches!(tab, Tab::Metadata | Tab::MediaBrowser | Tab::Info | Tab::Effects | Tab::Settings)
     }
 
     fn padding(&self, tab: &Tab) -> Insets {
@@ -140,6 +145,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Timeline => timeline::panel(ui, self.app),
             Tab::Effects => project::effects_list(ui, self.app),
             Tab::Info => info(ui, self.app),
+            Tab::Settings => crate::settings::panel(ui, self.app),
             other => placeholder(ui, &self.title(other)),
         }
     }

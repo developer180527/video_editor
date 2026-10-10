@@ -610,8 +610,11 @@ dependencies = [
  "libgui_keymap",
  "libgui_wgpu",
  "platform_winit",
+ "serde",
+ "toml",
  "ve_engine",
  "ve_model",
+ "ve_ports",
  "ve_ui",
 ]
 
@@ -2793,6 +2796,7 @@ dependencies = [
  "libgui_wgpu",
  "platform_headless",
  "png",
+ "serde",
  "toml",
  "ve_engine",
  "ve_model",

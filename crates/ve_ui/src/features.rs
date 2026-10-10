@@ -51,10 +51,6 @@ pub const TRANSITION_PAYLOAD: &str = "transition";
 /// Payload kind for a generator dragged from the Effects panel, carrying its id (`String`).
 pub const GENERATOR_PAYLOAD: &str = "generator";
 
-/// How long a new transition is.
-const TRANSITION_SECONDS: i64 = 1;
-/// How long a new generator clip is.
-const GENERATOR_SECONDS: i64 = 5;
 
 impl EditorUi {
     pub(crate) fn active_seq(&self) -> Option<Arc<Sequence>> {
@@ -171,7 +167,7 @@ impl EditorUi {
     /// than the clips allow.
     fn new_transition(&self, track: &Track, clip: &Clip, edge: Edge, plugin: PluginRef) -> Option<(ClipId, Edge, Transition)> {
         let i = track.clips.iter().position(|c| c.id == clip.id)?;
-        let full = self.rate().frame_to_time(self.rate().nominal_fps() as i64 * TRANSITION_SECONDS);
+        let full = Time::from_seconds_f64(self.settings().transition_seconds as f64).round_to_frame(self.rate());
         // The tail of a clip followed directly by another is that clip's cut.
         let (owner, edge) = match edge {
             Edge::End => match track.clips.get(i + 1).filter(|n| n.timeline_start == clip.timeline_range().end()) {
@@ -354,7 +350,7 @@ impl EditorUi {
             self.errors.push("Target a video track first.".into());
             return;
         };
-        let duration = self.rate().frame_to_time(self.rate().nominal_fps() as i64 * GENERATOR_SECONDS);
+        let duration = Time::from_seconds_f64(self.settings().still_seconds as f64).round_to_frame(self.rate());
         let Some(clip) = ve_engine::make_generator_clip(&self.st.plugins, &seq.format, &intrinsic::plugin_ref(id), duration) else { return };
         self.view.selection = vec![clip.id];
         let r = edit::overwrite(self.snap(), seq.id, at, &[(track, Arc::new(clip))]);

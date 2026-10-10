@@ -137,12 +137,23 @@ pub enum WindowRequest {
     Close,
 }
 
+/// Where a window is and how big, as an app saves it to put back later.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowGeometry {
+    /// Outer top-left, physical screen px (`None` where the OS won't say).
+    pub position: Option<(i32, i32)>,
+    /// Inner size, logical px.
+    pub size: Vec2,
+    pub maximized: bool,
+}
+
 /// What the shell tells the app about the window being built, and what the
 /// app asks of the shell during the frame.
 #[derive(Default)]
 pub struct ShellCtx {
     dialogs: Vec<FileDialog>,
     chrome: Chrome,
+    geometry: WindowGeometry,
     menu: Option<Vec<NativeMenu>>,
     windows: Vec<WindowRequest>,
     strip: Option<f32>,
@@ -156,6 +167,11 @@ impl ShellCtx {
     /// How this window is framed.
     pub fn chrome(&self) -> Chrome {
         self.chrome
+    }
+
+    /// Where this window is and how big.
+    pub fn geometry(&self) -> WindowGeometry {
+        self.geometry
     }
 
     /// The menus belong in the system menu bar ([`ShellCtx::set_menu`]),
@@ -209,13 +225,23 @@ pub struct ShellConfig {
     pub title: String,
     /// Initial window size in logical px (ignored on iPadOS: full screen).
     pub size: Vec2,
+    /// Initial outer position, physical px (`None`: the OS decides).
+    pub position: Option<(i32, i32)>,
+    pub maximized: bool,
     pub theme: Theme,
     pub font: &'static [u8],
 }
 
 impl Default for ShellConfig {
     fn default() -> Self {
-        ShellConfig { title: "Video Editor".into(), size: Vec2::new(1860.0, 1040.0), theme: Theme::dark(), font: DEFAULT_FONT }
+        ShellConfig {
+            title: "Video Editor".into(),
+            size: Vec2::new(1860.0, 1040.0),
+            position: None,
+            maximized: false,
+            theme: Theme::dark(),
+            font: DEFAULT_FONT,
+        }
     }
 }
 
@@ -352,6 +378,12 @@ impl<A: ShellApp> Shell<A> {
         }
         if !IOS {
             attrs = attrs.with_inner_size(LogicalSize::new(size.x, size.y));
+        }
+        if main && !IOS {
+            if let Some((x, y)) = self.cfg.position {
+                attrs = attrs.with_position(PhysicalPosition::new(x, y));
+            }
+            attrs = attrs.with_maximized(self.cfg.maximized);
         }
         if let Some(p) = inner_pos {
             let outer = p - self.decoration;
@@ -521,7 +553,12 @@ impl<A: ShellApp> Shell<A> {
         } else {
             Chrome::Drawn { maximized: w.window.is_maximized() }
         };
-        let mut ctx = ShellCtx { chrome, ..ShellCtx::default() };
+        let geometry = WindowGeometry {
+            position: w.window.outer_position().ok().map(|p| (p.x, p.y)),
+            size: Vec2::new(w.config.width as f32 / scale, w.config.height as f32 / scale),
+            maximized: w.window.is_maximized(),
+        };
+        let mut ctx = ShellCtx { chrome, geometry, ..ShellCtx::default() };
         if w.rebuild || self.app.animating() || dock_wants || w.ui.needs_frame_for(&info, w.idle) {
             w.idle = 0.0;
             w.rebuild = false;

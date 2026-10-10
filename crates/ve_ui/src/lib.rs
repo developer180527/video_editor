@@ -13,6 +13,7 @@ mod effects;
 mod features;
 mod menu;
 mod program;
+mod settings;
 mod project;
 pub mod theme;
 mod timeline;
@@ -31,6 +32,7 @@ use ve_time::{Rate, Time, Timecode};
 pub use dock::Tab;
 pub use features::Dialog;
 pub use menu::{Action, Entry, Menu, MenuItem};
+pub use settings::Settings;
 pub use theme::theme;
 
 /// Payload kind the shell uses for files dragged in from the OS, carrying
@@ -52,6 +54,11 @@ pub enum HostRequest {
     AttachProxy(AssetId),
     /// Pick the file `asset` now lives at; answer with [`EditorUi::relink`].
     RelinkMedia(AssetId),
+    /// Store [`EditorUi::settings_toml`]: the settings changed.
+    SaveSettings,
+    /// Store [`EditorUi::layout_toml`] and the windows' frames, to put back
+    /// at the next start with [`EditorUi::restore_layout`].
+    SaveLayout,
 }
 
 /// The timeline tools, in the order of the tool column.
@@ -84,6 +91,9 @@ pub enum WindowAction {
     ToggleMaximize,
     Close,
 }
+
+/// The tab bar's height in a torn-off window, where it is the title bar.
+pub const FLOATING_TAB_HEIGHT: f32 = 36.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -170,6 +180,7 @@ pub struct EditorUi {
     frame: WindowFrame,
     window_actions: Vec<(SurfaceId, WindowAction)>,
     tab_height: f32,
+    settings: Settings,
     /// The engine's state as of this frame.
     st: Published,
     playhead: Time,
@@ -232,6 +243,7 @@ impl EditorUi {
             frame: WindowFrame::default(),
             window_actions: Vec::new(),
             tab_height: 24.0,
+            settings: Settings::default(),
             st,
             playhead: Time::ZERO,
             errors: Vec::new(),
@@ -505,6 +517,53 @@ impl EditorUi {
         }
     }
 
+    /// Show the user something the host could not do (a toast).
+    pub fn report_error(&mut self, message: String) {
+        self.errors.push(message);
+    }
+
+    /// The dock layout (panes, tabs, torn-off windows' sizes) as the host
+    /// stores it.
+    pub fn layout_toml(&mut self) -> Option<String> {
+        let dock = std::mem::replace(&mut self.dock, DockState::new());
+        let text = dock.layout(&dock::Viewer { app: self }).to_toml().ok();
+        self.dock = dock;
+        text
+    }
+
+    /// Put back a layout from [`EditorUi::layout_toml`]. Panels it never
+    /// mentioned (added since) join the main window, apart from Settings,
+    /// which opens on request. False if the text is not a layout.
+    pub fn restore_layout(&mut self, text: &str) -> bool {
+        let Ok(saved) = DockLayout::from_toml(text) else { return false };
+        let Ok(report) = self.dock.restore(&saved, Tab::from_key) else { return false };
+        for key in report.missing_from(Tab::ALL.iter().map(|t| t.key())) {
+            if let Some(tab) = Tab::from_key(key).filter(|t| *t != Tab::Settings) {
+                self.dock.add_tab(SurfaceId::MAIN, tab);
+            }
+        }
+        true
+    }
+
+    /// Open `tab` in a window of its own (a floating panel on a tablet),
+    /// or bring it forward where it already is.
+    pub fn open_floating(&mut self, tab: Tab, size: Vec2) {
+        if let Some(at) = self.dock.find_tab(|t| *t == tab) {
+            self.dock.focus_tab(at);
+            return;
+        }
+        let dock = std::mem::replace(&mut self.dock, DockState::new());
+        let mut layout = dock.layout(&dock::Viewer { app: self });
+        self.dock = dock;
+        layout.surfaces.push(SurfaceLayout {
+            floating: true,
+            size,
+            rect: Rect::new(120.0, 90.0, size.x, size.y),
+            root: Some(NodeLayout::Leaf { tabs: vec![tab.key()], active: 0, titles: Vec::new() }),
+        });
+        let _ = self.dock.restore(&layout, Tab::from_key);
+    }
+
     /// The height of the strip at the top of a window that is its title bar:
     /// press empty space there to move the window.
     pub fn title_strip(&self, surface: SurfaceId) -> f32 {
@@ -530,6 +589,11 @@ impl EditorUi {
     /// the editor draws the title bar (or keeps clear of the OS's buttons).
     pub fn ui_framed(&mut self, ui: &mut Ui, surface: SurfaceId, frame: WindowFrame) {
         self.frame = frame;
+        // A torn-off window's tab bar is its title bar: as tall as one. Each
+        // window has its own `Ui`, so docked tabs keep the theme's height.
+        if surface != SurfaceId::MAIN && frame.controls != WindowControls::Os {
+            ui.theme.tab.height = FLOATING_TAB_HEIGHT;
+        }
         self.tab_height = ui.theme.tab.height;
         if surface != SurfaceId::MAIN {
             self.shared.retain(|id, _| self.dock.surface(*id).is_some());
@@ -639,6 +703,9 @@ impl EditorUi {
         }
         if cmd(ui, Key::M) {
             self.show_export = true;
+        }
+        if cmd(ui, Key::Comma) {
+            self.open_floating(Tab::Settings, Vec2::new(560.0, 520.0));
         }
         if cmd(ui, Key::R) {
             self.open_speed_dialog();
