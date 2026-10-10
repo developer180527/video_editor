@@ -10,7 +10,7 @@ use ve_engine::{Command, TrackState};
 use ve_model::*;
 
 use crate::theme::REEL;
-use crate::EditorUi;
+use crate::{drag_from, DragStart, EditorUi};
 
 const STRIP_W: f32 = 92.0;
 /// The fader's top, in dB.
@@ -72,7 +72,7 @@ fn strip(ui: &mut Ui, app: &mut EditorUi, sequence: SequenceId, track: &Track) {
     let strip_id = ui.make_id(("strip", track.id));
     ui.container_id(strip_id, col, Frame { fill: REEL.panel, ..Frame::none() }, |ui| {
         // Pan.
-        let pan_r = knob(ui, ("pan", track.id), pan);
+        let pan_r = knob(ui, &mut app.drag_start, ("pan", track.id), pan);
         ui.text_with(&pan_text(pan), t.metrics.font_size_small, REEL.timecode);
         // Mute and solo.
         let mut state = TrackState::of(track);
@@ -91,7 +91,7 @@ fn strip(ui: &mut Ui, app: &mut EditorUi, sequence: SequenceId, track: &Track) {
             app.run(Command::SetTrackState { sequence, track: track.id, state });
         }
         // Fader and meter.
-        let fader_r = fader(ui, ("fader", track.id), volume, meter);
+        let fader_r = fader(ui, &mut app.drag_start, ("fader", track.id), volume, meter);
         ui.text_with(&db_text(volume), t.metrics.font_size_small, REEL.timecode);
         ui.text_with(&track.name, t.metrics.font_size, t.palette.text);
 
@@ -143,12 +143,12 @@ struct DragResult {
 }
 
 /// A pan knob: drag up/right to turn right; -1..1.
-fn knob(ui: &mut Ui, key: impl std::hash::Hash, value: f32) -> DragResult {
+fn knob(ui: &mut Ui, start: &mut Option<DragStart>, key: impl std::hash::Hash, value: f32) -> DragResult {
     let id = ui.make_id(key);
     let r = ui.interact_drag(id);
     let mut out = DragResult { released: r.released, reset: r.double_clicked, ..Default::default() };
-    if r.active && (r.drag_delta.x != 0.0 || r.drag_delta.y != 0.0) {
-        out.value = Some((value + (r.drag_delta.x - r.drag_delta.y) / 100.0).clamp(-1.0, 1.0));
+    if let Some((v0, d)) = drag_from(start, &r, [value, 0.0]) {
+        out.value = Some((v0[0] + (d.x - d.y) / 100.0).clamp(-1.0, 1.0));
     }
     if r.hovered {
         ui.cursor = Cursor::ResizeHorizontal;
@@ -192,13 +192,13 @@ fn toggle(ui: &mut Ui, key: impl std::hash::Hash, label: &str, on: bool, color: 
 }
 
 /// A fader with the track's stereo meter beside it; `value` in dB.
-fn fader(ui: &mut Ui, key: impl std::hash::Hash, value: f32, meter: [f32; 2]) -> DragResult {
+fn fader(ui: &mut Ui, start: &mut Option<DragStart>, key: impl std::hash::Hash, value: f32, meter: [f32; 2]) -> DragResult {
     let id = ui.make_id(key);
     let r = ui.interact_drag(id);
     let mut out = DragResult { released: r.released, reset: r.double_clicked, ..Default::default() };
     let travel = (r.rect.h - 16.0).max(1.0);
-    if r.active && r.drag_delta.y != 0.0 {
-        out.value = Some((fader_pos(value) - r.drag_delta.y / travel).clamp(0.0, 1.0));
+    if let Some((v0, d)) = drag_from(start, &r, [fader_pos(value), 0.0]) {
+        out.value = Some((v0[0] - d.y / travel).clamp(0.0, 1.0));
     }
     if r.hovered {
         ui.cursor = Cursor::ResizeVertical;

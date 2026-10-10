@@ -95,6 +95,42 @@ pub enum WindowAction {
     Close,
 }
 
+/// Where the drag of a knob, fader or wheel began: the pointer, and the
+/// control's value then. Drags are measured from here, never by adding up
+/// per-frame movement: the press frame's movement (the pointer travelling
+/// to the control) would otherwise nudge a control that was only clicked.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DragStart {
+    pos: Vec2,
+    value: [f32; 2],
+    moved: bool,
+}
+
+/// How far (logical px) the pointer must move before a press becomes a drag.
+const DRAG_DEAD_ZONE: f32 = 3.0;
+
+/// For a control's response `r` and its current `value`: while it is being
+/// dragged past the dead zone, the value at the press and the pointer's
+/// offset from where it was pressed.
+pub(crate) fn drag_from(start: &mut Option<DragStart>, r: &Response, value: [f32; 2]) -> Option<([f32; 2], Vec2)> {
+    if r.pressed {
+        *start = Some(DragStart { pos: r.mouse_pos, value, moved: false });
+    }
+    if !r.active {
+        if r.released {
+            *start = None;
+        }
+        return None;
+    }
+    let s = start.as_mut()?;
+    let d = Vec2::new(r.mouse_pos.x - s.pos.x, r.mouse_pos.y - s.pos.y);
+    if !s.moved && d.x.abs().max(d.y.abs()) < DRAG_DEAD_ZONE {
+        return None;
+    }
+    s.moved = true;
+    Some((s.value, d))
+}
+
 /// The tab bar's height in a torn-off window, where it is the title bar.
 pub const FLOATING_TAB_HEIGHT: f32 = 36.0;
 
@@ -201,6 +237,8 @@ pub struct EditorUi {
     gesture: u64,
     /// The gesture of the slider or wheel being dragged.
     pub(crate) drag_gesture: u64,
+    /// Where the knob, fader or wheel being dragged was pressed.
+    pub(crate) drag_start: Option<DragStart>,
     /// A grade effect added but maybe not in the snapshot yet.
     pub(crate) pending_grade: Option<(ClipId, EffectId)>,
     /// The engine's state as of this frame.
@@ -276,6 +314,7 @@ impl EditorUi {
             loudness: ve_engine::Loudness::default(),
             gesture: 0,
             drag_gesture: 0,
+            drag_start: None,
             pending_grade: None,
             st,
             playhead: Time::ZERO,
@@ -944,5 +983,40 @@ impl EditorUi {
             false => ve_engine::Command::Batch { label: e.label(), commands: adds.into_iter().chain([e]).collect() },
         });
         self.run_edit(r);
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+
+    fn at(x: f32, y: f32, pressed: bool, active: bool, released: bool, delta: Vec2) -> Response {
+        Response { mouse_pos: Vec2::new(x, y), pressed, active, released, drag_delta: delta, ..Default::default() }
+    }
+
+    #[test]
+    fn a_click_never_moves_a_control() {
+        let mut start = None;
+        // The press frame carries the pointer's travel to the control (the
+        // old code added this to the fader: the -0.2 dB drift).
+        assert_eq!(drag_from(&mut start, &at(100.0, 200.0, true, true, false, Vec2::new(0.0, 3.0)), [0.8, 0.0]), None);
+        // Jitter inside the dead zone while held: still nothing.
+        assert_eq!(drag_from(&mut start, &at(101.0, 202.0, false, true, false, Vec2::new(1.0, 2.0)), [0.8, 0.0]), None);
+        // Released: nothing, and the drag is over.
+        assert_eq!(drag_from(&mut start, &at(101.0, 202.0, false, false, true, Vec2::ZERO), [0.8, 0.0]), None);
+        assert!(start.is_none());
+    }
+
+    #[test]
+    fn a_drag_is_measured_from_the_press() {
+        let mut start = None;
+        drag_from(&mut start, &at(100.0, 200.0, true, true, false, Vec2::new(5.0, 5.0)), [0.5, 0.0]);
+        // Past the dead zone: offset from the press point, from the value
+        // at the press, however the frames' deltas add up.
+        let (v0, d) = drag_from(&mut start, &at(100.0, 150.0, false, true, false, Vec2::new(0.0, -50.0)), [0.5, 0.0]).unwrap();
+        assert_eq!((v0, d), ([0.5, 0.0], Vec2::new(0.0, -50.0)));
+        // Once moving, small offsets count (back towards the start).
+        let (_, d) = drag_from(&mut start, &at(100.0, 199.0, false, true, false, Vec2::new(0.0, 49.0)), [0.9, 0.0]).unwrap();
+        assert_eq!(d, Vec2::new(0.0, -1.0));
     }
 }

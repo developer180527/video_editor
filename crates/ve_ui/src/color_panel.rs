@@ -172,11 +172,12 @@ fn slider(ui: &mut Ui, app: &mut EditorUi, key: &str, label: &str, value: f32, m
             app.drag_gesture = app.next_gesture();
         }
         let gesture = app.drag_gesture;
-        let frac = |x: f32| ((x - r.rect.x - 6.0) / (r.rect.w - 12.0).max(1.0)).clamp(0.0, 1.0);
+        let span = (r.rect.w - 12.0).max(1.0);
         if r.double_clicked {
             out = Some((default, app.next_gesture()));
-        } else if r.active && (r.pressed || r.drag_delta.x != 0.0) {
-            let v = min + (max - min) * frac(r.mouse_pos.x);
+        } else if let Some((v0, d)) = crate::drag_from(&mut app.drag_start, &r, [value, 0.0]) {
+            // Moves by how far it is dragged; a click alone changes nothing.
+            let v = (v0[0] + d.x / span * (max - min)).clamp(min, max);
             // Snap to the default near it, so "none" is easy to find.
             let v = if ((v - default) / (max - min)).abs() < 0.01 { default } else { v };
             if v != value {
@@ -229,9 +230,9 @@ fn wheel(ui: &mut Ui, app: &mut EditorUi, key: &str, value: [f32; 2]) -> Option<
     let mut out = None;
     if r.double_clicked {
         out = Some(([0.0, 0.0], app.next_gesture()));
-    } else if r.active && (r.drag_delta.x != 0.0 || r.drag_delta.y != 0.0) {
+    } else if let Some((v0, d)) = crate::drag_from(&mut app.drag_start, &r, value) {
         // Fine control: the puck moves at a quarter of the pointer's speed.
-        let (mut x, mut y) = (value[0] + r.drag_delta.x / radius * 0.25, value[1] - r.drag_delta.y / radius * 0.25);
+        let (mut x, mut y) = (v0[0] + d.x / radius * 0.25, v0[1] - d.y / radius * 0.25);
         let len = (x * x + y * y).sqrt();
         if len > 1.0 {
             (x, y) = (x / len, y / len);
