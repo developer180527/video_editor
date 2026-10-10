@@ -164,7 +164,18 @@ fn av1_mkv() {
         return eprintln!("skipped: no libsvtav1");
     }
     let p = need!(numbered("av1.mkv", "640x360", "25", 2.0, &["-c:v", "libsvtav1", "-crf", "20", "-g", "25"]), "av1 encode failed");
-    frame_exact(&p, Rate::FPS_25, &[0, 24, 25, 40]);
+    // AV1 decodes in hardware where there is an AV1 decoder (Apple M3/A17
+    // and later, recent GPUs); elsewhere it must say so plainly, not report
+    // a damaged file. (Software AV1 — dav1d — is not built in yet.)
+    let mut d = Ffmpeg::new().open_video(&res(&p)).unwrap();
+    match d.next_frame() {
+        Ok(_) => frame_exact(&p, Rate::FPS_25, &[0, 24, 25, 40]),
+        Err(ve_ports::MediaError::Unsupported(m)) => {
+            assert!(m.contains("av1"), "{m}");
+            eprintln!("skipped: {m}");
+        }
+        Err(e) => panic!("AV1 failed as if damaged: {e}"),
+    }
 }
 
 /// DV-style anamorphic: 720×480 stored, 16:9 shown (pixels 32:27 wide).

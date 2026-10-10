@@ -145,7 +145,7 @@ fn encode_frames(codec: &str, container: &str, deep: bool) -> Option<(ve_model::
         } else {
             ((0..320 * 180).flat_map(|p| [(p % 320) as u8, (i * 5) as u8, 128, 255]).collect(), PixelFormat::Rgba8, 4)
         };
-        enc.push_video(VideoFrame {
+        let pushed = enc.push_video(VideoFrame {
             pts: Rate::FPS_25.frame_to_time(i as i64),
             duration: Rate::FPS_25.frame_duration(),
             width: 320,
@@ -153,8 +153,14 @@ fn encode_frames(codec: &str, container: &str, deep: bool) -> Option<(ve_model::
             format,
             color: ColorTags::default(),
             data: FrameData::Cpu { planes: vec![px], strides: vec![320 * bpp] },
-        })
-        .unwrap();
+        });
+        match pushed {
+            Err(MediaError::Unsupported(m)) if m.contains("encoder works here") => {
+                eprintln!("skipped: {m}");
+                return None;
+            }
+            r => r.unwrap(),
+        }
     }
     let samples: Vec<f32> = (0..96_000).flat_map(|i| {
         let s = (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5;

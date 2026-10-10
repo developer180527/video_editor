@@ -211,7 +211,18 @@ fn export_fails_on_missing_media_and_ignores_the_preview() {
         }
     };
     run(gpu.clone(), "ok.mov").unwrap();
-    std::fs::remove_file(&copy).unwrap();
+    // The file goes away. (Windows will not delete a file the engine has
+    // open, so the asset is pointed at where it no longer is instead: the
+    // same missing media to an export.)
+    let gone_path = dir.join("will_vanish_moved_away.mov");
+    let info = client.snapshot().assets[&gone].info.clone();
+    client.execute(ve_engine::Command::SetAssetMedia { asset: gone, media: MediaRef(format!("file:{}", gone_path.display())), info });
+    let moved = MediaRef(format!("file:{}", gone_path.display()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while client.snapshot().assets[&gone].media != moved {
+        assert!(std::time::Instant::now() < deadline, "relink never landed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let err = run(gpu, "bad.mov").unwrap_err();
     assert!(err.contains("will_vanish.mov"), "{err}");
     assert!(!dir.join("bad.mov").exists(), "no half-written file");

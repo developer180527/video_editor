@@ -24,6 +24,8 @@ use platform_headless::{FileStorage, LinkedOnly};
 use ve_ports::*;
 
 #[cfg(target_os = "ios")]
+mod audio_session;
+#[cfg(target_os = "ios")]
 mod memory;
 
 pub struct IosSystem {
@@ -76,7 +78,10 @@ pub fn storage() -> FileStorage {
 
 pub fn platform(media: Arc<dyn MediaBackend>, linked: Vec<fn() -> Box<dyn NativeLibrary>>) -> Platform {
     #[cfg(target_os = "ios")]
-    memory::observe();
+    {
+        memory::observe();
+        audio_session::configure();
+    }
     Platform {
         system: Arc::new(IosSystem { start: Instant::now() }),
         storage: Arc::new(storage()),

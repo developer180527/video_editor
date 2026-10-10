@@ -81,7 +81,25 @@ pub struct EngineClient {
     tx: mpsc::Sender<Request>,
     shared: Arc<Mutex<Published>>,
     events: mpsc::Receiver<Event>,
+    watch: Mutex<Watchdog>,
 }
+
+/// Watches the playback clock while playing. The playhead follows the sound
+/// the device has played, and waits when that stops (so picture never runs
+/// ahead of sound) — but if the mixer starves or the device is interrupted
+/// (iOS does this), the wait would be forever: playback looks frozen.
+#[derive(Default)]
+struct Watchdog {
+    /// The audio frame count last seen, and since when it has not moved.
+    still: Option<(u64, std::time::Instant)>,
+    /// When it last restarted playback.
+    healed: Option<std::time::Instant>,
+}
+
+/// How long a playing clock may stand still before playback is restarted
+/// at the playhead, and how often that may happen.
+const STALL: std::time::Duration = std::time::Duration::from_millis(400);
+const HEAL_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn publish(e: &Engine, busy: Option<String>) -> Published {
     Published {
@@ -225,7 +243,7 @@ impl Engine {
                 }
             })
             .expect("engine thread");
-        EngineClient { platform, video, stills, tx, shared, events }
+        EngineClient { platform, video, stills, tx, shared, events, watch: Mutex::new(Watchdog::default()) }
     }
 }
 
@@ -382,8 +400,42 @@ impl EngineClient {
     }
 
     pub fn playhead(&self) -> Time {
-        let p = self.shared.lock().unwrap();
-        p.transport.position_at(self.clocks(&p))
+        let (t, stalled) = {
+            let p = self.shared.lock().unwrap();
+            let now = self.clocks(&p);
+            let at_speed = matches!(p.transport.state(), State::Playing { rate } if (rate - 1.0).abs() < 1e-9);
+            let t = p.transport.position_at(now);
+            // At the end there is nothing more to hear: standing still is right.
+            let watching = at_speed && t < p.transport.end;
+            (t, watching.then_some(now.audio).flatten().map(|(frames, _)| frames))
+        };
+        self.watch_clock(stalled);
+        t
+    }
+
+    /// While playing at speed with `frames` on the clock: restart playback at
+    /// the playhead when the clock has stood still too long.
+    fn watch_clock(&self, frames: Option<u64>) {
+        let mut w = self.watch.lock().unwrap();
+        let Some(frames) = frames else {
+            w.still = None;
+            return;
+        };
+        let now = std::time::Instant::now();
+        match w.still {
+            Some((f, since)) if f == frames => {
+                let due = w.healed.is_none_or(|h| now - h >= HEAL_EVERY);
+                if now - since >= STALL && due {
+                    w.healed = Some(now);
+                    w.still = None;
+                    drop(w);
+                    eprintln!("playback clock stalled for {} ms: restarting at the playhead", (now - since).as_millis());
+                    // Re-anchors the clock and restarts the mixer from here.
+                    self.play(1.0);
+                }
+            }
+            _ => w.still = Some((frames, now)),
+        }
     }
 
     /// What the active sequence shows at the playhead.

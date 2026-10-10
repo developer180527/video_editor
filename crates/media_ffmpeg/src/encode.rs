@@ -6,7 +6,7 @@
 //! 8 from elsewhere — and leaves as Rec.709 YCbCr at the codec's depth
 //! (10-bit for ProRes and, where the encoder can, HEVC), tagged as such.
 
-use std::ffi::{c_int, CString};
+use std::ffi::{c_int, CStr, CString};
 use std::ptr;
 
 use ve_ports::*;
@@ -257,6 +257,13 @@ impl FfEncoder {
         let (ctx, st) = (s.ctx, s.st);
         let r = sys::avcodec_send_frame(ctx, frame);
         if r < 0 && r != EOF {
+            // An encoder that opened but refuses the very first picture
+            // (a hardware encoder without this profile, say) cannot do this
+            // export here at all: say so as such, naming it.
+            if !audio && self.frames <= 1 {
+                let name = CStr::from_ptr((*(*ctx).codec).name).to_string_lossy();
+                return Err(MediaError::Unsupported(format!("no {name} encoder works here ({name} rejected the first frame: {})", err(r))));
+            }
             return Err(MediaError::Other(format!("encode: {}", err(r))));
         }
         loop {

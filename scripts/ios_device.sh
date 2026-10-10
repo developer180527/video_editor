@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 bundle=$(plutil -extract CFBundleIdentifier raw apps/editor_ios/ios/Info.plist)
-udid=${1:-$(xcrun devicectl list devices 2>/dev/null | awk '/iPad/ && /physical/ && /available/ {for (i=1;i<=NF;i++) if ($i ~ /^[0-9A-F]{8}-[0-9A-F]{16}$/) {print $i; exit}}')}
+udid=${1:-$(xcrun devicectl list devices 2>/dev/null | awk '/iPad/ && /physical/ && (/available/ || /connected/) {for (i=1;i<=NF;i++) if ($i ~ /^[0-9A-F]{8}-[0-9A-F]{16}$/) {print $i; exit}}')}
 [[ -n "$udid" ]] || { echo "no paired iPad found (xcrun devicectl list devices)" >&2; exit 1; }
 identity=$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/ {print $2; exit}')
 [[ -n "$identity" ]] || { echo "no Apple Development certificate: sign in to Xcode › Settings › Accounts" >&2; exit 1; }

@@ -73,6 +73,17 @@ impl Codec {
         }
     }
 
+    /// A decode error: "not implemented" means this codec cannot be decoded
+    /// here at all (FFmpeg's AV1 decoder needs a hardware decoder, say), which
+    /// is not a damaged file.
+    fn failure(&self, r: c_int) -> MediaError {
+        if r == -(libc_enosys()) {
+            let name = unsafe { crate::codec_name((*self.ctx).codec_id) };
+            return MediaError::Unsupported(format!("this machine cannot decode {name} ({})", err(r)));
+        }
+        MediaError::Corrupt(err(r))
+    }
+
     /// The next decoded frame of `stream` into `self.frame`; false at the end.
     fn next(&mut self, input: &Input, stream: usize) -> Result<bool, MediaError> {
         unsafe {
@@ -85,7 +96,7 @@ impl Codec {
                     return Ok(false);
                 }
                 if r != EAGAIN {
-                    return Err(MediaError::Corrupt(err(r)));
+                    return Err(self.failure(r));
                 }
                 if self.eof_sent {
                     return Ok(false);
@@ -100,7 +111,7 @@ impl Codec {
                     let r = sys::avcodec_send_packet(self.ctx, self.pkt);
                     if r < 0 && r != EAGAIN {
                         sys::av_packet_unref(self.pkt);
-                        return Err(MediaError::Corrupt(err(r)));
+                        return Err(self.failure(r));
                     }
                 }
                 sys::av_packet_unref(self.pkt);
@@ -722,5 +733,17 @@ impl AudioDecoder for AudioDec {
             }
             return Ok(Some(AudioBlock { pts, sample_rate: self.rate, channels: self.channels, samples }));
         }
+    }
+}
+
+/// `ENOSYS` as FFmpeg reports it (AVERROR(ENOSYS)): 78 on Apple, 38 on Linux,
+/// 40 on Windows.
+fn libc_enosys() -> c_int {
+    if cfg!(target_vendor = "apple") {
+        78
+    } else if cfg!(windows) {
+        40
+    } else {
+        38
     }
 }
