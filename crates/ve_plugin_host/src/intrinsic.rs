@@ -18,6 +18,8 @@ pub const CROSSFADE: &str = "ve.crossfade";
 pub const COLOR_MATTE: &str = "ve.color";
 pub const BARS: &str = "ve.bars";
 pub const TITLE: &str = "ve.title";
+/// The Color panel's grade: basic correction, creative, colour wheels.
+pub const GRADE: &str = "ve.grade";
 
 /// Cross dissolve: premultiplied, scene-linear, so it is exact light mixing.
 const DISSOLVE_WGSL: &str = r#"
@@ -39,6 +41,59 @@ fn effect(i: EffectIn) -> @location(0) vec4<f32> {
     let black = vec4<f32>(0.0, 0.0, 0.0, max(a.a, b.a));
     if (p < 0.5) { return mix(a, black, p * 2.0); }
     return mix(black, b, p * 2.0 - 1.0);
+}
+"#;
+
+/// The grade, in the linear working space. Tone works in stops around mid
+/// grey (0.18), so the controls feel the same on dark and bright shots;
+/// the wheels push the shadows, midtones and highlights towards a hue.
+/// Parameter order is the `params.values` index.
+const GRADE_WGSL: &str = r#"
+fn grade_luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2722287, 0.6740818, 0.0536895));
+}
+// A wheel's puck (x right, y up) as a colour offset with zero luma.
+fn grade_wheel(w: vec2<f32>) -> vec3<f32> {
+    let rgb = vec3<f32>(1.402 * w.y, -0.344136 * w.x - 0.714136 * w.y, 1.772 * w.x);
+    return rgb - vec3<f32>(grade_luma(rgb));
+}
+@fragment
+fn effect(i: EffectIn) -> @location(0) vec4<f32> {
+    let s = textureSample(source, source_sampler, i.uv);
+    let a = s.a;
+    if (a <= 0.0) { return s; }
+    var c = max(s.rgb / a, vec3<f32>(0.0));
+    let v = params.values;
+    // White balance: warm/cool along blue-amber, tint along green-magenta.
+    let temp = v[0].x / 100.0;
+    let tint = v[1].x / 100.0;
+    c = c * vec3<f32>(1.0 + 0.3 * temp, 1.0 - 0.3 * tint, 1.0 - 0.3 * temp);
+    // Exposure, in stops.
+    c = c * exp2(v[2].x);
+    // Tone, in stops from mid grey.
+    let y0 = max(grade_luma(c), 1e-6);
+    var st = log2(y0 / 0.18);
+    st = st * (1.0 + v[3].x / 100.0);
+    st = st + v[4].x / 100.0 * 1.5 * smoothstep(-0.5, 2.5, st);
+    st = st + v[5].x / 100.0 * 1.5 * (1.0 - smoothstep(-4.0, 0.5, st));
+    st = st + v[6].x / 100.0 * 1.0 * smoothstep(1.0, 3.5, st);
+    st = st + v[7].x / 100.0 * 1.0 * (1.0 - smoothstep(-6.0, -2.5, st));
+    c = c * (0.18 * exp2(st) / y0);
+    // Wheels: lift the shadows, bend the midtones, scale the highlights.
+    let y = clamp(grade_luma(c), 0.0, 1.0);
+    let lift = (grade_wheel(v[10].xy) * 0.1 + vec3<f32>(v[11].x * 0.1)) * (1.0 - y);
+    c = max(c + lift, vec3<f32>(0.0));
+    let gamma = vec3<f32>(1.0) + grade_wheel(v[12].xy) * 0.5 + vec3<f32>(v[13].x * 0.5);
+    c = pow(c, vec3<f32>(1.0) / max(gamma, vec3<f32>(0.05)));
+    c = c * (vec3<f32>(1.0) + grade_wheel(v[14].xy) * 0.5 + vec3<f32>(v[15].x * 0.5));
+    // Saturation, and vibrance: more on what is muted than what is vivid.
+    let l = grade_luma(c);
+    let hi = max(c.r, max(c.g, c.b));
+    let lo = min(c.r, min(c.g, c.b));
+    let chroma = select(0.0, (hi - lo) / hi, hi > 1e-6);
+    let sat = v[8].x / 100.0 * (1.0 + v[9].x / 100.0 * (1.0 - chroma));
+    c = max(vec3<f32>(l) + (c - vec3<f32>(l)) * sat, vec3<f32>(0.0));
+    return vec4<f32>(c * a, a);
 }
 "#;
 
@@ -108,6 +163,28 @@ pub fn all() -> Vec<EffectInfo> {
         // Colours are display-referred (what a colour picker shows); the
         // generators draw in display space, so their pictures take the same
         // colour path as footage.
+        EffectInfo {
+            implementation: Implementation::ShaderOnly,
+            wgsl: Some(GRADE_WGSL.into()),
+            ..info(GRADE, "Lumetri Color", "Color Correction", vec![
+                p("temperature", "Temperature", Float, -100.0, 100.0, [0.0; 4]),
+                p("tint", "Tint", Float, -100.0, 100.0, [0.0; 4]),
+                p("exposure", "Exposure", Float, -5.0, 5.0, [0.0; 4]),
+                p("contrast", "Contrast", Float, -100.0, 100.0, [0.0; 4]),
+                p("highlights", "Highlights", Float, -100.0, 100.0, [0.0; 4]),
+                p("shadows", "Shadows", Float, -100.0, 100.0, [0.0; 4]),
+                p("whites", "Whites", Float, -100.0, 100.0, [0.0; 4]),
+                p("blacks", "Blacks", Float, -100.0, 100.0, [0.0; 4]),
+                p("saturation", "Saturation", Float, 0.0, 200.0, [100.0, 0.0, 0.0, 0.0]),
+                p("vibrance", "Vibrance", Float, -100.0, 100.0, [0.0; 4]),
+                p("lift", "Shadows Color", Vec2, -1.0, 1.0, [0.0; 4]),
+                p("lift_level", "Shadows Level", Float, -1.0, 1.0, [0.0; 4]),
+                p("gamma", "Midtones Color", Vec2, -1.0, 1.0, [0.0; 4]),
+                p("gamma_level", "Midtones Level", Float, -1.0, 1.0, [0.0; 4]),
+                p("gain", "Highlights Color", Vec2, -1.0, 1.0, [0.0; 4]),
+                p("gain_level", "Highlights Level", Float, -1.0, 1.0, [0.0; 4]),
+            ])
+        },
         generator(COLOR_MATTE, "Color Matte", vec![p("color", "Color", Color, 0.0, 1.0, [0.5, 0.5, 0.5, 1.0])]),
         generator(BARS, "Bars", vec![]),
         generator(TITLE, "Title", vec![

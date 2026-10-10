@@ -33,7 +33,7 @@ pub use ve_plugin_host::{EffectInfo, EffectKind, Implementation, ParamInfo, Para
 pub use ve_render::{FramePlan, Quality, TextureImporter};
 pub use frame::Frame;
 pub use export::{ExportPreset, ExportState};
-pub use ve_media::{Meters, Stills, Thumb, PEAKS_PER_SECOND};
+pub use ve_media::{Levels, Loudness, Meters, Stills, Thumb, PEAKS_PER_SECOND};
 
 use std::sync::Arc;
 use thiserror::Error;
@@ -196,6 +196,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Apply `cmd` as part of the gesture `key`: one undo step for a whole
+    /// slider drag (see `History::execute_merging`).
+    pub fn execute_merging(&mut self, cmd: Command, key: u64) -> Result<(), CommandError> {
+        let next = self.history.execute_merging(&self.project, cmd, key)?;
+        self.publish(next);
+        Ok(())
+    }
+
     pub fn undo(&mut self) -> bool {
         self.step(true)
     }
@@ -232,12 +240,14 @@ impl Engine {
     }
 
     fn publish(&mut self, p: Project) {
+        let audio_changed = !same_audio(&self.project, &p);
         self.project = Arc::new(p);
         if let Some(seq) = self.project.active() {
             self.transport.end = seq.duration();
         }
-        // Edits are heard at once while playing.
-        if self.is_playing() {
+        // Edits are heard at once while playing; ones that change no sound
+        // (grading a picture) leave the audio alone.
+        if self.is_playing() && audio_changed {
             self.restart_audio();
         }
         self.events.push(Event::ProjectChanged);
@@ -405,6 +415,14 @@ impl Engine {
         self.events.push(Event::TransportChanged);
     }
 
+    /// Hear `track` at this fader and pan until `None` (see
+    /// [`EngineClient::preview_track`]).
+    pub fn preview_track(&mut self, track: ve_model::TrackId, mix: Option<(f32, f32)>) {
+        if let Some(p) = &self.playback {
+            p.preview_track(track, mix);
+        }
+    }
+
     /// Level meters of what is playing, once audio is open.
     pub fn meters(&self) -> Option<Arc<ve_media::Meters>> {
         self.playback.as_ref().map(|p| p.meters.clone())
@@ -456,4 +474,20 @@ impl Engine {
     pub fn drain_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
+}
+
+/// Whether `a` and `b` sound the same: the same media, and every audio track
+/// of every sequence unchanged (edits share what they don't touch, so a
+/// pointer comparison says so).
+fn same_audio(a: &Project, b: &Project) -> bool {
+    a.assets.ptr_eq(&b.assets)
+        && a.active_sequence == b.active_sequence
+        && a.sequences.len() == b.sequences.len()
+        && a.sequences.iter().all(|(id, sa)| {
+            b.sequences.get(id).is_some_and(|sb| {
+                Arc::ptr_eq(sa, sb)
+                    || (sa.tracks.len() == sb.tracks.len()
+                        && sa.tracks.iter().zip(sb.tracks.iter()).all(|(ta, tb)| ta.kind == TrackKind::Video || Arc::ptr_eq(ta, tb)))
+            })
+        })
 }

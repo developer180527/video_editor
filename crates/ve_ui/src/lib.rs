@@ -8,11 +8,14 @@
 //!
 //! The look is ported from the `libgui_cut` mock-up.
 
+mod color_panel;
 mod dock;
 mod effects;
 mod features;
 mod menu;
+mod mixer_panel;
 mod program;
+mod scopes_panel;
 mod settings;
 mod project;
 pub mod theme;
@@ -150,6 +153,10 @@ pub struct View {
     pub selected_marker: Option<MarkerId>,
     /// A transition's duration, in frames, while it is being dragged.
     pub transition_frames: Option<f32>,
+    /// Which scope the Scopes panel shows.
+    pub scope: ve_render::scopes::ScopeKind,
+    /// A fader or pan knob being dragged: the track and its live values.
+    pub track_drag: Option<(TrackId, f32, f32)>,
 }
 
 pub struct EditorUi {
@@ -181,6 +188,21 @@ pub struct EditorUi {
     window_actions: Vec<(SurfaceId, WindowAction)>,
     tab_height: f32,
     settings: Settings,
+    scopes: Option<ve_render::scopes::Scopes>,
+    /// The scope image, as the UI shows it, and its view (for other windows).
+    scope_tex: Option<TextureId>,
+    scope_view: Option<wgpu::TextureView>,
+    /// A Scopes panel was drawn: measure the next frame.
+    pub(crate) scopes_wanted: bool,
+    /// Per-track meters (dB, falling smoothly) and the master's loudness.
+    pub(crate) track_db: HashMap<TrackId, [f32; 2]>,
+    pub(crate) loudness: ve_engine::Loudness,
+    /// Numbers the drags of sliders, so each is one undo step.
+    gesture: u64,
+    /// The gesture of the slider or wheel being dragged.
+    pub(crate) drag_gesture: u64,
+    /// A grade effect added but maybe not in the snapshot yet.
+    pub(crate) pending_grade: Option<(ClipId, EffectId)>,
     /// The engine's state as of this frame.
     st: Published,
     playhead: Time,
@@ -225,6 +247,8 @@ impl EditorUi {
                 selected_transition: None,
                 selected_marker: None,
                 transition_frames: None,
+                scope: Default::default(),
+                track_drag: None,
             },
             dock,
             compositor: None,
@@ -244,6 +268,15 @@ impl EditorUi {
             window_actions: Vec::new(),
             tab_height: 24.0,
             settings: Settings::default(),
+            scopes: None,
+            scope_tex: None,
+            scope_view: None,
+            scopes_wanted: false,
+            track_db: HashMap::new(),
+            loudness: ve_engine::Loudness::default(),
+            gesture: 0,
+            drag_gesture: 0,
+            pending_grade: None,
             st,
             playhead: Time::ZERO,
             errors: Vec::new(),
@@ -334,6 +367,19 @@ impl EditorUi {
                 None => self.monitor = Some(renderer.register_texture(&view)),
             }
             self.monitor_view = Some(view);
+            // Scopes measure what the monitor shows, when a panel shows them.
+            if std::mem::take(&mut self.scopes_wanted) {
+                let scopes = self.scopes.get_or_insert_with(|| ve_render::scopes::Scopes::new(device));
+                scopes.render(device, queue, tex, self.view.scope);
+                if let Some(out) = scopes.output() {
+                    let view = out.create_view(&Default::default());
+                    match self.scope_tex {
+                        Some(id) => renderer.update_texture(id, &view),
+                        None => self.scope_tex = Some(renderer.register_texture(&view)),
+                    }
+                    self.scope_view = Some(view);
+                }
+            }
         }
     }
 
@@ -342,6 +388,7 @@ impl EditorUi {
             || self.st.busy.is_some()
             || self.catching_up
             || self.meter_db.iter().any(|d| *d > -95.0)
+            || self.track_db.values().flatten().any(|d| *d > -95.0)
             || self.export.as_ref().is_some_and(|e| e.result().is_none())
             || !self.thumb_uploads.is_empty()
     }
@@ -455,10 +502,33 @@ impl EditorUi {
     fn update_meters(&mut self, dt: f32) {
         let peaks = self.st.meters.as_ref().map(|m| m.peaks()).unwrap_or([0.0; 2]);
         let playing = self.engine.is_playing();
-        for (db, p) in self.meter_db.iter_mut().zip(peaks) {
+        let fall = |db: &mut f32, p: f32| {
             let now = if playing && p > 0.0 { 20.0 * p.log10() } else { -96.0 };
             *db = now.max(*db - 20.0 * dt).max(-96.0);
+        };
+        for (db, p) in self.meter_db.iter_mut().zip(peaks) {
+            fall(db, p);
         }
+        // Per track, and loudness, as of what is being heard.
+        let levels = self.st.meters.as_ref().map(|m| m.levels()).unwrap_or_default();
+        self.loudness = levels.loudness;
+        for (id, p) in &levels.tracks {
+            let db = self.track_db.entry(*id).or_insert([-96.0; 2]);
+            fall(&mut db[0], p[0]);
+            fall(&mut db[1], p[1]);
+        }
+        for (id, db) in self.track_db.iter_mut() {
+            if !levels.tracks.iter().any(|(t, _)| t == id) {
+                fall(&mut db[0], 0.0);
+                fall(&mut db[1], 0.0);
+            }
+        }
+    }
+
+    /// A new drag of a slider: its commands share this key, one undo step.
+    pub(crate) fn next_gesture(&mut self) -> u64 {
+        self.gesture += 1;
+        self.gesture
     }
 
     fn snap(&self) -> &Snapshot {
@@ -508,6 +578,9 @@ impl EditorUi {
         let bound = self.shared.entry(surface).or_default();
         // The monitor's picture changes underneath its id: point at it each frame.
         if let (Some(id), Some(view)) = (self.monitor, &self.monitor_view) {
+            renderer.update_texture(id, view);
+        }
+        if let (Some(id), Some(view)) = (self.scope_tex, &self.scope_view) {
             renderer.update_texture(id, view);
         }
         for (tex, id) in self.thumbs.values() {

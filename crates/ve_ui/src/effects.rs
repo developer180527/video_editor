@@ -410,7 +410,7 @@ fn default_for(app: &EditorUi, clip: &Clip, p: &ParamInfo) -> Value {
 
 /// `param` with `v` set at `t`: replaces a constant, or sets a keyframe at
 /// `t` when the parameter is animated.
-fn set_at(param: &Param, t: Time, v: Value) -> Param {
+pub(crate) fn set_at(param: &Param, t: Time, v: Value) -> Param {
     match param {
         Param::Constant(_) => Param::Constant(v),
         Param::Animated(keys) => {

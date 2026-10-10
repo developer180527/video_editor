@@ -19,10 +19,13 @@ pub enum Tab {
     Info,
     Timeline,
     Settings,
+    Scopes,
+    TrackMixer,
+    Color,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 11] = [
+    pub const ALL: [Tab; 14] = [
         Tab::Source,
         Tab::EffectControls,
         Tab::AudioClipMixer,
@@ -34,6 +37,9 @@ impl Tab {
         Tab::Info,
         Tab::Timeline,
         Tab::Settings,
+        Tab::Scopes,
+        Tab::TrackMixer,
+        Tab::Color,
     ];
 
     /// Identity in a saved layout: a name, never a position.
@@ -50,6 +56,9 @@ impl Tab {
             Tab::Info => "info",
             Tab::Timeline => "timeline",
             Tab::Settings => "settings",
+            Tab::Scopes => "scopes",
+            Tab::TrackMixer => "track-mixer",
+            Tab::Color => "color",
         })
         .0
     }
@@ -68,6 +77,9 @@ impl Tab {
             Tab::Info => "Info",
             Tab::Timeline => "Timeline",
             Tab::Settings => "Settings",
+            Tab::Scopes => "Lumetri Scopes",
+            Tab::TrackMixer => "Audio Track Mixer",
+            Tab::Color => "Lumetri Color",
         }
     }
 
@@ -78,7 +90,7 @@ impl Tab {
 
 pub(crate) fn initial(touch: bool) -> DockState<Tab> {
     let mut dock = DockState::new();
-    let mut top_left = dock.leaf(vec![Tab::Source, Tab::EffectControls, Tab::AudioClipMixer, Tab::Metadata]);
+    let mut top_left = dock.leaf(vec![Tab::Source, Tab::EffectControls, Tab::Color, Tab::Scopes, Tab::TrackMixer, Tab::AudioClipMixer, Tab::Metadata]);
     if let DockNode::Leaf(l) = &mut top_left {
         l.active = 1;
     }
@@ -119,6 +131,9 @@ impl TabViewer for Viewer<'_> {
             Tab::Info => "Info".into(),
             Tab::Timeline => seq,
             Tab::Settings => "Settings".into(),
+            Tab::Scopes => "Lumetri Scopes".into(),
+            Tab::TrackMixer => format!("Audio Track Mixer: {seq}"),
+            Tab::Color => "Lumetri Color".into(),
         }
     }
 
@@ -127,12 +142,12 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn scroll(&self, tab: &Tab) -> bool {
-        matches!(tab, Tab::Metadata | Tab::MediaBrowser | Tab::Info | Tab::Effects | Tab::Settings)
+        matches!(tab, Tab::Metadata | Tab::MediaBrowser | Tab::Info | Tab::Effects | Tab::Settings | Tab::Color)
     }
 
     fn padding(&self, tab: &Tab) -> Insets {
         match tab {
-            Tab::Program | Tab::Timeline | Tab::EffectControls | Tab::Project => Insets::all(0.0),
+            Tab::Program | Tab::Timeline | Tab::EffectControls | Tab::Project | Tab::Scopes | Tab::TrackMixer => Insets::all(0.0),
             _ => Insets::all(10.0),
         }
     }
@@ -146,6 +161,9 @@ impl TabViewer for Viewer<'_> {
             Tab::Effects => project::effects_list(ui, self.app),
             Tab::Info => info(ui, self.app),
             Tab::Settings => crate::settings::panel(ui, self.app),
+            Tab::Scopes => crate::scopes_panel::panel(ui, self.app),
+            Tab::TrackMixer => crate::mixer_panel::panel(ui, self.app),
+            Tab::Color => crate::color_panel::panel(ui, self.app),
             other => placeholder(ui, &self.title(other)),
         }
     }

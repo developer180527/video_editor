@@ -9,6 +9,7 @@
 //! - [`Playback`]: runs a `Mixer` ahead of the audio device on its own thread
 //!   and hands the samples to the real-time callback through a lock-free ring.
 
+mod loudness;
 mod mixer;
 mod playback;
 mod stills;
@@ -18,7 +19,8 @@ mod fakes;
 
 pub use stills::{Stills, Thumb, PEAKS_PER_SECOND};
 
-pub use mixer::{db_to_gain, Mixer};
+pub use loudness::{Loudness, LoudnessMeter};
+pub use mixer::{db_to_gain, Levels, Mixer, TrackMix};
 pub use playback::{Meters, Playback};
 pub use video::{Lookup, VideoPool};
 

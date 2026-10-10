@@ -275,3 +275,88 @@ fn deep_output_keeps_ten_bit_steps() {
     assert_eq!(deep, 64, "every 10-bit step survives the deep output");
     assert!(eight < 24, "the 8-bit monitor merges them ({eight} levels)");
 }
+
+#[test]
+fn the_grade_effect_compiles_and_grades() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let info = ve_plugin_host::intrinsic::all().into_iter().find(|i| i.plugin.id == ve_plugin_host::intrinsic::GRADE).unwrap();
+    let index = |id: &str| info.params.iter().position(|p| p.id == id).unwrap();
+    let grade = |set: &[(&str, f32)]| {
+        let mut params: Vec<[f32; 4]> = info.params.iter().map(|p| p.default.map(|d| d as f32)).collect();
+        for (id, v) in set {
+            params[index(id)][0] = *v;
+        }
+        let mut l = layer(gray(64, 36, 126), 100.0, 1.0);
+        l.effects.push(GpuEffect { key: "grade".into(), wgsl: info.wgsl.clone().unwrap().into(), params, time: 0.0 });
+        let mut c = Compositor::new(&device);
+        c.render(&device, &queue, &plan(64, 36), &[l], (64, 36), WorkingSpace::AcesCg);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        px(&c.read_output(&device, &queue).unwrap(), 32, 18)
+    };
+    // At its defaults it leaves the picture alone.
+    let p = grade(&[]);
+    assert!(p[..3].iter().all(|c| (126..=130).contains(c)), "neutral grade changed grey: {p:?}");
+    // A stop up is brighter; warm is redder than blue; no saturation is grey.
+    let up = grade(&[("exposure", 1.0)]);
+    assert!(up[1] > p[1] + 20, "{up:?}");
+    let warm = grade(&[("temperature", 100.0)]);
+    assert!(warm[0] > warm[2] + 20, "{warm:?}");
+    let grey = grade(&[("temperature", 100.0), ("saturation", 0.0)]);
+    assert!((grey[0] as i32 - grey[2] as i32).abs() <= 2, "{grey:?}");
+    // Lifting the shadows brightens a dark grey; pulling contrast flattens.
+    let lifted = grade(&[("lift_level", 1.0)]);
+    assert!(lifted[1] > p[1], "{lifted:?}");
+}
+
+/// A texture's RGBA8 pixels.
+fn read_rgba(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (tex.width(), tex.height());
+    let row = (w * 4).div_ceil(256) * 256;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut enc = device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        tex.as_image_copy(),
+        wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    queue.submit([enc.finish()]);
+    buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let data = buf.slice(..).get_mapped_range().unwrap();
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        out.extend_from_slice(&data[(y * row) as usize..(y * row + w * 4) as usize]);
+    }
+    (w, h, out)
+}
+
+#[test]
+fn scopes_measure_a_flat_grey() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let mut c = Compositor::new(&device);
+    c.render(&device, &queue, &plan(64, 36), &[layer(gray(64, 36, 126), 100.0, 1.0)], (64, 36), WorkingSpace::LinearRec709);
+    let picture = c.output().unwrap();
+    let level = px(&c.read_output(&device, &queue).unwrap(), 32, 18)[1] as u32;
+    let mut scopes = scopes::Scopes::new(&device);
+    let lit = |img: &(u32, u32, Vec<u8>), x: u32, y: u32| px(img, x, y)[1] > 60;
+
+    // Waveform: one bright line at the grey's level, nothing elsewhere.
+    scopes.render(&device, &queue, picture, scopes::ScopeKind::Waveform);
+    let img = read_rgba(&device, &queue, scopes.output().unwrap());
+    let row = 255 - level;
+    assert!(lit(&img, 100, row) && lit(&img, 700, row), "the grey's line at row {row}");
+    assert!(!lit(&img, 100, row - 10) && !lit(&img, 100, row + 10), "dark away from it");
+
+    // Vectorscope: a grey has no chroma, so a dot at the centre.
+    scopes.render(&device, &queue, picture, scopes::ScopeKind::Vectorscope);
+    let img = read_rgba(&device, &queue, scopes.output().unwrap());
+    assert_eq!((img.0, img.1), (256, 256));
+    assert!(lit(&img, 128, 128) && !lit(&img, 200, 60), "centre lit, edge dark");
+
+    // Histogram: every channel's column at that level reaches the top.
+    scopes.render(&device, &queue, picture, scopes::ScopeKind::Histogram);
+    let img = read_rgba(&device, &queue, scopes.output().unwrap());
+    let col = level * img.0 / 256 + 1;
+    assert!(px(&img, col, 2)[0] > 100 && px(&img, col, 2)[2] > 100, "a full bar at {col}: {:?}", px(&img, col, 2));
+    assert!(px(&img, 20, 250)[0] < 10, "no bar elsewhere");
+}

@@ -46,6 +46,7 @@ pub struct Published {
 
 enum Request {
     Execute(Command),
+    ExecuteMerging(Command, u64),
     Undo,
     Redo,
     Import(Vec<String>),
@@ -58,6 +59,7 @@ enum Request {
     Looping(bool),
     AttachProxy(ve_model::AssetId, String),
     Relink(ve_model::AssetId, String),
+    PreviewTrack(ve_model::TrackId, Option<(f32, f32)>),
 }
 
 pub struct EngineClient {
@@ -134,6 +136,11 @@ impl Engine {
                                 let _ = etx.send(Event::Error(err.to_string()));
                             }
                         }
+                        Request::ExecuteMerging(c, key) => {
+                            if let Err(err) = self.execute_merging(c, key) {
+                                let _ = etx.send(Event::Error(err.to_string()));
+                            }
+                        }
                         Request::Undo => {
                             self.undo();
                         }
@@ -162,6 +169,7 @@ impl Engine {
                         }
                         Request::Transport(t) => self.adopt_transport(t),
                         Request::Looping(on) => self.set_looping(on),
+                        Request::PreviewTrack(track, mix) => self.preview_track(track, mix),
                         Request::AttachProxy(asset, path) => {
                             if let Err(err) = self.attach_proxy(asset, &path) {
                                 let _ = etx.send(Event::Error(format!("{path}: {err}")));
@@ -207,6 +215,12 @@ impl EngineClient {
         self.send(Request::Execute(c));
     }
 
+    /// `c` as part of the gesture `key` (a slider drag): one undo step for
+    /// the whole gesture. Use a new key for each gesture.
+    pub fn execute_merging(&self, c: Command, key: u64) {
+        self.send(Request::ExecuteMerging(c, key));
+    }
+
     pub fn undo(&self) {
         self.send(Request::Undo);
     }
@@ -227,6 +241,13 @@ impl EngineClient {
     /// thread).
     pub fn attach_proxy(&self, asset: ve_model::AssetId, path: String) {
         self.send(Request::AttachProxy(asset, path));
+    }
+
+    /// Hear `track` at this fader (dB) and pan while it is dragged, without
+    /// an edit (no restart, no undo step); `None` ends the preview. Commit
+    /// the final values with `SetTrackState`.
+    pub fn preview_track(&self, track: ve_model::TrackId, mix: Option<(f32, f32)>) {
+        self.send(Request::PreviewTrack(track, mix));
     }
 
     /// Relink `asset` to the file at `path`.

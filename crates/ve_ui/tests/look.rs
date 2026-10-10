@@ -244,6 +244,27 @@ fn torn_off_windows() {
     assert_eq!(app.dock().surfaces().len(), 3);
 }
 
+/// The Color, Scopes and Audio Track Mixer panels, each brought to the
+/// front of its pane.
+#[test]
+fn color_scopes_and_mixer_panels() {
+    let mut app = editor();
+    let show = |app: &mut EditorUi, tab: ve_ui::Tab| {
+        let at = app.dock().find_tab(|t| *t == tab).expect("panel in the layout");
+        app.dock_mut().focus_tab(at);
+    };
+    render(&mut app, 2000, 1129, "panel-color.png", |app| {
+        show(app, ve_ui::Tab::Color);
+        let snap = app.engine.snapshot();
+        app.view.selection = vec![snap.active().unwrap().tracks[0].clips[0].id];
+    });
+    render(&mut app, 2000, 1129, "panel-scopes.png", |app| {
+        show(app, ve_ui::Tab::Scopes);
+        app.view.scope = ve_render::scopes::ScopeKind::Vectorscope;
+    });
+    render(&mut app, 2000, 1129, "panel-mixer.png", |app| show(app, ve_ui::Tab::TrackMixer));
+}
+
 fn frame(ui: &mut Ui, app: &mut EditorUi) {
     let info = FrameInfo { screen_size: Vec2::new(2000.0, 1129.0), scale: 1.0, dt: 1.0 / 60.0 };
     ui.begin_frame(info);

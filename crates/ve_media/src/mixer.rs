@@ -11,13 +11,17 @@
 //! stereo), then Volume (`ve.volume` level, dB) and Panner (`ve.panner`
 //! balance) place it in the stereo master; gains ramp per sample. Inside a
 //! transition the clips going out and coming in cross with equal power,
-//! playing into their media handles. Muted tracks are silent; when any track
-//! is soloed, only soloed tracks play.
+//! playing into their media handles. Each track is mixed on its own, then
+//! its fader and pan (also ramped) place it in the master, where it is
+//! metered; the master is metered for loudness. Muted tracks are silent;
+//! when any track is soloed, only soloed tracks play.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ve_model::*;
+
+use crate::loudness::{Loudness, LoudnessMeter};
 use ve_ports::{AudioDecoder, MediaBackend, Storage};
 use ve_time::Time;
 
@@ -116,6 +120,18 @@ struct Stream {
     next: Option<i64>,
 }
 
+/// A track's fader (dB) and pan (-1..1) as heard right now, overriding the
+/// project's while the user drags them.
+pub type TrackMix = Arc<Mutex<HashMap<TrackId, (f32, f32)>>>;
+
+/// What one block measured: each audio track's peaks (linear, post-fader)
+/// and the master's loudness.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Levels {
+    pub tracks: Vec<(TrackId, [f32; 2])>,
+    pub loudness: Loudness,
+}
+
 pub struct Mixer {
     storage: Arc<dyn Storage>,
     media: Arc<dyn MediaBackend>,
@@ -123,6 +139,22 @@ pub struct Mixer {
     streams: HashMap<ClipId, Stream>,
     failed: HashMap<ClipId, String>,
     scratch: Vec<f32>,
+    /// One track's mix, before its fader.
+    track_buf: Vec<f32>,
+    /// Each track's gains at the end of the last block, to ramp from.
+    track_gains: HashMap<TrackId, (f32, f32)>,
+    overrides: TrackMix,
+    loudness: LoudnessMeter,
+    levels: Levels,
+}
+
+/// A track's fader and pan as left/right gains. The track is already
+/// stereo, so its pan is a balance: the side it leans to stays at unity,
+/// the other fades out.
+fn track_gains(volume_db: f32, pan: f32) -> (f32, f32) {
+    let g = db_to_gain(volume_db as f64);
+    let pan = pan.clamp(-1.0, 1.0);
+    (g * (1.0 - pan).min(1.0), g * (1.0 + pan).min(1.0))
 }
 
 fn param(clip: &Clip, effect: &str, name: &str, t: Time) -> Option<f64> {
@@ -147,7 +179,34 @@ fn transition_gain(track: &Track, id: ClipId, t: Time) -> f32 {
 
 impl Mixer {
     pub fn new(storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>, rate: u32) -> Self {
-        Mixer { storage, media, rate, streams: HashMap::new(), failed: HashMap::new(), scratch: Vec::new() }
+        Mixer {
+            storage,
+            media,
+            rate,
+            streams: HashMap::new(),
+            failed: HashMap::new(),
+            scratch: Vec::new(),
+            track_buf: Vec::new(),
+            track_gains: HashMap::new(),
+            overrides: TrackMix::default(),
+            loudness: LoudnessMeter::new(rate),
+            levels: Levels::default(),
+        }
+    }
+
+    /// Faders and pans to hear in place of the project's (live dragging).
+    pub fn overrides(&self) -> TrackMix {
+        self.overrides.clone()
+    }
+
+    /// What the last [`Mixer::render`] measured.
+    pub fn levels(&self) -> &Levels {
+        &self.levels
+    }
+
+    /// Start a new loudness measurement (a new playback).
+    pub fn reset_loudness(&mut self) {
+        self.loudness.reset();
     }
 
     pub fn rate(&self) -> u32 {
@@ -170,17 +229,45 @@ impl Mixer {
         let range = ve_time::TimeRange::new(start, self.ticks(frames as i64));
         let any_solo = seq.tracks.iter().any(|t| t.kind == TrackKind::Audio && t.solo);
         let mut live = HashSet::new();
+        let overrides = self.overrides.lock().map(|o| o.clone()).unwrap_or_default();
+        let mut buf = std::mem::take(&mut self.track_buf);
+        buf.resize(out.len(), 0.0);
+        let mut levels = Vec::new();
         for track in seq.tracks.iter().filter(|t| t.kind == TrackKind::Audio) {
             if track.muted || (any_solo && !track.solo) {
+                levels.push((track.id, [0.0; 2]));
+                self.track_gains.remove(&track.id);
                 continue;
             }
+            buf.fill(0.0);
+            let mut any = false;
             for (i, clip) in track.clips.iter().enumerate() {
                 if clip.enabled && track.reach(i).overlaps(range) {
                     live.insert(clip.id);
-                    self.mix_clip(project, track, i, start, frames, out);
+                    self.mix_clip(project, track, i, start, frames, &mut buf);
+                    any = true;
                 }
             }
+            // The fader and pan, ramped from where the last block left them.
+            let (volume, pan) = overrides.get(&track.id).copied().unwrap_or((track.volume_db, track.pan));
+            let to = track_gains(volume, pan);
+            let from = self.track_gains.insert(track.id, to).unwrap_or(to);
+            let mut peak = [0f32; 2];
+            if any {
+                for k in 0..frames {
+                    let x = (k + 1) as f32 / frames as f32;
+                    let (gl, gr) = (from.0 + (to.0 - from.0) * x, from.1 + (to.1 - from.1) * x);
+                    let (l, r) = (buf[k * 2] * gl, buf[k * 2 + 1] * gr);
+                    peak = [peak[0].max(l.abs()), peak[1].max(r.abs())];
+                    out[k * 2] += l;
+                    out[k * 2 + 1] += r;
+                }
+            }
+            levels.push((track.id, peak));
         }
+        self.track_buf = buf;
+        self.loudness.push(out);
+        self.levels = Levels { tracks: levels, loudness: self.loudness.read() };
         // Close decoders of clips no longer playing.
         self.streams.retain(|id, _| live.contains(id));
     }
@@ -447,6 +534,37 @@ mod tests {
         assert!(worst < 0.002, "largest step between samples: {worst}");
         assert!(heard.windows(2).all(|w| w[1] >= w[0] - 1e-6), "fade never dips");
         assert!((heard.last().unwrap() - 1.0).abs() < 1e-3, "reaches full level");
+    }
+
+    #[test]
+    fn track_fader_pan_and_live_override() {
+        let (p, mut seq) = one_clip(Param::Constant(Value::Float(0.0)));
+        let mut mixer = Mixer::new(Arc::new(crate::fakes::AnyFile), Arc::new(Counting::default()), 48_000);
+        let mut out = vec![0f32; 1024 * 2];
+        let render = |mixer: &mut Mixer, seq: &Sequence, block: i64, out: &mut Vec<f32>| {
+            mixer.render(&p, seq, Time::from_ticks(block * 1024 * ve_time::TICKS_PER_SECOND / 48_000), out);
+            (out[out.len() - 2], out[out.len() - 1])
+        };
+        // -6 dB and hard right: left silent, right at half.
+        let t = Arc::make_mut(&mut seq.tracks[0]);
+        t.volume_db = -6.0206;
+        t.pan = 1.0;
+        let (l, r) = render(&mut mixer, &seq, 0, &mut out);
+        assert!(l.abs() < 1e-4 && (r - 0.5).abs() < 1e-3, "({l}, {r})");
+        let id = seq.tracks[0].id;
+        let peaks = mixer.levels().tracks.iter().find(|(t, _)| *t == id).unwrap().1;
+        assert!(peaks[0] < 1e-4 && (peaks[1] - 0.5).abs() < 1e-3, "track meter {peaks:?}");
+        // A live override wins over the project, and ramps in over a block.
+        mixer.overrides().lock().unwrap().insert(id, (0.0, 0.0));
+        let (l, r) = render(&mut mixer, &seq, 1, &mut out);
+        assert!((l - 1.0).abs() < 1e-3 && (r - 1.0).abs() < 1e-3, "({l}, {r})");
+        assert!(out[0] < 0.1 && out[1] > 0.45, "the first sample is still near the old gains");
+        // Muted: silent, and metered at zero.
+        mixer.overrides().lock().unwrap().clear();
+        Arc::make_mut(&mut seq.tracks[0]).muted = true;
+        let (l, r) = render(&mut mixer, &seq, 2, &mut out);
+        assert_eq!((l, r), (0.0, 0.0));
+        assert_eq!(mixer.levels().tracks[0].1, [0.0; 2]);
     }
 
     #[test]

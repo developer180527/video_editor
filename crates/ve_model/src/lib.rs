@@ -286,6 +286,13 @@ pub struct Track {
     /// track's pan places it in the stereo master.
     #[serde(default)]
     pub layout: ChannelLayout,
+    /// Audio tracks: the fader, in dB (0 is unity).
+    #[serde(default)]
+    pub volume_db: f32,
+    /// Audio tracks: where the track sits in the stereo master, -1 (left)
+    /// to 1 (right).
+    #[serde(default)]
+    pub pan: f32,
 }
 
 /// Channels of an audio track.
@@ -318,6 +325,8 @@ impl Track {
             muted: false,
             solo: false,
             layout: ChannelLayout::default(),
+            volume_db: 0.0,
+            pan: 0.0,
         }
     }
 

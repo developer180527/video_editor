@@ -38,18 +38,20 @@ pub enum CommandError {
     Invalid(#[from] ModelError),
 }
 
-/// A track's switches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A track's switches, fader and pan.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackState {
     pub enabled: bool,
     pub locked: bool,
     pub muted: bool,
     pub solo: bool,
+    pub volume_db: f32,
+    pub pan: f32,
 }
 
 impl TrackState {
     pub fn of(t: &Track) -> Self {
-        TrackState { enabled: t.enabled, locked: t.locked, muted: t.muted, solo: t.solo }
+        TrackState { enabled: t.enabled, locked: t.locked, muted: t.muted, solo: t.solo, volume_db: t.volume_db, pan: t.pan }
     }
 }
 
@@ -324,6 +326,8 @@ impl Command {
                 t.locked = state.locked;
                 t.muted = state.muted;
                 t.solo = state.solo;
+                t.volume_db = state.volume_db;
+                t.pan = state.pan;
                 SetTrackState { sequence: *sequence, track: *track, state: old }
             }
             SetAssetMedia { asset, media, info } => {
