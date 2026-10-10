@@ -433,12 +433,27 @@ fn source_monitor_three_point_insert() {
 
     // Clear the sequence's in/out and park the program at 22 s (the end).
     app.engine.execute(Command::SetMarks { owner: ve_engine::MarksOwner::Sequence(app.engine.snapshot().active().unwrap().id), marks: Default::default() });
+    // The fixture's sequence In (1 s) would place the edit: wait for the clear.
+    wait(&app.engine, |c| c.snapshot().active().unwrap().marks.in_point.is_none());
     app.engine.set_viewer(ve_engine::Viewer::Program);
     app.engine.seek(s(22));
     frame(&mut ui, &mut app);
     // Comma inserts the marked part at the program playhead.
     press(&mut ui, &mut app, Key::Comma, Modifiers::NONE);
-    wait(&app.engine, |c| c.snapshot().active().unwrap().tracks[0].clips.len() == 4);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.engine.snapshot().active().unwrap().tracks[0].clips.len() != 4 {
+        if Instant::now() > deadline {
+            panic!(
+                "no insert: V1 {:?}, undo {:?}, source {:?}, program at {:?}, events {:?}",
+                spans(&app, 0),
+                app.engine.published().undo_label,
+                app.engine.source().map(|s| s.asset),
+                app.engine.playhead_of(ve_engine::Viewer::Program),
+                app.engine.drain_events()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let seq = app.engine.snapshot().active().unwrap().clone();
     let clip = seq.tracks[0].clips.iter().find(|c| c.timeline_start == s(22)).expect("cut in at the playhead");
     assert_eq!(clip.source_range, ve_time::TimeRange::new(s(2), out - s(2)), "just the marked part");
@@ -449,3 +464,149 @@ fn source_monitor_three_point_insert() {
     assert_eq!(app.engine.playhead_of(ve_engine::Viewer::Program), s(22) + (out - s(2)));
 }
 
+fn set_sequence_marks(app: &EditorUi, i: i64, o: i64) {
+    let seq = app.engine.snapshot().active().unwrap().id;
+    let marks = Marks {
+        in_point: Some(Time::from_seconds(i)),
+        out_point: Some(Time::from_seconds(o)),
+        ..Default::default()
+    };
+    app.engine.execute(Command::SetMarks {
+        owner: ve_engine::MarksOwner::Sequence(seq),
+        marks,
+    });
+}
+
+/// (start, length) in whole seconds of each clip on track `i`.
+fn spans(app: &EditorUi, i: usize) -> Vec<(f64, f64)> {
+    let r = |t: Time| (t.as_seconds_f64() * 100.0).round() / 100.0;
+    app.engine.snapshot().active().unwrap().tracks[i]
+        .clips
+        .iter()
+        .map(|c| (r(c.timeline_start), r(c.source_range.duration)))
+        .collect()
+}
+
+/// Lift (;) leaves a gap on the targeted tracks; Extract (') closes it on
+/// every track and parks the playhead at the join.
+#[test]
+fn lift_and_extract_from_the_keyboard() {
+    let mut app = editor();
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    for _ in 0..4 {
+        frame(&mut ui, &mut app);
+    }
+    // V1: Tikal 0–6, Atitlan 6–8, Antigua 8–22 (half speed). V1 and A1 targeted.
+    let v2_before = spans(&app, 1);
+    set_sequence_marks(&app, 1, 3);
+    // The fixture has marks already (1–12 s): wait for these.
+    wait(&app.engine, |c| {
+        c.snapshot().active().unwrap().marks.out_point == Some(Time::from_seconds(3))
+    });
+    frame(&mut ui, &mut app);
+    press(&mut ui, &mut app, Key::Semicolon, Modifiers::NONE);
+    wait(&app.engine, |c| {
+        c.published().undo_label.as_deref() == Some("Lift")
+    });
+    assert_eq!(
+        spans(&app, 0)[..2],
+        [(0.0, 1.0), (3.0, 3.0)],
+        "a gap 1–3 on V1"
+    );
+    assert_eq!(spans(&app, 1), v2_before, "untargeted V2 untouched");
+
+    app.engine.undo();
+    wait(&app.engine, |c| {
+        c.published().undo_label.as_deref() != Some("Lift")
+    });
+    frame(&mut ui, &mut app);
+    press(&mut ui, &mut app, Key::Quote, Modifiers::NONE);
+    wait(&app.engine, |c| {
+        c.published().undo_label.as_deref() == Some("Extract")
+    });
+    assert_eq!(
+        spans(&app, 0)[..2],
+        [(0.0, 1.0), (1.0, 3.0)],
+        "closed up on V1"
+    );
+    assert_eq!(
+        spans(&app, 1)[0].0,
+        1.0,
+        "V2's clip (was at 3) moved up 2 s too: in sync"
+    );
+    let seq = app.engine.snapshot().active().unwrap().clone();
+    assert_eq!(
+        (seq.marks.in_point, seq.marks.out_point),
+        (None, None),
+        "the range is gone, so are its marks"
+    );
+    frame(&mut ui, &mut app);
+    assert_eq!(
+        app.engine.playhead_of(ve_engine::Viewer::Program),
+        Time::from_seconds(1)
+    );
+}
+
+/// Match Frame (F) opens the clip under the playhead in the Source monitor
+/// at the same frame, marked to the part used; Shift+R goes back.
+#[test]
+fn match_frame_and_back() {
+    let mut app = editor();
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    for _ in 0..4 {
+        frame(&mut ui, &mut app);
+    }
+    let s = Time::from_seconds;
+    let tikal = app
+        .engine
+        .snapshot()
+        .assets
+        .values()
+        .find(|a| a.name == "Tikal.mp4")
+        .unwrap()
+        .id;
+    app.engine.seek(s(4)); // Tikal on V1, 0–6
+    frame(&mut ui, &mut app);
+    press(&mut ui, &mut app, Key::F, Modifiers::NONE);
+    wait(&app.engine, |c| {
+        c.source().is_some_and(|x| x.asset == tikal)
+    });
+    for _ in 0..3 {
+        frame(&mut ui, &mut app);
+    }
+    assert_eq!(
+        app.engine.playhead_of(ve_engine::Viewer::Source),
+        s(4),
+        "the matching frame"
+    );
+    let marks = app
+        .engine
+        .snapshot()
+        .assets
+        .get(&tikal)
+        .unwrap()
+        .marks
+        .clone();
+    assert_eq!(
+        (marks.in_point, marks.out_point),
+        (Some(s(0)), Some(s(6))),
+        "marked to the clip's part"
+    );
+
+    // In the Source monitor, go to 5 s; Shift+R finds it in the sequence.
+    app.engine.seek(s(5));
+    app.engine.set_viewer(ve_engine::Viewer::Program);
+    app.engine.seek(s(15));
+    frame(&mut ui, &mut app);
+    press(
+        &mut ui,
+        &mut app,
+        Key::R,
+        Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        },
+    );
+    frame(&mut ui, &mut app);
+    assert_eq!(app.engine.playhead_of(ve_engine::Viewer::Program), s(5));
+}

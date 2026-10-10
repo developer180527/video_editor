@@ -465,6 +465,55 @@ pub fn lift(p: &Project, clips: &[ClipId], follow_links: bool) -> Result<Command
     b.finish("Delete")
 }
 
+/// Split at `range`'s ends and remove whatever lies inside it, on each of
+/// `tracks`. Linked halves split together stay linked to each other.
+fn clear_range(b: &mut Builder, seq: SequenceId, tracks: &[TrackId], range: ve_time::TimeRange) -> Result<(), CommandError> {
+    let mut links = HashMap::new();
+    for &t in tracks {
+        for cut in [range.start, range.end()] {
+            if let Some(c) = track(b.project(), seq, t)?.clip_at(cut).cloned() {
+                split(b, c.id, cut, &mut links)?;
+            }
+        }
+        let inside: Vec<ClipId> = track(b.project(), seq, t)?
+            .clips
+            .iter()
+            .filter(|c| c.timeline_start >= range.start && c.timeline_range().end() <= range.end())
+            .map(|c| c.id)
+            .collect();
+        for c in inside {
+            b.push(Command::RemoveClip { clip: c })?;
+        }
+    }
+    Ok(())
+}
+
+/// Lift (;): remove `range` (the sequence's in to out) from `tracks`,
+/// leaving a gap; clips crossing its ends are cut there.
+pub fn lift_range(p: &Project, seq: SequenceId, tracks: &[TrackId], range: ve_time::TimeRange) -> Result<Command, CommandError> {
+    if range.duration <= Time::ZERO {
+        return Err(CommandError::BadRange);
+    }
+    let mut b = Builder::new(p);
+    clear_range(&mut b, seq, tracks, range)?;
+    b.finish("Lift")
+}
+
+/// Extract ('): remove `range` from `tracks` and close the gap. Everything
+/// after it moves left on each of those tracks, so pass every track that
+/// must stay in sync (all unlocked ones, as with Premiere's sync lock).
+pub fn extract_range(p: &Project, seq: SequenceId, tracks: &[TrackId], range: ve_time::TimeRange) -> Result<Command, CommandError> {
+    if range.duration <= Time::ZERO {
+        return Err(CommandError::BadRange);
+    }
+    let mut b = Builder::new(p);
+    clear_range(&mut b, seq, tracks, range)?;
+    for &t in tracks {
+        shift_track(&mut b, seq, t, range.end(), Time::ZERO - range.duration, &[])?;
+    }
+    b.finish("Extract")
+}
+
 /// Edges worth snapping to: clip starts and ends on every track (except the
 /// clips being dragged), the playhead, and zero.
 pub fn snap_points(seq: &Sequence, except: &[ClipId], playhead: Time) -> Vec<Time> {

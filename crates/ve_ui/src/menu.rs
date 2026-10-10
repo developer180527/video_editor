@@ -46,6 +46,10 @@ pub enum Action {
     /// The Source monitor's marked part into the sequence.
     InsertFromSource,
     OverwriteFromSource,
+    Lift,
+    Extract,
+    MatchFrame,
+    ReverseMatchFrame,
     /// Keep the current window layout for the next start.
     SaveLayout,
     /// Show a panel that is closed, or close one that is open.
@@ -151,7 +155,13 @@ impl EditorUi {
             .item("Audio Channels…", Action::Channels, None, has_clip);
         out.push(b.menu("Clip"));
 
-        b.on("Add Edit", Action::AddEdit, primary(Key::K))
+        b.on("Match Frame", Action::MatchFrame, key(Key::F))
+            .item("Reverse Match Frame", Action::ReverseMatchFrame, Some(Chord::key(Key::R).shift()), self.engine.source().is_some())
+            .sep()
+            .on("Lift", Action::Lift, key(Key::Semicolon))
+            .on("Extract", Action::Extract, key(Key::Quote))
+            .sep()
+            .on("Add Edit", Action::AddEdit, primary(Key::K))
             .sep()
             .on("Apply Video Transition", Action::VideoTransition, primary(Key::D))
             .on("Apply Audio Transition", Action::AudioTransition, Some(Chord::primary(Key::D).shift()))
@@ -206,8 +216,14 @@ impl EditorUi {
             }
             Action::LinkMedia => self.requests.extend(self.view.selected_asset.map(HostRequest::RelinkMedia)),
             Action::Export => self.show_export = true,
-            Action::Undo => self.engine.undo(),
-            Action::Redo => self.engine.redo(),
+            Action::Undo => {
+                self.pending_marks = None;
+                self.engine.undo()
+            }
+            Action::Redo => {
+                self.pending_marks = None;
+                self.engine.redo()
+            }
             Action::Speed => self.open_speed_dialog(),
             Action::FrameHold => self.frame_hold(),
             Action::Nest => self.open_nest_dialog(),
@@ -237,6 +253,10 @@ impl EditorUi {
             Action::NewTitle => self.new_generator(intrinsic::TITLE, self.playhead, None),
             Action::NewColorMatte => self.new_generator(intrinsic::COLOR_MATTE, self.playhead, None),
             Action::NewBars => self.new_generator(intrinsic::BARS, self.playhead, None),
+            Action::Lift => self.lift(),
+            Action::Extract => self.extract(),
+            Action::MatchFrame => self.match_frame(),
+            Action::ReverseMatchFrame => self.reverse_match_frame(),
             Action::InsertFromSource => self.edit_from_source(true),
             Action::OverwriteFromSource => self.edit_from_source(false),
             Action::OpenSettings => self.open_floating(Tab::Settings, Vec2::new(560.0, 520.0)),

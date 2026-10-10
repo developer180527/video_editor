@@ -10,6 +10,7 @@
 
 mod color_panel;
 mod dock;
+mod editing;
 mod effects;
 mod features;
 mod menu;
@@ -256,6 +257,11 @@ pub struct EditorUi {
     /// (after an edit the engine has not applied yet).
     /// Dropped after a second: the edit failed.
     pub(crate) seek_after_edit: Option<(Time, std::time::Instant)>,
+    /// Where the Source monitor goes once this asset has opened in it
+    /// (Match Frame): the engine opens it at its in point first.
+    pub(crate) source_seek_on_open: Option<(AssetId, Time)>,
+    /// The marks last sent, until the engine publishes them.
+    pub(crate) pending_marks: Option<(ve_engine::MarksOwner, Marks, std::time::Instant)>,
     /// The Source picture is still decoding: keep drawing.
     source_catching_up: bool,
     /// Refusals from this frame, shown as toasts on the next.
@@ -339,6 +345,8 @@ impl EditorUi {
             source_wanted: false,
             source_catching_up: false,
             seek_after_edit: None,
+            source_seek_on_open: None,
+            pending_marks: None,
             errors: Vec::new(),
             requests: Vec::new(),
             touch,
@@ -820,6 +828,12 @@ impl EditorUi {
             self.st = self.engine.published();
             self.playhead = self.engine.playhead_of(Viewer::Program);
             self.source_playhead = self.engine.playhead_of(Viewer::Source);
+            if let Some((asset, t)) = self.source_seek_on_open {
+                if self.engine.source().is_some_and(|s| s.asset == asset) {
+                    self.source_seek_on_open = None;
+                    self.seek_source(t);
+                }
+            }
             if let Some((t, since)) = self.seek_after_edit {
                 if self.snap().active().is_some_and(|s| s.duration() >= t) {
                     self.seek_after_edit = None;
@@ -913,8 +927,10 @@ impl EditorUi {
         let key = |ui: &mut Ui, k: Key| ui.consume_shortcut(Shortcut::plain(k));
 
         if cmd_shift(ui, Key::Z) {
+            self.pending_marks = None;
             self.engine.redo();
         } else if cmd(ui, Key::Z) {
+            self.pending_marks = None;
             self.engine.undo();
         }
         if cmd(ui, Key::I) {
@@ -1008,6 +1024,7 @@ impl EditorUi {
         if key(ui, Key::ArrowRight) {
             self.nudge(1);
         }
+        editing::shortcuts(self, ui);
         // Three-point editing from the Source monitor: , inserts, . overwrites.
         if key(ui, Key::Comma) {
             self.edit_from_source(true);

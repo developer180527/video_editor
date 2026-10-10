@@ -87,7 +87,13 @@ impl EditorUi {
     }
 
     fn set_marks(&mut self, f: impl FnOnce(&mut Marks)) {
-        let Some((owner, old)) = self.marks_owner() else { return };
+        let Some((owner, published)) = self.marks_owner() else { return };
+        // Marks sent a moment ago may not be published yet: build on them,
+        // or a quick I then O would send O with the old In and lose it.
+        let old = match &self.pending_marks {
+            Some((o, m, at)) if *o == owner && *m != published && at.elapsed().as_secs_f32() < 1.0 => m.clone(),
+            _ => published,
+        };
         let mut marks = old.clone();
         f(&mut marks);
         // Keep in ≤ out: a new in after the out (or out before the in) clears the other.
@@ -100,6 +106,7 @@ impl EditorUi {
                 }
             }
         }
+        self.pending_marks = Some((owner, marks.clone(), std::time::Instant::now()));
         self.run(Command::SetMarks { owner, marks });
     }
 

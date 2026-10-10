@@ -329,3 +329,32 @@ fn frame_hold_freezes_from_the_cut() {
     assert_eq!(clips[1].source_time(s(7)), s(13), "held");
     assert_eq!(clips[0].source_time(s(2)), s(12), "before the cut it plays");
 }
+
+#[test]
+fn lift_leaves_a_gap_and_extract_closes_it() {
+    let mut f = fixture();
+    let l = LinkId::new();
+    // V1: 0–10 and 10–20; A1: 0–20 linked to the first.
+    let (v1, v2) = (linked_clip(&f, 0, 0, 10, Some(l)), clip(&f, 10, 50, 10));
+    let a = linked_clip(&f, 0, 0, 20, Some(l));
+    put(&mut f, true, &v1);
+    put(&mut f, true, &v2);
+    put(&mut f, false, &a);
+    let range = TimeRange::new(s(6), s(8)); // 6–14, across the cut at 10
+
+    // Lift on V1 only: a gap 6–14 there; A1 untouched.
+    let p = run(&f, lift_range(&f.p, f.seq, &[f.v1], range).unwrap());
+    assert_eq!(layout(&p, f.seq, f.v1), [(0, 0, 6), (14, 54, 6)]);
+    assert_eq!(layout(&p, f.seq, f.a1), [(0, 0, 20)]);
+
+    // Extract on both: the range is gone and everything after closes up.
+    let p = run(&f, extract_range(&f.p, f.seq, &[f.v1, f.a1], range).unwrap());
+    assert_eq!(layout(&p, f.seq, f.v1), [(0, 0, 6), (6, 54, 6)]);
+    assert_eq!(layout(&p, f.seq, f.a1), [(0, 0, 6), (6, 14, 6)]);
+    // Linked halves on each side stay linked to each other.
+    let seq = p.sequence(f.seq).unwrap();
+    assert_eq!(seq.tracks[0].clips[0].link, seq.tracks[1].clips[0].link);
+
+    // An empty range is refused.
+    assert!(lift_range(&f.p, f.seq, &[f.v1], TimeRange::new(s(3), Time::ZERO)).is_err());
+}
