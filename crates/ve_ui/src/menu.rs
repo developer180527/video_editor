@@ -43,6 +43,9 @@ pub enum Action {
     NewColorMatte,
     NewBars,
     OpenSettings,
+    /// The Source monitor's marked part into the sequence.
+    InsertFromSource,
+    OverwriteFromSource,
     /// Keep the current window layout for the next start.
     SaveLayout,
     /// Show a panel that is closed, or close one that is open.
@@ -137,7 +140,11 @@ impl EditorUi {
             .item(redo, Action::Redo, Some(Chord::primary(Key::Z).shift()), self.st.redo_label.is_some());
         out.push(b.menu("Edit"));
 
-        b.item("Speed/Duration…", Action::Speed, primary(Key::R), has_clip)
+        let has_source = self.engine.source().is_some();
+        b.item("Insert", Action::InsertFromSource, key(Key::Comma), has_source)
+            .item("Overwrite", Action::OverwriteFromSource, key(Key::Period), has_source)
+            .sep()
+            .item("Speed/Duration…", Action::Speed, primary(Key::R), has_clip)
             .item("Add Frame Hold", Action::FrameHold, None, has_clip)
             .sep()
             .item("Nest…", Action::Nest, None, sel)
@@ -230,6 +237,8 @@ impl EditorUi {
             Action::NewTitle => self.new_generator(intrinsic::TITLE, self.playhead, None),
             Action::NewColorMatte => self.new_generator(intrinsic::COLOR_MATTE, self.playhead, None),
             Action::NewBars => self.new_generator(intrinsic::BARS, self.playhead, None),
+            Action::InsertFromSource => self.edit_from_source(true),
+            Action::OverwriteFromSource => self.edit_from_source(false),
             Action::OpenSettings => self.open_floating(Tab::Settings, Vec2::new(560.0, 520.0)),
             Action::SaveLayout => self.requests.push(HostRequest::SaveLayout),
             Action::TogglePanel(tab) => dock::toggle_tab(&mut self.dock, *tab),

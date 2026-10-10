@@ -263,6 +263,14 @@ fn color_scopes_and_mixer_panels() {
         app.view.scope = ve_render::scopes::ScopeKind::Vectorscope;
     });
     render(&mut app, 2000, 1129, "panel-mixer.png", |app| show(app, ve_ui::Tab::TrackMixer));
+    // The Source monitor with a clip marked.
+    let snap = app.engine.snapshot();
+    let tikal = snap.assets.values().find(|a| a.name == "Tikal.mp4").unwrap().id;
+    let marks = Marks { in_point: Some(Time::from_seconds(4)), out_point: Some(Time::from_seconds(12)), ..Default::default() };
+    app.engine.execute(Command::SetMarks { owner: ve_engine::MarksOwner::Asset(tikal), marks });
+    app.engine.set_source(tikal);
+    wait(&app.engine, |c| c.source().is_some());
+    render(&mut app, 2000, 1129, "panel-source.png", |app| show(app, ve_ui::Tab::Source));
 }
 
 fn frame(ui: &mut Ui, app: &mut EditorUi) {
@@ -381,3 +389,63 @@ fn marks_and_transitions_from_the_keyboard() {
     assert_eq!(t.before + t.after, Time::from_seconds(1), "one second, centred");
     assert_eq!(t.before, t.after);
 }
+
+/// Three-point editing through the UI: open a clip in the Source monitor,
+/// mark it with I and O, shuttle with L, then cut it in with comma.
+#[test]
+fn source_monitor_three_point_insert() {
+    let mut app = editor();
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    for _ in 0..4 {
+        frame(&mut ui, &mut app);
+    }
+    let snap = app.engine.snapshot();
+    let atitlan = snap.assets.values().find(|a| a.name == "Atitlan.mp4").unwrap().id;
+    app.engine.set_source(atitlan);
+    wait(&app.engine, |c| c.viewer() == ve_engine::Viewer::Source);
+    frame(&mut ui, &mut app);
+    let s = Time::from_seconds;
+
+    // Marks go on the clip, not the sequence.
+    app.engine.seek(s(2));
+    frame(&mut ui, &mut app);
+    press(&mut ui, &mut app, Key::I, Modifiers::NONE);
+    app.engine.seek(s(5));
+    frame(&mut ui, &mut app);
+    press(&mut ui, &mut app, Key::O, Modifiers::NONE);
+    let out = s(5) + Rate::FPS_24.frame_to_time(1);
+    wait(&app.engine, |c| c.snapshot().assets.get(&atitlan).unwrap().marks.out_point.is_some());
+    let marks = app.engine.snapshot().assets.get(&atitlan).unwrap().marks.clone();
+    assert_eq!(marks.in_point, Some(s(2)));
+    assert_eq!(marks.out_point, Some(out), "the end of the frame at 5 s");
+    let seq_marks = app.engine.snapshot().active().unwrap().marks.clone();
+    assert_ne!(seq_marks.in_point, Some(s(2)), "the sequence's marks are untouched");
+
+    // L plays the source, L again doubles, K stops: the program stays put.
+    let program = app.engine.playhead_of(ve_engine::Viewer::Program);
+    press(&mut ui, &mut app, Key::L, Modifiers::NONE);
+    assert!(matches!(app.engine.published().transport.state(), ve_engine::State::Playing { rate } if rate == 1.0));
+    press(&mut ui, &mut app, Key::L, Modifiers::NONE);
+    assert!(matches!(app.engine.published().transport.state(), ve_engine::State::Playing { rate } if rate == 2.0));
+    press(&mut ui, &mut app, Key::K, Modifiers::NONE);
+    assert!(!app.engine.is_playing());
+    assert_eq!(app.engine.playhead_of(ve_engine::Viewer::Program), program);
+
+    // Clear the sequence's in/out and park the program at 22 s (the end).
+    app.engine.execute(Command::SetMarks { owner: ve_engine::MarksOwner::Sequence(app.engine.snapshot().active().unwrap().id), marks: Default::default() });
+    app.engine.set_viewer(ve_engine::Viewer::Program);
+    app.engine.seek(s(22));
+    frame(&mut ui, &mut app);
+    // Comma inserts the marked part at the program playhead.
+    press(&mut ui, &mut app, Key::Comma, Modifiers::NONE);
+    wait(&app.engine, |c| c.snapshot().active().unwrap().tracks[0].clips.len() == 4);
+    let seq = app.engine.snapshot().active().unwrap().clone();
+    let clip = seq.tracks[0].clips.iter().find(|c| c.timeline_start == s(22)).expect("cut in at the playhead");
+    assert_eq!(clip.source_range, ve_time::TimeRange::new(s(2), out - s(2)), "just the marked part");
+    let audio = seq.tracks[2].clips.iter().find(|c| c.timeline_start == s(22)).expect("with its sound");
+    assert_eq!(audio.source_range, clip.source_range);
+    // The program playhead parks after the new clip.
+    frame(&mut ui, &mut app);
+    assert_eq!(app.engine.playhead_of(ve_engine::Viewer::Program), s(22) + (out - s(2)));
+}
+

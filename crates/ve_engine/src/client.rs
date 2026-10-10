@@ -42,6 +42,15 @@ pub struct Published {
     pub busy: Option<String>,
     /// Audio levels, once the audio device is open.
     pub meters: Option<Arc<ve_media::Meters>>,
+    /// Which monitor `transport` plays; the other waits in `parked`.
+    pub viewer: crate::Viewer,
+    pub parked: Transport,
+    pub source: Option<crate::SourceView>,
+    /// Counts the client's own transport changes (play, seek, switching
+    /// monitors). Until the engine has adopted the latest, a publish keeps
+    /// the client's transport: otherwise an edit's publish, made before the
+    /// engine saw a seek, would put the playhead back for a moment.
+    pub transport_rev: u64,
 }
 
 enum Request {
@@ -55,11 +64,14 @@ enum Request {
     Open(MediaRef),
     /// The transport exactly as the client set it (play, stop, seek), so
     /// both sides share one anchor and the playhead never jumps.
-    Transport(Transport),
+    Transport(Transport, u64),
     Looping(bool),
     AttachProxy(ve_model::AssetId, String),
     Relink(ve_model::AssetId, String),
     PreviewTrack(ve_model::TrackId, Option<(f32, f32)>),
+    SetSource(ve_model::AssetId),
+    /// The monitors exactly as the client switched them.
+    Viewer(crate::Viewer, Transport, Transport, u64),
 }
 
 pub struct EngineClient {
@@ -84,6 +96,10 @@ fn publish(e: &Engine, busy: Option<String>) -> Published {
         capabilities: e.capabilities(),
         busy,
         meters: e.meters(),
+        viewer: e.viewer(),
+        parked: e.parked().clone(),
+        source: e.source().cloned(),
+        transport_rev: 0,
     }
 }
 
@@ -103,8 +119,20 @@ impl Engine {
         std::thread::Builder::new()
             .name("ve-engine".into())
             .spawn(move || {
-                let flush = |e: &mut Engine, busy: Option<String>| {
-                    *out.lock().unwrap() = publish(e, busy);
+                // The client's transport changes the engine has adopted.
+                let mut adopted = 0u64;
+                let flush = |e: &mut Engine, busy: Option<String>, adopted: u64| {
+                    let mut next = publish(e, busy);
+                    let mut shared = out.lock().unwrap();
+                    next.transport_rev = shared.transport_rev;
+                    if shared.transport_rev > adopted {
+                        // The client has moved on since: keep its transport.
+                        next.transport = shared.transport.clone();
+                        next.parked = shared.parked.clone();
+                        next.viewer = shared.viewer;
+                    }
+                    *shared = next;
+                    drop(shared);
                     for ev in e.drain_events() {
                         let _ = etx.send(ev);
                     }
@@ -113,7 +141,7 @@ impl Engine {
                 // Open the audio device now, not on the first Play: opening
                 // takes a moment, and the clock should not change basis mid-play.
                 self.prepare_audio();
-                flush(&mut self, None);
+                flush(&mut self, None, adopted);
                 // Ends when the client is dropped. Between requests (and at
                 // least every AUTOSAVE_EVERY) unsaved changes are autosaved.
                 let mut last_autosave = std::time::Instant::now();
@@ -150,7 +178,7 @@ impl Engine {
                         Request::Import(paths) => {
                             for p in paths {
                                 let name = std::path::Path::new(&p).file_name().map(|n| n.to_string_lossy().into_owned());
-                                flush(&mut self, Some(format!("Importing {}", name.unwrap_or_else(|| p.clone()))));
+                                flush(&mut self, Some(format!("Importing {}", name.unwrap_or_else(|| p.clone()))), adopted);
                                 if let Err(err) = self.import(&p) {
                                     let _ = etx.send(Event::Error(format!("{p}: {err}")));
                                 }
@@ -167,9 +195,21 @@ impl Engine {
                                 let _ = etx.send(Event::Error(format!("Open failed: {err}")));
                             }
                         }
-                        Request::Transport(t) => self.adopt_transport(t),
+                        Request::Transport(t, rev) => {
+                            adopted = adopted.max(rev);
+                            self.adopt_transport(t)
+                        }
                         Request::Looping(on) => self.set_looping(on),
                         Request::PreviewTrack(track, mix) => self.preview_track(track, mix),
+                        Request::SetSource(asset) => {
+                            if let Err(err) = self.set_source(asset) {
+                                let _ = etx.send(Event::Error(err.to_string()));
+                            }
+                        }
+                        Request::Viewer(v, active, parked, rev) => {
+                            adopted = adopted.max(rev);
+                            self.adopt_viewer(v, active, parked)
+                        }
                         Request::AttachProxy(asset, path) => {
                             if let Err(err) = self.attach_proxy(asset, &path) {
                                 let _ = etx.send(Event::Error(format!("{path}: {err}")));
@@ -181,7 +221,7 @@ impl Engine {
                             }
                         }
                     }
-                    flush(&mut self, None);
+                    flush(&mut self, None, adopted);
                 }
             })
             .expect("engine thread");
@@ -274,9 +314,10 @@ impl EngineClient {
             let mut p = self.shared.lock().unwrap();
             let now = self.clocks(&p);
             f(&mut p.transport, now);
-            p.transport.clone()
+            p.transport_rev += 1;
+            (p.transport.clone(), p.transport_rev)
         };
-        self.send(Request::Transport(t));
+        self.send(Request::Transport(t.0, t.1));
     }
 
     pub fn play(&self, rate: f64) {
@@ -296,6 +337,46 @@ impl EngineClient {
         self.send(Request::Looping(on));
     }
 
+    /// Which monitor the transport plays.
+    pub fn viewer(&self) -> crate::Viewer {
+        self.shared.lock().unwrap().viewer
+    }
+
+    pub fn source(&self) -> Option<crate::SourceView> {
+        self.shared.lock().unwrap().source.clone()
+    }
+
+    /// Open `asset` in the Source monitor (it becomes the active monitor).
+    pub fn set_source(&self, asset: ve_model::AssetId) {
+        self.send(Request::SetSource(asset));
+    }
+
+    /// Make `v` the monitor the transport plays: the other stops where it
+    /// is and waits. Switched here at once, so playheads never jump.
+    pub fn set_viewer(&self, v: crate::Viewer) {
+        let msg = {
+            let mut p = self.shared.lock().unwrap();
+            if p.viewer == v || (v == crate::Viewer::Source && p.source.is_none()) {
+                return;
+            }
+            let now = self.clocks(&p);
+            p.transport.stop(now);
+            let p = &mut *p;
+            std::mem::swap(&mut p.transport, &mut p.parked);
+            p.viewer = v;
+            p.transport_rev += 1;
+            Request::Viewer(v, p.transport.clone(), p.parked.clone(), p.transport_rev)
+        };
+        self.send(msg);
+    }
+
+    /// `v`'s playhead, whether or not it is the active monitor.
+    pub fn playhead_of(&self, v: crate::Viewer) -> Time {
+        let p = self.shared.lock().unwrap();
+        let now = self.clocks(&p);
+        if p.viewer == v { p.transport.position_at(now) } else { p.parked.position_at(now) }
+    }
+
     pub fn is_playing(&self) -> bool {
         matches!(self.shared.lock().unwrap().transport.state(), State::Playing { .. })
     }
@@ -312,19 +393,31 @@ impl EngineClient {
         snap.active().map(|s| ve_render::evaluate(s, t, quality))
     }
 
-    /// The frame at the playhead, resolved for the compositor with whatever
-    /// the decoders have ready. Never blocks.
+    /// The Program monitor's frame at its playhead, resolved for the
+    /// compositor with whatever the decoders have ready. Never blocks.
     pub fn frame(&self, quality: Quality) -> Option<crate::Frame> {
+        self.frame_of(crate::Viewer::Program, quality)
+    }
+
+    /// Monitor `v`'s frame at its playhead. Never blocks.
+    pub fn frame_of(&self, v: crate::Viewer, quality: Quality) -> Option<crate::Frame> {
         let p = self.published();
-        let t = p.transport.position_at(self.clocks(&p));
-        let plan = p.snapshot.active().map(|s| ve_render::evaluate(s, t, quality))?;
+        let now = self.clocks(&p);
+        let transport = if p.viewer == v { &p.transport } else { &p.parked };
+        let t = transport.position_at(now);
+        // The Source monitor's asset plays as a sequence of its own.
+        let project = match v {
+            crate::Viewer::Program => p.snapshot.clone(),
+            crate::Viewer::Source => p.source.as_ref()?.project(&p.snapshot),
+        };
+        let plan = project.active().map(|s| ve_render::evaluate(s, t, quality))?;
         // Playing forwards: have the next cut's pictures ready in time.
-        if let State::Playing { rate } = p.transport.state() {
+        if let State::Playing { rate } = transport.state() {
             if rate > 0.0 {
-                crate::frame::prefetch(&p.snapshot, t, Time::from_seconds_f64(2.0 * rate), quality.use_proxies, &self.video);
+                crate::frame::prefetch(&project, t, Time::from_seconds_f64(2.0 * rate), quality.use_proxies, &self.video);
             }
         }
-        Some(crate::frame::resolve(&p.snapshot, plan, &p.plugins, &self.video, None))
+        Some(crate::frame::resolve(&project, plan, &p.plugins, &self.video, None))
     }
 
     pub fn video(&self) -> &Arc<ve_media::VideoPool> {

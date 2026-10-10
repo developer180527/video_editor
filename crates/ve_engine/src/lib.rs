@@ -18,6 +18,7 @@ mod clips;
 pub mod export;
 pub mod frame;
 mod project_file;
+mod viewer;
 
 pub use client::{EngineClient, Published, Waker};
 pub use clips::{clips_for_asset, default_value, make_clip, make_generator_clip, make_sequence_clip};
@@ -32,6 +33,7 @@ pub use ve_plugin_host::Registry as PluginRegistry;
 pub use ve_plugin_host::{EffectInfo, EffectKind, Implementation, ParamInfo, ParamKind};
 pub use ve_render::{FramePlan, Quality, TextureImporter};
 pub use frame::Frame;
+pub use viewer::{SourceView, Viewer};
 pub use export::{ExportPreset, ExportState};
 pub use ve_media::{Levels, Loudness, Meters, Stills, Thumb, PEAKS_PER_SECOND};
 
@@ -73,7 +75,13 @@ pub struct Engine {
     project: Snapshot,
     history: History,
     plugins: Arc<PluginRegistry>,
+    /// Plays the active monitor ([`Viewer`]).
     transport: Transport,
+    viewer: Viewer,
+    /// The other monitor's position, stopped, until it is active again.
+    parked: Transport,
+    /// The asset in the Source monitor.
+    source: Option<SourceView>,
     audio: Option<Box<dyn AudioStream>>,
     playback: Option<ve_media::Playback>,
     video: Arc<ve_media::VideoPool>,
@@ -100,6 +108,9 @@ impl Engine {
             history: History::default(),
             plugins: Arc::new(PluginRegistry::default()),
             transport: Transport::new(MIX_RATE),
+            viewer: Viewer::Program,
+            parked: Transport::new(MIX_RATE),
+            source: None,
             audio: None,
             playback: None,
             video,
@@ -187,7 +198,79 @@ impl Engine {
         self.session = SequenceId::new();
         self.autosaved = Some(self.project.clone());
         self.transport = Transport::new(MIX_RATE);
+        self.parked = Transport::new(MIX_RATE);
+        self.viewer = Viewer::Program;
+        self.source = None;
         self.events.push(Event::ProjectChanged);
+    }
+
+    // ---- the monitors -----------------------------------------------------
+
+    pub fn viewer(&self) -> Viewer {
+        self.viewer
+    }
+
+    pub fn source(&self) -> Option<&SourceView> {
+        self.source.as_ref()
+    }
+
+    /// The other monitor's transport (stopped).
+    pub fn parked(&self) -> &Transport {
+        &self.parked
+    }
+
+    /// How long `v`'s material is: where its playback stops.
+    fn end_of(&self, v: Viewer) -> Time {
+        match v {
+            Viewer::Program => self.project.active().map(|s| s.duration()).unwrap_or(Time::MAX),
+            Viewer::Source => self.source.as_ref().map(|s| s.duration()).unwrap_or(Time::ZERO),
+        }
+    }
+
+    fn sync_ends(&mut self) {
+        let other = match self.viewer {
+            Viewer::Program => Viewer::Source,
+            Viewer::Source => Viewer::Program,
+        };
+        self.transport.end = self.end_of(self.viewer);
+        self.parked.end = self.end_of(other);
+    }
+
+    /// Put `asset` in the Source monitor and make it the active monitor, at
+    /// its in point (its start without one).
+    pub fn set_source(&mut self, asset: AssetId) -> Result<(), EngineError> {
+        let Some(view) = SourceView::new(&self.plugins, &self.project, asset) else {
+            return Err(EngineError::Media(MediaError::Unsupported("this media has not been probed".into())));
+        };
+        let start = self.project.assets.get(&asset).and_then(|a| a.marks.in_point).unwrap_or(Time::ZERO);
+        self.source = Some(view);
+        let now = self.clocks();
+        if self.viewer == Viewer::Program {
+            self.transport.stop(now);
+            std::mem::swap(&mut self.transport, &mut self.parked);
+            self.viewer = Viewer::Source;
+        }
+        // Its length first: a seek is clamped to it.
+        self.sync_ends();
+        self.transport.stop(now);
+        self.transport.seek(start, now);
+        self.restart_audio();
+        self.events.push(Event::TransportChanged);
+        Ok(())
+    }
+
+    /// Take the client's monitors exactly as it set them (it switches
+    /// locally, so its playheads never jump).
+    pub fn adopt_viewer(&mut self, viewer: Viewer, active: Transport, parked: Transport) {
+        if viewer == Viewer::Source && self.source.is_none() {
+            return;
+        }
+        self.viewer = viewer;
+        self.transport = active;
+        self.parked = parked;
+        self.sync_ends();
+        self.restart_audio();
+        self.events.push(Event::TransportChanged);
     }
 
     pub fn execute(&mut self, cmd: Command) -> Result<(), CommandError> {
@@ -242,9 +325,19 @@ impl Engine {
     fn publish(&mut self, p: Project) {
         let audio_changed = !same_audio(&self.project, &p);
         self.project = Arc::new(p);
-        if let Some(seq) = self.project.active() {
-            self.transport.end = seq.duration();
+        // The Source monitor follows its asset: gone, it empties; changed
+        // (relinked, re-probed), it is rebuilt.
+        if let Some(s) = &self.source {
+            let asset = s.asset;
+            self.source = SourceView::new(&self.plugins, &self.project, asset);
+            if self.source.is_none() && self.viewer == Viewer::Source {
+                let now = self.clocks();
+                self.transport.stop(now);
+                std::mem::swap(&mut self.transport, &mut self.parked);
+                self.viewer = Viewer::Program;
+            }
         }
+        self.sync_ends();
         // Edits are heard at once while playing; ones that change no sound
         // (grading a picture) leave the audio alone.
         if self.is_playing() && audio_changed {
@@ -375,6 +468,7 @@ impl Engine {
             Ok(mut s) => {
                 let _ = s.play();
                 self.transport.set_sample_rate(s.config().sample_rate);
+                self.parked.set_sample_rate(s.config().sample_rate);
                 self.audio = Some(s);
                 self.playback = Some(playback);
             }
@@ -385,9 +479,15 @@ impl Engine {
     /// (Re)start the mixer at the playhead, when playing forwards at speed.
     fn restart_audio(&mut self) {
         let Some(pb) = &self.playback else { return };
-        match (self.transport.state(), self.project.active_sequence) {
-            (State::Playing { rate }, Some(seq)) if (rate - 1.0).abs() < 1e-9 => {
-                pb.play(self.project.clone(), seq, self.playhead());
+        // What the active monitor plays.
+        let target = match (self.viewer, &self.source) {
+            (Viewer::Source, Some(s)) => Some((s.project(&self.project), s.sequence.id)),
+            (Viewer::Source, None) => None,
+            (Viewer::Program, _) => self.project.active_sequence.map(|id| (self.project.clone(), id)),
+        };
+        match (self.transport.state(), target) {
+            (State::Playing { rate }, Some((project, seq))) if (rate - 1.0).abs() < 1e-9 => {
+                pb.play(project, seq, self.playhead());
             }
             _ => pb.stop(),
         }

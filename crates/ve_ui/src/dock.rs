@@ -120,7 +120,10 @@ impl TabViewer for Viewer<'_> {
     fn title(&self, tab: &Tab) -> String {
         let seq = self.app.snap().active().map(|s| s.name.clone()).unwrap_or_default();
         match tab {
-            Tab::Source => "Source: (no clips)".into(),
+            Tab::Source => match self.app.engine.source().and_then(|s| self.app.snap().assets.get(&s.asset).map(|a| a.name.clone())) {
+                Some(name) => format!("Source: {name}"),
+                None => "Source: (no clips)".into(),
+            },
             Tab::EffectControls => "Effect Controls".into(),
             Tab::AudioClipMixer => format!("Audio Clip Mixer: {seq}"),
             Tab::Metadata => "Metadata".into(),
@@ -147,7 +150,7 @@ impl TabViewer for Viewer<'_> {
 
     fn padding(&self, tab: &Tab) -> Insets {
         match tab {
-            Tab::Program | Tab::Timeline | Tab::EffectControls | Tab::Project | Tab::Scopes | Tab::TrackMixer => Insets::all(0.0),
+            Tab::Program | Tab::Source | Tab::Timeline | Tab::EffectControls | Tab::Project | Tab::Scopes | Tab::TrackMixer => Insets::all(0.0),
             _ => Insets::all(10.0),
         }
     }
@@ -160,6 +163,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Timeline => timeline::panel(ui, self.app),
             Tab::Effects => project::effects_list(ui, self.app),
             Tab::Info => info(ui, self.app),
+            Tab::Source => crate::source::panel(ui, self.app),
             Tab::Settings => crate::settings::panel(ui, self.app),
             Tab::Scopes => crate::scopes_panel::panel(ui, self.app),
             Tab::TrackMixer => crate::mixer_panel::panel(ui, self.app),

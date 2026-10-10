@@ -51,6 +51,7 @@ fn picture(ui: &mut Ui, app: &mut EditorUi) {
 }
 
 fn toggle_play(app: &mut EditorUi) {
+    app.engine.set_viewer(ve_engine::Viewer::Program);
     if app.engine.is_playing() {
         app.engine.stop();
     } else {
@@ -146,16 +147,19 @@ fn transport(ui: &mut Ui, app: &mut EditorUi) {
         let r = icon_button(ui, "add-marker", Icon::Marker, 22.0, false);
         tip(ui, &r, "Add Marker (M)");
         if r.clicked {
+            app.engine.set_viewer(ve_engine::Viewer::Program);
             app.add_marker();
         }
         let r = icon_button(ui, "in", Icon::MarkIn, 22.0, false);
         tip(ui, &r, "Mark In (I)");
         if r.clicked {
+            app.engine.set_viewer(ve_engine::Viewer::Program);
             app.mark_in();
         }
         let r = icon_button(ui, "out", Icon::MarkOut, 22.0, false);
         tip(ui, &r, "Mark Out (O)");
         if r.clicked {
+            app.engine.set_viewer(ve_engine::Viewer::Program);
             app.mark_out();
         }
         divider(ui, "t1", true, 18.0);

@@ -336,3 +336,49 @@ fn a_sequence_cannot_contain_itself() {
     let err = e.execute(Command::AddClip { sequence: inner.id, track: inner.tracks[0].id, clip: Arc::new(back) }).unwrap_err();
     assert!(matches!(err, CommandError::Invalid(ModelError::NestingCycle(_))), "{err:?}");
 }
+
+/// The Source monitor: an asset plays as a sequence of its own, with its
+/// own playhead; switching monitors keeps each one's position.
+#[test]
+fn the_source_monitor_has_its_own_playhead() {
+    let mut e = engine(&tmp("source-monitor"));
+    let stream = AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: "pcm".into(), layout: "stereo".into() };
+    let asset = Asset {
+        id: AssetId::new(),
+        name: "cam.mov".into(),
+        media: MediaRef("file:cam.mov".into()),
+        info: Some(MediaInfo {
+            duration: Time::from_seconds(10),
+            video: Some(VideoStreamInfo { width: 3840, height: 2160, rate: ve_time::Rate::FPS_25, codec: "h264".into() }),
+            audio: vec![stream.clone(), stream],
+        }),
+        variants: Vec::new(),
+        marks: Marks { in_point: Some(Time::from_seconds(2)), ..Default::default() },
+    };
+    e.execute(Command::AddAsset { asset: Arc::new(asset.clone()) }).unwrap();
+    add_generator_clip(&mut e, 0, 8);
+    e.seek(Time::from_seconds(1)); // the program playhead
+
+    e.set_source(asset.id).unwrap();
+    assert_eq!(e.viewer(), Viewer::Source);
+    assert_eq!(e.playhead(), Time::from_seconds(2), "opens at its in point");
+    let s = e.source().unwrap();
+    assert_eq!(s.duration(), Time::from_seconds(10));
+    assert_eq!((s.sequence.format.width, s.sequence.format.rate), (3840, ve_time::Rate::FPS_25), "the asset's own format");
+    let audio = s.sequence.tracks.iter().filter(|t| t.kind == TrackKind::Audio && !t.clips.is_empty()).count();
+    assert_eq!(audio, 2, "every audio stream plays");
+    assert!(!e.snapshot().sequences.contains_key(&s.sequence.id), "not part of the project");
+    assert_eq!(e.transport().end, Time::from_seconds(10));
+
+    e.seek(Time::from_seconds(5));
+    let (active, parked) = (e.transport().clone(), e.parked().clone());
+    // Back to the program: its playhead is where it was.
+    e.adopt_viewer(Viewer::Program, parked, active);
+    assert_eq!(e.playhead(), Time::from_seconds(1));
+    assert_eq!(e.parked().position_at(Clocks { audio: None, monotonic: ve_ports::clock_now() }), Time::from_seconds(5));
+
+    // Removing the asset empties the Source monitor.
+    e.execute(Command::RemoveAsset { asset: asset.id }).unwrap();
+    assert!(e.source().is_none());
+    assert_eq!(e.viewer(), Viewer::Program);
+}

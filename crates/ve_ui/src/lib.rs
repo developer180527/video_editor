@@ -17,6 +17,7 @@ mod mixer_panel;
 mod program;
 mod scopes_panel;
 mod settings;
+mod source;
 mod project;
 pub mod theme;
 mod timeline;
@@ -27,7 +28,7 @@ mod widgets;
 use std::collections::{HashMap, HashSet};
 
 use libgui::*;
-use ve_engine::{Command, EngineClient, Event, Published, Snapshot};
+use ve_engine::{Command, EngineClient, Event, Published, Snapshot, Viewer};
 use ve_model::*;
 use ve_render::Compositor;
 use ve_time::{Rate, Time, Timecode};
@@ -244,6 +245,19 @@ pub struct EditorUi {
     /// The engine's state as of this frame.
     st: Published,
     playhead: Time,
+    /// The Source monitor's playhead.
+    pub(crate) source_playhead: Time,
+    source_comp: Option<Compositor>,
+    source_tex: Option<TextureId>,
+    source_view: Option<wgpu::TextureView>,
+    /// A Source monitor panel was drawn: render its picture next frame.
+    pub(crate) source_wanted: bool,
+    /// Where to put the program playhead once the sequence is long enough
+    /// (after an edit the engine has not applied yet).
+    /// Dropped after a second: the edit failed.
+    pub(crate) seek_after_edit: Option<(Time, std::time::Instant)>,
+    /// The Source picture is still decoding: keep drawing.
+    source_catching_up: bool,
     /// Refusals from this frame, shown as toasts on the next.
     errors: Vec<String>,
     requests: Vec<HostRequest>,
@@ -318,6 +332,13 @@ impl EditorUi {
             pending_grade: None,
             st,
             playhead: Time::ZERO,
+            source_playhead: Time::ZERO,
+            source_comp: None,
+            source_tex: None,
+            source_view: None,
+            source_wanted: false,
+            source_catching_up: false,
+            seek_after_edit: None,
             errors: Vec::new(),
             requests: Vec::new(),
             touch,
@@ -389,6 +410,29 @@ impl EditorUi {
             let id = renderer.register_texture(&tex.create_view(&Default::default()));
             self.thumbs.insert(key, (tex, id));
         }
+        // The Source monitor's picture, while a Source panel shows it.
+        self.source_catching_up = false;
+        if std::mem::take(&mut self.source_wanted) {
+            if let Some(frame) = self.engine.frame_of(Viewer::Source, quality) {
+                let importer = &self.importer;
+                let comp = self.source_comp.get_or_insert_with(|| {
+                    let mut c = Compositor::new(device);
+                    c.set_importer(importer.clone());
+                    c
+                });
+                comp.render(device, queue, &frame.plan, &frame.layers, frame.seq_size, frame.space);
+                self.source_catching_up = !frame.complete;
+                self.errors.append(&mut comp.errors);
+                if let Some(tex) = comp.output() {
+                    let view = tex.create_view(&Default::default());
+                    match self.source_tex {
+                        Some(id) => renderer.update_texture(id, &view),
+                        None => self.source_tex = Some(renderer.register_texture(&view)),
+                    }
+                    self.source_view = Some(view);
+                }
+            }
+        }
         let Some(frame) = self.engine.frame(quality) else { return };
         let importer = &self.importer;
         let comp = self.compositor.get_or_insert_with(|| {
@@ -426,6 +470,7 @@ impl EditorUi {
         self.engine.is_playing()
             || self.st.busy.is_some()
             || self.catching_up
+            || self.source_catching_up
             || self.meter_db.iter().any(|d| *d > -95.0)
             || self.track_db.values().flatten().any(|d| *d > -95.0)
             || self.export.as_ref().is_some_and(|e| e.result().is_none())
@@ -595,10 +640,68 @@ impl EditorUi {
         }
     }
 
+    /// Move the Program monitor's playhead (it becomes the active monitor).
     fn seek(&mut self, t: Time) {
         let t = t.max(Time::ZERO);
+        self.engine.set_viewer(Viewer::Program);
         self.engine.seek(t);
         self.playhead = t;
+    }
+
+    /// Move the Source monitor's playhead (it becomes the active monitor).
+    pub(crate) fn seek_source(&mut self, t: Time) {
+        if self.engine.source().is_none() {
+            return;
+        }
+        let t = t.max(Time::ZERO);
+        self.engine.set_viewer(Viewer::Source);
+        self.engine.seek(t);
+        self.source_playhead = t;
+    }
+
+    /// The active monitor: what play, J/K/L, the arrows and marks act on.
+    pub(crate) fn viewer(&self) -> Viewer {
+        self.engine.viewer()
+    }
+
+    /// The active monitor's playhead, frame rate and length.
+    pub(crate) fn active_position(&self) -> (Time, Rate, Time) {
+        match (self.viewer(), self.engine.source()) {
+            (Viewer::Source, Some(s)) => (self.source_playhead, s.sequence.format.rate, s.duration()),
+            _ => (self.playhead, self.rate(), self.snap().active().map(|s| s.duration()).unwrap_or(Time::ZERO)),
+        }
+    }
+
+    fn seek_active(&mut self, t: Time) {
+        match self.viewer() {
+            Viewer::Source => self.seek_source(t),
+            Viewer::Program => self.seek(t),
+        }
+    }
+
+    /// Step the active monitor `frames` frames, stopped.
+    fn nudge(&mut self, frames: i64) {
+        self.engine.stop();
+        let (t, r, _) = self.active_position();
+        self.seek_active(r.frame_to_time(t.to_frame(r) + frames));
+    }
+
+    /// J and L, as editors shuttle: each press of the same key doubles the
+    /// speed (1×, 2×, 4×, 8×); the other key slows down, then reverses.
+    pub(crate) fn shuttle(&mut self, forward: bool) {
+        let dir = if forward { 1.0 } else { -1.0 };
+        let rate = match self.engine.published().transport.state() {
+            ve_engine::State::Playing { rate } => rate,
+            _ => 0.0,
+        };
+        let next = if rate * dir > 0.0 {
+            (rate * 2.0).clamp(-8.0, 8.0)
+        } else if rate.abs() > 1.0 {
+            rate / 2.0
+        } else {
+            dir
+        };
+        self.engine.play(next);
     }
 
     /// Start of the next frame at or after `t`, shifted by `frames`.
@@ -620,6 +723,9 @@ impl EditorUi {
             renderer.update_texture(id, view);
         }
         if let (Some(id), Some(view)) = (self.scope_tex, &self.scope_view) {
+            renderer.update_texture(id, view);
+        }
+        if let (Some(id), Some(view)) = (self.source_tex, &self.source_view) {
             renderer.update_texture(id, view);
         }
         for (tex, id) in self.thumbs.values() {
@@ -712,7 +818,16 @@ impl EditorUi {
         }
         if surface == SurfaceId::MAIN {
             self.st = self.engine.published();
-            self.playhead = self.engine.playhead();
+            self.playhead = self.engine.playhead_of(Viewer::Program);
+            self.source_playhead = self.engine.playhead_of(Viewer::Source);
+            if let Some((t, since)) = self.seek_after_edit {
+                if self.snap().active().is_some_and(|s| s.duration() >= t) {
+                    self.seek_after_edit = None;
+                    self.seek(t);
+                } else if since.elapsed().as_secs_f32() > 1.0 {
+                    self.seek_after_edit = None;
+                }
+            }
             for e in self.engine.drain_events() {
                 if let Event::Error(msg) = e {
                     self.errors.push(msg);
@@ -860,26 +975,45 @@ impl EditorUi {
                 self.run_edit(r);
             }
         }
-        if key(ui, Key::Space) || key(ui, Key::K) {
+        // Transport: on the active monitor (Source or Program).
+        if key(ui, Key::Space) {
             if self.engine.is_playing() {
                 self.engine.stop();
-            } else if !ui.key_pressed(Key::K) {
+            } else {
                 self.engine.play(1.0);
             }
         }
+        if key(ui, Key::K) {
+            self.engine.stop();
+        }
+        // With K held, J and L step a frame; otherwise they shuttle.
+        let k_held = ui.key_down(Key::K);
         if key(ui, Key::L) {
-            self.engine.play(1.0);
+            if k_held {
+                self.nudge(1);
+            } else {
+                self.shuttle(true);
+            }
         }
         if key(ui, Key::J) {
-            self.engine.play(-1.0);
+            if k_held {
+                self.nudge(-1);
+            } else {
+                self.shuttle(false);
+            }
         }
         if key(ui, Key::ArrowLeft) {
-            self.engine.stop();
-            self.seek(self.step(-1));
+            self.nudge(-1);
         }
         if key(ui, Key::ArrowRight) {
-            self.engine.stop();
-            self.seek(self.step(1));
+            self.nudge(1);
+        }
+        // Three-point editing from the Source monitor: , inserts, . overwrites.
+        if key(ui, Key::Comma) {
+            self.edit_from_source(true);
+        }
+        if key(ui, Key::Period) {
+            self.edit_from_source(false);
         }
         if key(ui, Key::ArrowUp) || key(ui, Key::ArrowDown) {
             let up = ui.key_pressed(Key::ArrowUp);
@@ -896,12 +1030,11 @@ impl EditorUi {
             }
         }
         if key(ui, Key::Home) {
-            self.seek(Time::ZERO);
+            self.seek_active(Time::ZERO);
         }
         if key(ui, Key::End) {
-            if let Some(end) = self.snap().active().map(|s| s.duration()) {
-                self.seek(end);
-            }
+            let (_, _, end) = self.active_position();
+            self.seek_active(end);
         }
         let shift_delete = ui.consume_shortcut(Shortcut::plain(Key::Delete).shift()) || ui.consume_shortcut(Shortcut::plain(Key::Backspace).shift());
         let delete = key(ui, Key::Delete) || key(ui, Key::Backspace);
@@ -952,14 +1085,27 @@ impl EditorUi {
 
     /// Put `asset` on the targeted tracks at `at`: an overwrite edit, or an
     /// insert edit, video and audio linked — one undo step.
+    /// Put `asset` into the sequence at `at`: its marked part (in to out),
+    /// or all of it.
     fn place_asset(&mut self, asset: AssetId, at: Time, video_track: Option<TrackId>, insert: bool) {
-        let Some(seq) = self.snap().active().cloned() else { return };
         let Some(a) = self.snap().assets.get(&asset).cloned() else { return };
         let Some(info) = a.info.clone() else {
             self.errors.push(format!("{} has not been probed", a.name));
             return;
         };
-        let duration = if info.duration > Time::ZERO { info.duration } else { Time::from_seconds(5) };
+        let media = if info.duration > Time::ZERO { info.duration } else { Time::from_seconds(5) };
+        let start = a.marks.in_point.unwrap_or(Time::ZERO).clamp_to(Time::ZERO, media);
+        let end = a.marks.out_point.unwrap_or(media).clamp_to(start, media);
+        if end > start {
+            self.place_range(asset, ve_time::TimeRange::new(start, end - start), at, video_track, insert);
+        }
+    }
+
+    /// Put `range` of `asset`'s media into the sequence at `at`.
+    fn place_range(&mut self, asset: AssetId, range: ve_time::TimeRange, at: Time, video_track: Option<TrackId>, insert: bool) {
+        let Some(seq) = self.snap().active().cloned() else { return };
+        let Some(a) = self.snap().assets.get(&asset).cloned() else { return };
+        let duration = range.duration;
         let target = |kind: TrackKind, explicit: Option<TrackId>| {
             explicit
                 .filter(|id| seq.track(*id).is_some_and(|(_, t)| t.kind == kind))
@@ -967,7 +1113,11 @@ impl EditorUi {
         };
         // Picture and every audio stream, linked; audio tracks added if the
         // file has more streams than the sequence has tracks.
-        let (adds, items) = ve_engine::clips_for_asset(&self.st.plugins, &seq, &a, duration, target(TrackKind::Video, video_track), target(TrackKind::Audio, video_track));
+        let (adds, mut items) = ve_engine::clips_for_asset(&self.st.plugins, &seq, &a, duration, target(TrackKind::Video, video_track), target(TrackKind::Audio, video_track));
+        // From the range's start in the media.
+        for (_, clip) in &mut items {
+            std::sync::Arc::make_mut(clip).source_range = range;
+        }
         let add_tracks = ve_engine::Command::Batch { label: String::new(), commands: adds.clone() };
         let with_tracks = match add_tracks.apply(self.snap()) {
             Ok(r) => r.project,

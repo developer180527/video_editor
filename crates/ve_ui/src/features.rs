@@ -74,31 +74,44 @@ impl EditorUi {
 
     // ---- markers and in/out ------------------------------------------------
 
+    /// Whose marks I, O and ⌥X set: the clip in the Source monitor when it
+    /// is the active monitor, else the sequence.
+    fn marks_owner(&self) -> Option<(MarksOwner, Marks)> {
+        match (self.viewer(), self.engine.source()) {
+            (ve_engine::Viewer::Source, Some(s)) => {
+                let a = self.snap().assets.get(&s.asset)?;
+                Some((MarksOwner::Asset(a.id), a.marks.clone()))
+            }
+            _ => self.active_seq().map(|s| (MarksOwner::Sequence(s.id), s.marks.clone())),
+        }
+    }
+
     fn set_marks(&mut self, f: impl FnOnce(&mut Marks)) {
-        let Some(seq) = self.active_seq() else { return };
-        let mut marks = seq.marks.clone();
+        let Some((owner, old)) = self.marks_owner() else { return };
+        let mut marks = old.clone();
         f(&mut marks);
         // Keep in ≤ out: a new in after the out (or out before the in) clears the other.
         if let (Some(a), Some(b)) = (marks.in_point, marks.out_point) {
             if a > b {
-                if seq.marks.in_point == marks.in_point {
+                if old.in_point == marks.in_point {
                     marks.in_point = None;
                 } else {
                     marks.out_point = None;
                 }
             }
         }
-        self.run(Command::SetMarks { owner: MarksOwner::Sequence(seq.id), marks });
+        self.run(Command::SetMarks { owner, marks });
     }
 
     pub(crate) fn mark_in(&mut self) {
-        let t = self.playhead;
+        let (t, _, _) = self.active_position();
         self.set_marks(|m| m.in_point = Some(t));
     }
 
     pub(crate) fn mark_out(&mut self) {
         // The out point is the end of the frame under the playhead.
-        let t = self.step(1);
+        let (t, rate, _) = self.active_position();
+        let t = rate.frame_to_time(t.to_frame(rate) + 1);
         self.set_marks(|m| m.out_point = Some(t));
     }
 

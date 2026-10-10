@@ -166,9 +166,8 @@ fn grid(ui: &mut Ui, app: &mut EditorUi, drop_hover: bool) {
         None => {}
     }
     if let Some(id) = append {
-        // Double-click: onto the end of the sequence.
-        let end = app.snap().active().map(|s| s.duration()).unwrap_or(Time::ZERO);
-        app.place_asset(id, end, None, false);
+        // Double-click: open it in the Source monitor to mark and cut in.
+        app.open_in_source(id);
     }
 }
 
