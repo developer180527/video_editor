@@ -38,7 +38,7 @@ use libgui::{Backend, Batch, Color, FrameInfo, InputEvent, Key, Modifiers, Platf
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 pub use libgui_winit::FILES as FILES_PAYLOAD;
@@ -263,13 +263,20 @@ struct Win {
     mods: Modifiers,
     /// A key pressed on a menu item's behalf, to release after a frame.
     release: Option<Key>,
+    /// When the UI asked for its next frame (an animation, a caret blink).
+    wake: Option<Instant>,
+    /// The swapchain shows the latest build: nothing to present until the
+    /// UI changes or the window is resized.
+    presented: bool,
 }
 
 struct Shell<A: ShellApp> {
     cfg: ShellConfig,
     app: A,
     gfx: Option<Gfx>,
-    wins: HashMap<WindowId, Win>,
+    /// Boxed: a draw takes its window out of the map and puts it back, and
+    /// a `Win` (with its whole `Ui`) is far too big to copy every frame.
+    wins: HashMap<WindowId, Box<Win>>,
     clipboard: Clipboard,
     #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     proxy: EventLoopProxy<UserEvent>,
@@ -404,7 +411,7 @@ impl<A: ShellApp> Shell<A> {
         let id = window.id();
         self.wins.insert(
             id,
-            Win {
+            Box::new(Win {
                 window,
                 surface,
                 config,
@@ -427,7 +434,9 @@ impl<A: ShellApp> Shell<A> {
                 last_press: None,
                 mods: Modifiers::NONE,
                 release: None,
-            },
+                wake: None,
+                presented: false,
+            }),
         );
         id
     }
@@ -491,6 +500,7 @@ impl<A: ShellApp> Shell<A> {
             w.config.width = px.width.max(1);
             w.config.height = px.height.max(1);
             w.surface.configure(&g.gpu.device, &w.config);
+            w.presented = false;
         }
         let now = Instant::now();
         w.idle += (now - w.last).as_secs_f32();
@@ -524,6 +534,13 @@ impl<A: ShellApp> Shell<A> {
             w.renderer.prepare(&out);
             w.batches.clear();
             w.batches.extend_from_slice(&out.draw.batches);
+            w.wake = platform.repaint_after.map(|s| now + std::time::Duration::from_secs_f32(s.max(0.0)));
+            w.presented = false;
+        }
+        if w.presented {
+            // Nothing changed since the last present: no GPU work at all.
+            self.wins.insert(wid, w);
+            return;
         }
 
         let frame = match w.surface.get_current_texture() {
@@ -559,6 +576,7 @@ impl<A: ShellApp> Shell<A> {
             g.gpu.queue.submit([enc.finish()]);
             w.window.pre_present_notify();
             g.gpu.queue.present(frame);
+            w.presented = true;
         }
         // An output from a frame that was only re-presented is ignored.
         w.platform.apply(&w.window, &platform);
@@ -827,11 +845,38 @@ impl<A: ShellApp> ApplicationHandler<UserEvent> for Shell<A> {
             d.update();
         }
         self.sync_windows(el);
-        for w in self.wins.values() {
-            if w.visible {
+        // Draw only windows with something to show: input, a due animation,
+        // playback, the dock, news from another thread, or a new size. An
+        // idle editor sleeps until one of those arrives.
+        let now = Instant::now();
+        let animating = self.app.animating();
+        let mut next: Option<Instant> = None;
+        let ids: Vec<WindowId> = self.wins.keys().copied().collect();
+        for wid in ids {
+            let dock_wants = self.app.dock().is_some_and(|d| self.wins.get(&wid).is_some_and(|w| d.needs_frame(w.dock_id)));
+            let Some(w) = self.wins.get(&wid) else { continue };
+            if !w.visible {
+                continue;
+            }
+            let scale = w.window.scale_factor() as f32;
+            let px = surface_size(&w.window);
+            let info = FrameInfo {
+                screen_size: Vec2::new(px.width.max(1) as f32 / scale, px.height.max(1) as f32 / scale),
+                scale,
+                dt: 0.0,
+            };
+            let idle = w.idle + (now - w.last).as_secs_f32();
+            let due = w.wake.is_some_and(|t| t <= now);
+            if animating || dock_wants || w.rebuild || due || !w.presented || w.release.is_some() || w.ui.needs_frame_for(&info, idle) {
                 w.window.request_redraw();
+            } else if let Some(t) = w.wake {
+                next = Some(next.map_or(t, |n| n.min(t)));
             }
         }
+        el.set_control_flow(match next {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        });
     }
 }
 
