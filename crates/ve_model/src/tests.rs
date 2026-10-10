@@ -204,3 +204,47 @@ fn transition_regions_may_not_overlap() {
     put(&mut p, vec![a, b]);
     assert!(matches!(validate(&p), Err(ModelError::BadTransition(_))));
 }
+
+#[test]
+fn bezier_keyframes_follow_their_curve() {
+    let key = |t: i64, v: f64, interp: Interp| Keyframe { time: Time::from_seconds(t), value: Value::Float(v), interp };
+    let at = |p: &Param, ms: i64| match p.value_at(Time::from_ticks(ms * ve_time::TICKS_PER_SECOND / 1000)) {
+        Value::Float(v) => v,
+        _ => panic!(),
+    };
+    // The linear-equivalent curve is linear.
+    let lin = Interp::Linear.as_bezier().unwrap();
+    let p = Param::Animated(vec![key(0, 0.0, Interp::Bezier { x1: lin.0, y1: lin.1, x2: lin.2, y2: lin.3 }), key(10, 100.0, Interp::Linear)]);
+    for ms in [0, 1000, 2500, 5000, 7500, 9999] {
+        assert!((at(&p, ms) - ms as f64 / 100.0).abs() < 1e-4, "{ms}: {}", at(&p, ms));
+    }
+    // Ease in-out: slow at both ends, half-way at the middle, symmetric.
+    let p = Param::Animated(vec![key(0, 0.0, Interp::EASE_IN_OUT), key(10, 100.0, Interp::Linear)]);
+    assert!(at(&p, 1000) < 5.0, "{}", at(&p, 1000));
+    assert!((at(&p, 5000) - 50.0).abs() < 1e-3);
+    assert!((at(&p, 2000) + at(&p, 8000) - 100.0).abs() < 1e-3);
+    // Handles above 1 overshoot, then settle on the next key.
+    let p = Param::Animated(vec![key(0, 0.0, Interp::Bezier { x1: 0.3, y1: 1.6, x2: 0.6, y2: 1.3 }), key(10, 100.0, Interp::Linear)]);
+    assert!((0..10_000).step_by(250).any(|ms| at(&p, ms) > 100.0), "overshoots");
+    assert_eq!(at(&p, 10_000), 100.0);
+}
+
+#[test]
+fn a_curve_timed_outside_its_segment_is_refused() {
+    let with = |interp: Interp| {
+        let (mut p, _) = sample();
+        let sid = *p.sequences.keys().next().unwrap();
+        let seq = Arc::make_mut(p.sequences.get_mut(&sid).unwrap());
+        let track = Arc::make_mut(&mut seq.tracks[0]);
+        let clip = Arc::make_mut(&mut track.clips[0]);
+        let mut params = OrdMap::new();
+        params.insert("x".to_string(), Param::Animated(vec![Keyframe { time: Time::ZERO, value: Value::Float(0.0), interp }]));
+        let plugin = PluginRef { api: PluginApi::Builtin, id: "fx".into(), major_version: 1 };
+        clip.effects.push_back(Arc::new(Effect { id: EffectId::new(), plugin, enabled: true, params }));
+        validate(&p)
+    };
+    assert_eq!(with(Interp::EASE_IN_OUT), Ok(()));
+    assert_eq!(with(Interp::Bezier { x1: 0.3, y1: 2.0, x2: 0.6, y2: -1.0 }), Ok(()), "values may overshoot");
+    assert!(matches!(with(Interp::Bezier { x1: 1.5, y1: 0.0, x2: 0.5, y2: 1.0 }), Err(ModelError::BadKeyframes(_))), "time runs backwards");
+    assert!(matches!(with(Interp::Bezier { x1: 0.2, y1: f32::NAN, x2: 0.5, y2: 1.0 }), Err(ModelError::BadKeyframes(_))));
+}

@@ -610,3 +610,76 @@ fn match_frame_and_back() {
     frame(&mut ui, &mut app);
     assert_eq!(app.engine.playhead_of(ve_engine::Viewer::Program), s(5));
 }
+
+/// The keyframe graph through the pointer: drag a key up, undo it in one
+/// step, double-click to add a key, Delete to remove it; and how it looks.
+#[test]
+fn keyframe_graph_editing() {
+    let mut app = editor();
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    let snap = app.engine.snapshot();
+    let clip = snap.active().unwrap().tracks[0].clips[0].clone(); // Tikal, 0–6 s
+    let opacity = clip.effects.iter().find(|e| e.plugin.id == ve_engine::intrinsic::OPACITY).unwrap().id;
+    let key = |t: i64, v: f64, interp| Keyframe { time: Time::from_seconds(t), value: Value::Float(v), interp };
+    let keys = vec![key(0, 100.0, Interp::EASE_IN_OUT), key(4, 0.0, Interp::Linear)];
+    app.engine.execute(Command::SetEffectParam { clip: clip.id, effect: opacity, param: "opacity".into(), value: Some(Param::Animated(keys)) });
+    let opacity_keys = |app: &EditorUi| match app.engine.snapshot().find_clip(clip.id).unwrap().2.effects.iter().find(|e| e.id == opacity).unwrap().params["opacity"].clone() {
+        Param::Animated(k) => k,
+        _ => Vec::new(), // not yet
+    };
+    wait(&app.engine, |_| opacity_keys(&app).len() == 2);
+    app.view.selection = edit::linked(&app.engine.snapshot(), clip.id);
+    app.view.graphs.insert((opacity, "opacity".into()));
+    for _ in 0..4 {
+        frame(&mut ui, &mut app);
+    }
+    let r = app.graph_rect().expect("the graph is drawn");
+
+    // The second key: 4 s on a lane spanning 0–9.6 s; 0 % on a 0–100 range
+    // padded 8 % each way, in the value band above the velocity strip.
+    let band = (r.y + 10.0, r.bottom() - 42.0 - 10.0);
+    let y_of = |v: f32| band.1 - (v + 8.0) / 116.0 * (band.1 - band.0);
+    let x = r.x + r.w * 4.0 / 9.6;
+    let mv = |ui: &mut Ui, x: f32, y: f32| ui.push(InputEvent::PointerMoved { pos: Vec2::new(x, y) });
+    let button = |ui: &mut Ui, down: bool| ui.push(InputEvent::PointerButton { button: PointerButton::Primary, pressed: down });
+    mv(&mut ui, x, y_of(0.0));
+    frame(&mut ui, &mut app);
+    button(&mut ui, true);
+    frame(&mut ui, &mut app);
+    for k in 1..=10 {
+        mv(&mut ui, x, y_of(5.0 * k as f32));
+        frame(&mut ui, &mut app);
+    }
+    button(&mut ui, false);
+    frame(&mut ui, &mut app);
+    wait(&app.engine, |_| matches!(opacity_keys(&app)[1].value, Value::Float(v) if v > 40.0));
+    let k = opacity_keys(&app);
+    assert!(matches!(k[1].value, Value::Float(v) if (v - 50.0).abs() < 3.0), "dragged to ~50: {:?}", k[1].value);
+    assert_eq!(k[1].time, Time::from_seconds(4), "straight up: same time");
+    render_surface(&mut app, 2000, 1129, "graph-editor.png", SurfaceId::MAIN, ve_ui::WindowFrame::default(), |_| {});
+
+    // The whole drag is one undo step.
+    app.engine.undo();
+    wait(&app.engine, |_| matches!(opacity_keys(&app)[1].value, Value::Float(v) if v == 0.0));
+
+    // Double-click the curve at 2 s: a key there, on the curve.
+    for _ in 0..3 {
+        frame(&mut ui, &mut app);
+    }
+    let x2 = r.x + r.w * 2.0 / 9.6;
+    mv(&mut ui, x2, band.0 + 4.0);
+    frame(&mut ui, &mut app);
+    for _ in 0..2 {
+        button(&mut ui, true);
+        frame(&mut ui, &mut app);
+        button(&mut ui, false);
+        frame(&mut ui, &mut app);
+    }
+    wait(&app.engine, |_| opacity_keys(&app).len() == 3);
+    let k = opacity_keys(&app);
+    assert_eq!(k[1].time, Time::from_seconds(2));
+    assert!(matches!(k[1].value, Value::Float(v) if (v - 50.0).abs() < 1.0), "half-way on an ease: {:?}", k[1].value);
+    // Delete removes the selected (new) key.
+    press(&mut ui, &mut app, Key::Delete, Modifiers::NONE);
+    wait(&app.engine, |_| opacity_keys(&app).len() == 2);
+}

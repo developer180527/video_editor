@@ -179,7 +179,14 @@ pub fn validate(p: &Project) -> Result<(), ModelError> {
                 for e in &c.effects {
                     for param in e.params.values() {
                         if let Param::Animated(k) = param {
-                            if k.is_empty() || k.windows(2).any(|w| w[0].time >= w[1].time) {
+                            // Curves must be numbers, timed within their segment.
+                            let bad_curve = k.iter().any(|key| match key.interp {
+                                crate::Interp::Bezier { x1, y1, x2, y2 } => {
+                                    ![x1, y1, x2, y2].iter().all(|v| v.is_finite()) || !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2)
+                                }
+                                _ => false,
+                            });
+                            if k.is_empty() || k.windows(2).any(|w| w[0].time >= w[1].time) || bad_curve {
                                 return Err(ModelError::BadKeyframes(c.id));
                             }
                         }

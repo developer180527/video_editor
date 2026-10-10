@@ -13,6 +13,7 @@ mod dock;
 mod editing;
 mod effects;
 mod features;
+mod graph;
 mod menu;
 mod mixer_panel;
 mod program;
@@ -191,6 +192,13 @@ pub struct View {
     pub selected_marker: Option<MarkerId>,
     /// A transition's duration, in frames, while it is being dragged.
     pub transition_frames: Option<f32>,
+    /// Effect parameters whose keyframe graph is open.
+    pub graphs: HashSet<(EffectId, String)>,
+    /// The selected key in a graph, and what a graph drag holds.
+    pub(crate) graph_key: Option<graph::GraphKey>,
+    pub(crate) graph_drag: Option<graph::Grab>,
+    /// The graph's value scale, held while dragging.
+    pub(crate) graph_scale: Option<(f64, f64)>,
     /// Which scope the Scopes panel shows.
     pub scope: ve_render::scopes::ScopeKind,
     /// A fader or pan knob being dragged: the track and its live values.
@@ -262,6 +270,8 @@ pub struct EditorUi {
     pub(crate) source_seek_on_open: Option<(AssetId, Time)>,
     /// The marks last sent, until the engine publishes them.
     pub(crate) pending_marks: Option<(ve_engine::MarksOwner, Marks, std::time::Instant)>,
+    /// Where the last keyframe graph was drawn (tests aim at it).
+    pub(crate) graph_rect: Option<Rect>,
     /// The Source picture is still decoding: keep drawing.
     source_catching_up: bool,
     /// Refusals from this frame, shown as toasts on the next.
@@ -305,6 +315,10 @@ impl EditorUi {
                 selected_transition: None,
                 selected_marker: None,
                 transition_frames: None,
+                graphs: HashSet::new(),
+                graph_key: None,
+                graph_drag: None,
+                graph_scale: None,
                 scope: Default::default(),
                 track_drag: None,
             },
@@ -347,6 +361,7 @@ impl EditorUi {
             seek_after_edit: None,
             source_seek_on_open: None,
             pending_marks: None,
+            graph_rect: None,
             errors: Vec::new(),
             requests: Vec::new(),
             touch,
@@ -743,6 +758,12 @@ impl EditorUi {
         }
     }
 
+    /// Where the last keyframe graph lane was drawn, for tests that drive it.
+    #[doc(hidden)]
+    pub fn graph_rect(&self) -> Option<Rect> {
+        self.graph_rect
+    }
+
     /// Show the user something the host could not do (a toast).
     pub fn report_error(&mut self, message: String) {
         self.errors.push(message);
@@ -1055,8 +1076,23 @@ impl EditorUi {
         }
         let shift_delete = ui.consume_shortcut(Shortcut::plain(Key::Delete).shift()) || ui.consume_shortcut(Shortcut::plain(Key::Backspace).shift());
         let delete = key(ui, Key::Delete) || key(ui, Key::Backspace);
-        // A selected transition or marker goes first; then clips.
+        // A selected graph key, transition or marker goes first; then clips.
         if delete {
+            if let Some(g) = self.view.graph_key.clone() {
+                let found = self.view.selection.iter().find_map(|id| {
+                    let (_, _, c) = self.snap().find_clip(*id)?;
+                    let e = c.effects.iter().find(|e| e.id == g.effect)?;
+                    match e.params.get(&g.param)? {
+                        Param::Animated(keys) => Some((c.id, keys.clone())),
+                        _ => None,
+                    }
+                });
+                if let Some((clip, keys)) = found {
+                    graph::delete_key(self, clip, g.effect, &g.param, &keys, g.index);
+                    return;
+                }
+                self.view.graph_key = None;
+            }
             if let Some((clip, edge)) = self.view.selected_transition.take() {
                 self.remove_transition(clip, edge);
                 return;

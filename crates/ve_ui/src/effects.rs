@@ -20,16 +20,16 @@ use crate::{EditorUi, ParamEdit};
 
 /// The clip's slice of the timeline the lanes show.
 #[derive(Clone, Copy)]
-struct Span {
-    origin: f64,
-    span: f64,
-    clip_start: f64,
-    clip_len: f64,
-    playhead: f64,
+pub(crate) struct Span {
+    pub(crate) origin: f64,
+    pub(crate) span: f64,
+    pub(crate) clip_start: f64,
+    pub(crate) clip_len: f64,
+    pub(crate) playhead: f64,
 }
 
 impl Span {
-    fn x(&self, r: Rect, t: f64) -> f32 {
+    pub(crate) fn x(&self, r: Rect, t: f64) -> f32 {
         r.x + r.w * ((t - self.origin) / self.span) as f32
     }
 }
@@ -441,7 +441,14 @@ fn param_row(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>,
     let mut commit: Option<Value> = None;
     let mut preview: Option<Value> = None;
     let mut cancel_preview = false;
+    // An animated number has a graph: its twirl opens it under the row.
+    let graphable = animated && matches!(p.kind, ParamKind::Float | ParamKind::Int);
+    let graph_id = (e.id, p.id.clone());
+    let mut graph_open = graphable && app.view.graphs.contains(&graph_id);
     let mut prop = Prop::new(&p.label).dim(!e.enabled);
+    if graphable {
+        prop = prop.twirl(&mut graph_open);
+    }
     if p.animatable {
         prop = prop.stopwatch(animated);
     }
@@ -563,7 +570,30 @@ fn param_row(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>,
     if cancel_preview {
         app.view.param_edit = None;
     }
+    if graphable {
+        if graph_open {
+            app.view.graphs.insert(graph_id);
+        } else {
+            app.view.graphs.remove(&graph_id);
+        }
+    }
+    if graphable && graph_open {
+        let s = graph_row(ui, app, clip, e, &p.id, &stored, span);
+        return seek.or(s);
+    }
     seek
+}
+
+/// The graph under an animated number's row: the selected key's details
+/// left, the value and velocity graphs right, on the lanes' time scale.
+fn graph_row(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>, param: &str, stored: &Param, span: Span) -> Option<Time> {
+    let id = ui.make_id(("graph-row", e.id, param));
+    ui.container_id(id, Layout::row().width(Size::Grow(1.0)).height(Size::Fixed(crate::graph::HEIGHT)), Frame::none(), |ui| {
+        ui.container(Layout::row().width(Size::Grow(1.5)).height(Size::Grow(1.0)), Frame { fill: REEL.chrome, ..Frame::none() }, |ui| {
+            crate::graph::key_panel(ui, app, clip, e, param, stored)
+        });
+        ui.container(Layout::row().width(Size::Grow(1.0)).height(Size::Grow(1.0)), Frame::none(), |ui| crate::graph::lane(ui, app, clip, e, param, stored, span))
+    })
 }
 
 /// The lane right of a row: background, keyframe diamonds, the playhead.
