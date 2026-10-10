@@ -77,7 +77,7 @@ pub fn load(lib: Arc<dyn NativeLibrary>, static_name: Option<&str>) -> Result<Ve
             .map(|p| {
                 let at = unsafe { (ed.params as *const u8).add(p * stride) } as *const abi::VeParamDesc;
                 let pd = unsafe { read_versioned(at, abi::VE_PARAM_DESC_MIN_SIZE) }.ok_or_else(|| bad("VeParamDesc too small"))?;
-                param_info(&pd).ok_or_else(|| bad("parameter without id"))
+                param_info(&pd).ok_or_else(|| bad("parameter without an id, or of a type this host does not know"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let wgsl = cstr(ed.wgsl);
@@ -86,6 +86,7 @@ pub fn load(lib: Arc<dyn NativeLibrary>, static_name: Option<&str>) -> Result<Ve
             abi::VeEffectKind::Filter => EffectKind::Filter,
             abi::VeEffectKind::Transition => EffectKind::Transition,
             abi::VeEffectKind::Generator => EffectKind::Generator,
+            other => return Err(bad(&format!("unknown effect kind {}", other.0))),
         };
         let implementation = if ed.render_cpu.is_some() {
             Implementation::Native(Arc::new(NativeEffect { _lib: lib.clone(), desc: ed }))
@@ -141,6 +142,8 @@ fn param_info(p: &abi::VeParamDesc) -> Option<ParamInfo> {
         abi::VeParamType::Choice => ParamKind::Choice(
             (0..p.choice_count as usize).filter_map(|i| cstr(unsafe { *p.choices.add(i) })).collect(),
         ),
+        // A type from a newer ABI: the plugin is refused, not misread.
+        _ => return None,
     };
     Some(ParamInfo {
         id: cstr(p.id)?,

@@ -12,13 +12,18 @@ pub const VE_FLAG_THREAD_SAFE: u32 = 1 << 0;
 /// The header, for tools that ship it (the SDK, the CLI's `sdk` command).
 pub const HEADER: &str = include_str!("../include/ve_plugin.h");
 
-#[repr(C)]
+/// A log message's level (`VeLogLevel` in C). A plain `u32`, not a Rust enum: a newer plugin may send a value
+/// this host does not know, which must be refused, not undefined behaviour.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VeLogLevel {
-    Debug = 0,
-    Info = 1,
-    Warn = 2,
-    Error = 3,
+pub struct VeLogLevel(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl VeLogLevel {
+    pub const Debug: VeLogLevel = VeLogLevel(0);
+    pub const Info: VeLogLevel = VeLogLevel(1);
+    pub const Warn: VeLogLevel = VeLogLevel(2);
+    pub const Error: VeLogLevel = VeLogLevel(3);
 }
 
 #[repr(C)]
@@ -29,15 +34,20 @@ pub struct VeHost {
     pub get_extension: Option<unsafe extern "C" fn(*const c_char) -> *const c_void>,
 }
 
-#[repr(C)]
+/// A parameter's type (`VeParamType` in C). A plain `u32`, not a Rust enum: a newer plugin may send a value
+/// this host does not know, which must be refused, not undefined behaviour.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VeParamType {
-    Bool = 0,
-    Int = 1,
-    Float = 2,
-    Vec2 = 3,
-    Color = 4,
-    Choice = 5,
+pub struct VeParamType(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl VeParamType {
+    pub const Bool: VeParamType = VeParamType(0);
+    pub const Int: VeParamType = VeParamType(1);
+    pub const Float: VeParamType = VeParamType(2);
+    pub const Vec2: VeParamType = VeParamType(3);
+    pub const Color: VeParamType = VeParamType(4);
+    pub const Choice: VeParamType = VeParamType(5);
 }
 
 #[repr(C)]
@@ -79,12 +89,17 @@ pub struct VeRenderArgs {
     pub progress: f64,
 }
 
-#[repr(C)]
+/// What an effect is (`VeEffectKind` in C). A plain `u32`, not a Rust enum: a newer plugin may send a value
+/// this host does not know, which must be refused, not undefined behaviour.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VeEffectKind {
-    Filter = 0,
-    Transition = 1,
-    Generator = 2,
+pub struct VeEffectKind(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl VeEffectKind {
+    pub const Filter: VeEffectKind = VeEffectKind(0);
+    pub const Transition: VeEffectKind = VeEffectKind(1);
+    pub const Generator: VeEffectKind = VeEffectKind(2);
 }
 
 pub type CreateFn = unsafe extern "C" fn(*const VeHost) -> *mut c_void;
