@@ -39,8 +39,7 @@ impl SourceView {
         let info = a.info.as_ref()?;
         let mut format = project.active().map(|s| s.format.clone()).unwrap_or_default();
         if let Some(v) = &info.video {
-            format.width = v.width;
-            format.height = v.height;
+            (format.width, format.height) = v.display_size();
             format.rate = v.rate;
         }
         let duration = if info.duration > Time::ZERO { info.duration } else { Time::from_seconds(5) };

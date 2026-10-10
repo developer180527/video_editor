@@ -197,10 +197,50 @@ pub struct MediaInfo {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VideoStreamInfo {
+    /// The stored (coded) picture size: what decoded frames are.
     pub width: u32,
     pub height: u32,
     pub rate: Rate,
     pub codec: String,
+    /// Degrees to turn the picture clockwise to show it upright: 0, 90, 180
+    /// or 270 (a phone held upright records landscape and says 90).
+    #[serde(default)]
+    pub rotation: u16,
+    /// Each stored pixel's width over its height (anamorphic video is not
+    /// 1:1). `[1, 1]` for square pixels.
+    #[serde(default = "square")]
+    pub pixel_aspect: [u32; 2],
+}
+
+fn square() -> [u32; 2] {
+    [1, 1]
+}
+
+impl VideoStreamInfo {
+    /// A stream of square, upright pixels.
+    pub fn new(width: u32, height: u32, rate: Rate, codec: impl Into<String>) -> Self {
+        VideoStreamInfo { width, height, rate, codec: codec.into(), rotation: 0, pixel_aspect: [1, 1] }
+    }
+
+    /// Whether showing it upright swaps width and height.
+    pub fn turned(&self) -> bool {
+        self.rotation % 180 == 90
+    }
+
+    /// The picture as it is shown: pixel aspect applied, then rotation.
+    pub fn display_size(&self) -> (u32, u32) {
+        let [n, d] = self.pixel_aspect;
+        let w = if n > 0 && d > 0 { (self.width as u64 * n as u64 + d as u64 / 2) / d as u64 } else { self.width as u64 } as u32;
+        if self.turned() { (self.height, w) } else { (w, self.height) }
+    }
+
+    pub fn display_width(&self) -> u32 {
+        self.display_size().0
+    }
+
+    pub fn display_height(&self) -> u32 {
+        self.display_size().1
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

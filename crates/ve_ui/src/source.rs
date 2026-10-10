@@ -107,7 +107,7 @@ fn picture(ui: &mut Ui, app: &mut EditorUi, asset: Option<&Arc<Asset>>) {
             }
         }
     }
-    let size = asset.and_then(|a| a.info.as_ref()).and_then(|i| i.video.as_ref()).map(|v| (v.width as f32, v.height as f32)).unwrap_or((16.0, 9.0));
+    let size = asset.and_then(|a| a.info.as_ref()).and_then(|i| i.video.as_ref()).map(|v| (v.display_width() as f32, v.display_height() as f32)).unwrap_or((16.0, 9.0));
     let tex = asset.and(app.source_tex);
     let audio_only = asset.and_then(|a| a.info.as_ref()).is_some_and(|i| i.video.is_none());
     let hint = ui.frame_text(match (asset, audio_only) {

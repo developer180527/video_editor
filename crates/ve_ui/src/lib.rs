@@ -456,10 +456,14 @@ impl EditorUi {
                 self.template_tex.push(tex);
             }
         }
-        for (key, img) in self.thumb_uploads.drain(..) {
+        let uploads = std::mem::take(&mut self.thumb_uploads);
+        for (key, img) in uploads {
             if self.thumbs.contains_key(&key) {
                 continue;
             }
+            // Thumbnails are made as the picture is stored: stand it upright.
+            let turn = self.snap().assets.get(&key.0).and_then(|a| a.info.as_ref()).and_then(|i| i.video.as_ref()).map_or(0, |v| v.rotation);
+            let img = upright(&img, turn);
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("thumb"),
                 size: wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
@@ -1287,6 +1291,28 @@ fn upload_rgba(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui
     );
     let id = renderer.register_texture(&tex.create_view(&Default::default()));
     (tex, id)
+}
+
+/// `t` turned `turn` degrees clockwise (0, 90, 180, 270).
+fn upright(t: &ve_engine::Thumb, turn: u16) -> ve_engine::Thumb {
+    let (w, h) = (t.width as usize, t.height as usize);
+    let turned = turn % 180 == 90;
+    let (ow, oh) = if turned { (h, w) } else { (w, h) };
+    let mut rgba = vec![0u8; ow * oh * 4];
+    for y in 0..oh {
+        for x in 0..ow {
+            // The stored pixel under upright pixel (x, y).
+            let (sx, sy) = match turn % 360 {
+                90 => (y, h - 1 - x),
+                180 => (w - 1 - x, h - 1 - y),
+                270 => (w - 1 - y, x),
+                _ => (x, y),
+            };
+            let (d, s) = ((y * ow + x) * 4, (sy * w + sx) * 4);
+            rgba[d..d + 4].copy_from_slice(&t.rgba[s..s + 4]);
+        }
+    }
+    ve_engine::Thumb { width: ow as u32, height: oh as u32, rgba }
 }
 
 #[cfg(test)]

@@ -453,3 +453,22 @@ fn effect_sources_carry_mip_chains() {
     let grey = render(t);
     assert!((186..=196).contains(&grey), "a transition's incoming source: {grey}");
 }
+
+/// A phone held upright stores landscape and says "turn 90° clockwise":
+/// the stored right half (white) ends up at the bottom, in a portrait frame.
+#[test]
+fn turned_pictures_stand_upright() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    // Stored 64×36 landscape; upright 36×64, in a 36×64 sequence.
+    let mut l = RenderLayer::of_frame(halves(64, 36), Motion { position: [18.0, 32.0], scale: 100.0, rotation: 0.0, anchor: [18.0, 32.0], crop: [0.0; 4] }, 1.0);
+    l.size = (36, 64);
+    l.turn = 90;
+    let mut c = Compositor::new(&device);
+    c.render(&device, &queue, &plan(36, 64), &[l], (36, 64), WorkingSpace::LinearRec709);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    let img = c.read_output(&device, &queue).unwrap();
+    assert_eq!((img.0, img.1), (36, 64));
+    assert!(px(&img, 18, 10)[0] < 10, "top is the stored left half (black): {:?}", px(&img, 18, 10));
+    assert!(px(&img, 18, 54)[0] > 245, "bottom is the stored right half (white): {:?}", px(&img, 18, 54));
+    assert_eq!(turn_uv([0.25, 0.75], 270), [0.25, 0.25], "270: the stored picture's point under an upright one");
+}

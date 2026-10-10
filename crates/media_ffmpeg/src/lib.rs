@@ -119,11 +119,26 @@ impl MediaBackend for Ffmpeg {
             match par.codec_type {
                 sys::AVMediaType::AVMEDIA_TYPE_VIDEO if info.video.is_none() => {
                     let r = if s.avg_frame_rate.num > 0 { s.avg_frame_rate } else { s.r_frame_rate };
+                    // A display matrix says how to turn the picture upright
+                    // (FFmpeg's angle is counter-clockwise; ours clockwise).
+                    let side = unsafe { sys::av_packet_side_data_get(par.coded_side_data, par.nb_coded_side_data, sys::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX) };
+                    let rotation = if side.is_null() || unsafe { (*side).size } < 36 {
+                        0
+                    } else {
+                        let ccw = unsafe { sys::av_display_rotation_get((*side).data as *const i32) };
+                        if ccw.is_finite() { ((-ccw / 90.0).round() as i32 * 90).rem_euclid(360) as u16 } else { 0 }
+                    };
+                    let sar = unsafe { sys::av_guess_sample_aspect_ratio(input.0, s as *const _ as *mut _, std::ptr::null_mut()) };
+                    let pixel_aspect = if sar.num > 0 && sar.den > 0 { [sar.num as u32, sar.den as u32] } else { [1, 1] };
                     info.video = Some(VideoStreamInfo {
-                        width: par.width as u32,
-                        height: par.height as u32,
-                        rate: if r.num > 0 && r.den > 0 { Rate::new(r.num as u32, r.den as u32) } else { Rate::FPS_24 },
-                        codec: codec_name(par.codec_id),
+                        rotation,
+                        pixel_aspect,
+                        ..VideoStreamInfo::new(
+                            par.width as u32,
+                            par.height as u32,
+                            if r.num > 0 && r.den > 0 { Rate::new(r.num as u32, r.den as u32) } else { Rate::FPS_24 },
+                            codec_name(par.codec_id),
+                        )
                     });
                 }
                 sys::AVMediaType::AVMEDIA_TYPE_AUDIO => {

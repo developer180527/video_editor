@@ -107,12 +107,16 @@ impl Resolver<'_> {
     fn layer(&mut self, l: &Layer, seq_size: (u32, u32)) -> Option<RenderLayer> {
         let out = |n: u32| ((n as f32 * self.scale).round() as u32).max(1);
         // The picture, and its size as Motion sees it.
+        let mut turn = 0;
         let (source, size, generator) = match &l.source {
             ClipSource::Asset { asset, .. } => {
                 let a = self.project.assets.get(asset)?;
                 let frame = self.picture(&a.name, a.picture_media(self.proxies), l.source_time)?;
-                // A proxy stands in at its original's size.
-                let size = a.info.as_ref().and_then(|i| i.video.as_ref()).map_or((frame.width, frame.height), |v| (v.width, v.height));
+                // Upright, at the original's size (a proxy stands in for it;
+                // anamorphic pixels are stretched by the size itself).
+                let video = a.info.as_ref().and_then(|i| i.video.as_ref());
+                turn = video.map_or(0, |v| v.rotation);
+                let size = video.map_or((frame.width, frame.height), |v| v.display_size());
                 (LayerSource::Frame(frame), size, None)
             }
             ClipSource::Generator { plugin } => {
@@ -181,7 +185,7 @@ impl Resolver<'_> {
             let incoming = t.incoming.as_ref().and_then(|x| self.layer(x, seq_size));
             Box::new(RenderTransition { effect, progress: t.progress as f32, incoming, self_incoming: t.self_incoming })
         });
-        Some(RenderLayer { source, size, motion, opacity, blend, effects, transition })
+        Some(RenderLayer { source, size, motion, opacity, blend, effects, transition, turn })
     }
 }
 

@@ -96,7 +96,7 @@ fn main() {
             "ffmpeg.h",
             "#include <libavformat/avformat.h>\n#include <libavcodec/avcodec.h>\n\
              #include <libavutil/imgutils.h>\n#include <libswscale/swscale.h>\n\
-             #include <libswresample/swresample.h>\n#include <libavutil/pixdesc.h>\n#include <libavutil/opt.h>\n#include <errno.h>\n",
+             #include <libswresample/swresample.h>\n#include <libavutil/pixdesc.h>\n#include <libavutil/opt.h>\n#include <libavutil/display.h>\n#include <errno.h>\n",
         )
         .clang_arg(format!("-I{}", dir.join("include").display()))
         .allowlist_function("(av|avformat|avcodec|avio|sws|swr)_.*")

@@ -504,7 +504,7 @@ fn default_for(app: &EditorUi, clip: &Clip, p: &ParamInfo) -> Value {
     let d = match p.id.as_str() {
         "position" => [fmt.width as f64 / 2.0, fmt.height as f64 / 2.0, 0.0, 0.0],
         "anchor" => {
-            let (w, h) = src.map(|v| (v.width as f64, v.height as f64)).unwrap_or((fmt.width as f64, fmt.height as f64));
+            let (w, h) = src.map(|v| (v.display_width() as f64, v.display_height() as f64)).unwrap_or((fmt.width as f64, fmt.height as f64));
             [w / 2.0, h / 2.0, 0.0, 0.0]
         }
         _ => p.default,

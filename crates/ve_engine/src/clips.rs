@@ -20,7 +20,7 @@ pub fn make_clip(
         TrackKind::Video => " [V]",
         TrackKind::Audio => " [A]",
     };
-    let size = asset.info.as_ref().and_then(|i| i.video.as_ref()).map(|v| (v.width, v.height)).unwrap_or((format.width, format.height));
+    let size = asset.info.as_ref().and_then(|i| i.video.as_ref()).map(|v| v.display_size()).unwrap_or((format.width, format.height));
     clip_of(
         ClipSource::Asset { asset: asset.id, audio_stream: 0 },
         format!("{}{suffix}", asset.name),

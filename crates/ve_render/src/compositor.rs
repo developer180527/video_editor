@@ -94,12 +94,16 @@ pub struct RenderLayer {
     pub effects: Vec<GpuEffect>,
     /// Inside a transition: the other layer and the transition's shader.
     pub transition: Option<Box<RenderTransition>>,
+    /// Degrees the stored picture turns clockwise to stand upright (a phone
+    /// held upright records landscape): 0, 90, 180 or 270. `size` is the
+    /// upright size; effects see the picture as stored.
+    pub turn: u16,
 }
 
 impl RenderLayer {
     /// A plain layer showing `frame` at its own size.
     pub fn of_frame(frame: Arc<VideoFrame>, motion: Motion, opacity: f32) -> Self {
-        RenderLayer { size: (frame.width, frame.height), source: LayerSource::Frame(frame), motion, opacity, blend: Blend::Normal, effects: vec![], transition: None }
+        RenderLayer { size: (frame.width, frame.height), source: LayerSource::Frame(frame), motion, opacity, blend: Blend::Normal, effects: vec![], transition: None, turn: 0 }
     }
 }
 
@@ -1120,8 +1124,11 @@ impl Compositor {
                 return;
             }
         }
+        // The stored picture's extent along the upright picture's width.
+        let turned = layer.turn % 180 == 90;
+        let across = if turned { th } else { tw };
         // Output pixels per texture pixel decides the mip chain.
-        let scale = layer.motion.scale / 100.0 * out.0 as f32 / seq_size.0.max(1) as f32 * layer.size.0 as f32 / tw.max(1) as f32;
+        let scale = layer.motion.scale / 100.0 * out.0 as f32 / seq_size.0.max(1) as f32 * layer.size.0 as f32 / across.max(1) as f32;
         // Effects may read a mip chain (wide blurs); otherwise only a
         // layer drawn small needs one.
         let levels = if layer.effects.is_empty() { mip_levels(scale, tw, th) } else { full_levels(tw, th) };
@@ -1129,7 +1136,7 @@ impl Compositor {
         // Texture pixels per pixel of the picture at full quality: what an
         // effect multiplies its sizes by (a proxy is smaller; a clip at any
         // preview quality is decoded whole).
-        let fx_scale = tw as f32 / layer.size.0.max(1) as f32;
+        let fx_scale = across as f32 / layer.size.0.max(1) as f32;
         let first = self.slots[i].pair.as_ref().unwrap()[0].base.clone();
 
         // 1. The picture, into the first texture of the pair.
@@ -1234,7 +1241,11 @@ impl Compositor {
         }
 
         // 4. Composite, by Motion, in the picture's logical size.
-        let corners = quad(&layer.motion, (layer.size.0 as f32, layer.size.1 as f32), (seq_size.0 as f32, seq_size.1 as f32));
+        let mut corners = quad(&layer.motion, (layer.size.0 as f32, layer.size.1 as f32), (seq_size.0 as f32, seq_size.1 as f32));
+        // Upright: each corner shows the stored picture's point under it.
+        for c in &mut corners {
+            [c[2], c[3]] = turn_uv([c[2], c[3]], layer.turn);
+        }
         let mut u: Vec<f32> = corners.iter().flatten().copied().collect();
         u.extend([layer.opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0]);
         queue.write_buffer(&self.slots[i].quad_buf, 0, &floats(&u));
@@ -1350,6 +1361,17 @@ fn begin<'e>(enc: &'e mut wgpu::CommandEncoder, view: &wgpu::TextureView, clear:
 
 /// The four corners of a layer, cropped and moved, in clip space with their
 /// texture coordinates: top-left, top-right, bottom-left, bottom-right.
+/// Where an upright picture's point `uv` lies in the stored picture that
+/// turns `turn` degrees clockwise to stand upright.
+pub fn turn_uv([u, v]: [f32; 2], turn: u16) -> [f32; 2] {
+    match turn % 360 {
+        90 => [v, 1.0 - u],
+        180 => [1.0 - u, 1.0 - v],
+        270 => [1.0 - v, u],
+        _ => [u, v],
+    }
+}
+
 pub fn quad(m: &Motion, src: (f32, f32), seq: (f32, f32)) -> [[f32; 4]; 4] {
     let [cl, ct, cr, cb] = m.crop.map(|c| (c / 100.0).clamp(0.0, 1.0));
     let (u0, v0, u1, v1) = (cl, ct, (1.0 - cr).max(cl), (1.0 - cb).max(ct));

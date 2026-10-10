@@ -21,7 +21,7 @@ fn asset(name: &str, secs: i64, video: bool, audio: bool) -> Asset {
         media: MediaRef(format!("file:/media/{name}")),
         info: Some(MediaInfo {
             duration: Time::from_seconds(secs),
-            video: video.then(|| VideoStreamInfo { width: 1920, height: 1080, rate: Rate::FPS_24, codec: "h264".into() }),
+            video: video.then(|| VideoStreamInfo::new(1920, 1080, Rate::FPS_24, "h264")),
             audio: audio.then(|| AudioStreamInfo { sample_rate: 48000, channels: 2, codec: "aac".into(), layout: "stereo".into() }).into_iter().collect(),
         }),
         variants: Vec::new(),

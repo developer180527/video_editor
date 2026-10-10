@@ -13,7 +13,7 @@ mod compositor;
 pub mod generate;
 pub mod scopes;
 
-pub use compositor::{display_color_to_working, quad, yuv_levels, Blend, Compositor, LayerSource, NestedLayers, Readback, RenderTransition, DEEP_FORMAT, GpuEffect, Motion, RenderLayer, TextureImporter, WorkingSpace, DISPLAY_FORMAT, WORKING_FORMAT};
+pub use compositor::{display_color_to_working, quad, turn_uv, yuv_levels, Blend, Compositor, LayerSource, NestedLayers, Readback, RenderTransition, DEEP_FORMAT, GpuEffect, Motion, RenderLayer, TextureImporter, WorkingSpace, DISPLAY_FORMAT, WORKING_FORMAT};
 
 use std::sync::Arc;
 use ve_model::*;

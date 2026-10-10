@@ -146,7 +146,7 @@ fn make_clip_attaches_intrinsics() {
         media: MediaRef("file:a.mov".into()),
         info: Some(MediaInfo {
             duration: Time::from_seconds(3),
-            video: Some(VideoStreamInfo { width: 1280, height: 720, rate: ve_time::Rate::FPS_25, codec: "h264".into() }),
+            video: Some(VideoStreamInfo::new(1280, 720, ve_time::Rate::FPS_25, "h264")),
             audio: Vec::new(),
         }),
         variants: Vec::new(),
@@ -215,7 +215,7 @@ fn every_audio_stream_gets_a_track_and_a_clip() {
         media: MediaRef("file:cam.mxf".into()),
         info: Some(MediaInfo {
             duration: Time::from_seconds(4),
-            video: Some(VideoStreamInfo { width: 1920, height: 1080, rate: ve_time::Rate::FPS_25, codec: "h264".into() }),
+            video: Some(VideoStreamInfo::new(1920, 1080, ve_time::Rate::FPS_25, "h264")),
             audio: vec![stream("mono", 1), stream("mono", 1), stream("mono", 1), stream("stereo", 2)],
         }),
         variants: Vec::new(),
@@ -349,7 +349,7 @@ fn the_source_monitor_has_its_own_playhead() {
         media: MediaRef("file:cam.mov".into()),
         info: Some(MediaInfo {
             duration: Time::from_seconds(10),
-            video: Some(VideoStreamInfo { width: 3840, height: 2160, rate: ve_time::Rate::FPS_25, codec: "h264".into() }),
+            video: Some(VideoStreamInfo::new(3840, 2160, ve_time::Rate::FPS_25, "h264")),
             audio: vec![stream.clone(), stream],
         }),
         variants: Vec::new(),

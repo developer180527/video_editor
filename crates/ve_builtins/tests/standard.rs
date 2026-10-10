@@ -165,17 +165,20 @@ fn every_shader_compiles_and_renders_on_the_gpu() {
 }
 
 /// Every video transition is exactly the outgoing picture at 0 and the
-/// incoming one at 1: no jump at either end.
+/// incoming one at 1: no jump at either end. (In linear Rec.709: in ACEScg
+/// one half-float rounding in a shader's arithmetic shows near black, and
+/// GPUs differ in where they round — lavapipe does, Metal does not.)
 #[test]
 fn transitions_start_on_a_and_end_on_b() {
     let Some(mut g) = Gpu::new() else { return eprintln!("skipped: no GPU") };
-    let a = g.render(&[layer(busy())], "A");
-    let b = g.render(&[layer(other())], "B");
+    let space = WorkingSpace::LinearRec709;
+    let a = g.render_in(&[layer(busy())], "A", space);
+    let b = g.render_in(&[layer(other())], "B", space);
     let builtin = intrinsic::all().into_iter().filter(|e| e.kind == EffectKind::Transition && e.wgsl.is_some());
     for e in pack().into_iter().filter(|e| e.kind == EffectKind::Transition).chain(builtin) {
-        let fx = at_defaults(&e, WorkingSpace::AcesCg);
+        let fx = at_defaults(&e, space);
         for (p, want, side) in [(0.0, &a, "A"), (1.0, &b, "B")] {
-            let got = g.render(&[across(busy(), other(), fx.clone(), p)], &e.plugin.id);
+            let got = g.render_in(&[across(busy(), other(), fx.clone(), p)], &e.plugin.id, space);
             let (d, at) = worst(&got, want, |_, _| true);
             assert!(d <= 1, "{} at {p}: not {side} (off by {d} at {at:?})", e.plugin.id);
         }
