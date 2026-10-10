@@ -33,7 +33,7 @@ const STRIP_H: f32 = 15.0;
 /// How close, in px, an edge must come to another to snap.
 const SNAP_PX: f32 = 8.0;
 
-const TOOLS: [(Icon, Tool, &str); 9] = [
+const TOOLS: [(Icon, Tool, &str); 10] = [
     (Icon::Select, Tool::Select, "Selection (V)"),
     (Icon::TrackSelect, Tool::TrackSelect, "Track Select Forward (A)"),
     (Icon::Ripple, Tool::Ripple, "Ripple Edit (B)"),
@@ -42,6 +42,7 @@ const TOOLS: [(Icon, Tool, &str); 9] = [
     (Icon::Slip, Tool::Slip, "Slip (Y)"),
     (Icon::Pen, Tool::Pen, "Pen (P)"),
     (Icon::Rect, Tool::Rect, "Rectangle"),
+    (Icon::Type, Tool::Type, "Type (T)"),
     (Icon::Hand, Tool::Hand, "Hand (H)"),
 ];
 
@@ -404,7 +405,7 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
     let rows = rows(app, &seq);
 
     // Media and effects dropped onto the timeline.
-    let zone = ui.drop_zone(&[ASSET_PAYLOAD, FILES_PAYLOAD, EFFECT_PAYLOAD, TRANSITION_PAYLOAD, GENERATOR_PAYLOAD]);
+    let zone = ui.drop_zone(&[ASSET_PAYLOAD, FILES_PAYLOAD, EFFECT_PAYLOAD, TRANSITION_PAYLOAD, GENERATOR_PAYLOAD, crate::graphics::TEMPLATE_PAYLOAD]);
 
     let id = ui.make_id("timeline");
     let r = ui.interact_drag(id);
@@ -605,6 +606,16 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
                     match target {
                         Some((clip, edge)) => app.add_transition(clip, edge, plugin),
                         None => app.errors.push("Drop transitions onto a clip's edge.".into()),
+                    }
+                }
+            }
+            crate::graphics::TEMPLATE_PAYLOAD => {
+                if let Ok(i) = p.take::<usize>() {
+                    let all = crate::graphics::templates();
+                    if let Some(tpl) = all.get(i) {
+                        // Onto the video track under the pointer, else the top free one.
+                        let video = track.filter(|t| seq.track(*t).is_some_and(|(_, tr)| tr.kind == TrackKind::Video));
+                        app.add_title(&tpl.params, t, video);
                     }
                 }
             }

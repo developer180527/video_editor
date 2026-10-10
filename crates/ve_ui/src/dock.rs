@@ -22,10 +22,11 @@ pub enum Tab {
     Scopes,
     TrackMixer,
     Color,
+    Graphics,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 14] = [
+    pub const ALL: [Tab; 15] = [
         Tab::Source,
         Tab::EffectControls,
         Tab::AudioClipMixer,
@@ -40,6 +41,7 @@ impl Tab {
         Tab::Scopes,
         Tab::TrackMixer,
         Tab::Color,
+        Tab::Graphics,
     ];
 
     /// Identity in a saved layout: a name, never a position.
@@ -59,6 +61,7 @@ impl Tab {
             Tab::Scopes => "scopes",
             Tab::TrackMixer => "track-mixer",
             Tab::Color => "color",
+            Tab::Graphics => "essential-graphics",
         })
         .0
     }
@@ -80,6 +83,7 @@ impl Tab {
             Tab::Scopes => "Lumetri Scopes",
             Tab::TrackMixer => "Audio Track Mixer",
             Tab::Color => "Lumetri Color",
+            Tab::Graphics => "Essential Graphics",
         }
     }
 
@@ -90,7 +94,7 @@ impl Tab {
 
 pub(crate) fn initial(touch: bool) -> DockState<Tab> {
     let mut dock = DockState::new();
-    let mut top_left = dock.leaf(vec![Tab::Source, Tab::EffectControls, Tab::Color, Tab::Scopes, Tab::TrackMixer, Tab::AudioClipMixer, Tab::Metadata]);
+    let mut top_left = dock.leaf(vec![Tab::Source, Tab::EffectControls, Tab::Color, Tab::Graphics, Tab::Scopes, Tab::TrackMixer, Tab::AudioClipMixer, Tab::Metadata]);
     if let DockNode::Leaf(l) = &mut top_left {
         l.active = 1;
     }
@@ -137,6 +141,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Scopes => "Lumetri Scopes".into(),
             Tab::TrackMixer => format!("Audio Track Mixer: {seq}"),
             Tab::Color => "Lumetri Color".into(),
+            Tab::Graphics => "Essential Graphics".into(),
         }
     }
 
@@ -145,7 +150,7 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn scroll(&self, tab: &Tab) -> bool {
-        matches!(tab, Tab::Metadata | Tab::MediaBrowser | Tab::Info | Tab::Effects | Tab::Settings | Tab::Color)
+        matches!(tab, Tab::Metadata | Tab::MediaBrowser | Tab::Info | Tab::Effects | Tab::Settings | Tab::Color | Tab::Graphics)
     }
 
     fn padding(&self, tab: &Tab) -> Insets {
@@ -168,6 +173,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Scopes => crate::scopes_panel::panel(ui, self.app),
             Tab::TrackMixer => crate::mixer_panel::panel(ui, self.app),
             Tab::Color => crate::color_panel::panel(ui, self.app),
+            Tab::Graphics => crate::graphics::panel(ui, self.app),
             other => placeholder(ui, &self.title(other)),
         }
     }

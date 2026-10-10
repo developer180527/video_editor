@@ -14,6 +14,7 @@ mod editing;
 mod effects;
 mod features;
 mod graph;
+mod graphics;
 mod menu;
 mod mixer_panel;
 mod program;
@@ -148,6 +149,8 @@ pub enum Tool {
     Pen,
     Rect,
     Hand,
+    /// Click the Program monitor to make a title there.
+    Type,
 }
 
 /// A parameter being dragged in Effect Controls, shown before it is committed.
@@ -199,6 +202,9 @@ pub struct View {
     pub(crate) graph_drag: Option<graph::Grab>,
     /// The graph's value scale, held while dragging.
     pub(crate) graph_scale: Option<(f64, f64)>,
+    /// Essential Graphics: 0 Browse, 1 Edit; the selected template.
+    pub graphics_tab: usize,
+    pub template: usize,
     /// Which scope the Scopes panel shows.
     pub scope: ve_render::scopes::ScopeKind,
     /// A fader or pan knob being dragged: the track and its live values.
@@ -272,6 +278,16 @@ pub struct EditorUi {
     pub(crate) pending_marks: Option<(ve_engine::MarksOwner, Marks, std::time::Instant)>,
     /// Where the last keyframe graph was drawn (tests aim at it).
     pub(crate) graph_rect: Option<Rect>,
+    /// Where the Program monitor's picture was drawn (tests aim at it).
+    pub(crate) monitor_rect: Option<Rect>,
+    /// An Essential Graphics panel was drawn: it wants template pictures.
+    pub(crate) graphics_wanted: bool,
+    /// Template pictures, by template index.
+    pub(crate) template_tex: Vec<Option<(wgpu::Texture, TextureId)>>,
+    /// Typing in a title's text: one undo step per stretch of typing.
+    pub(crate) text_gesture: Option<(ClipId, u64)>,
+    /// A colour being picked: one undo step until the picker closes.
+    pub(crate) color_gesture: Option<(&'static str, u64)>,
     /// The Source picture is still decoding: keep drawing.
     source_catching_up: bool,
     /// Refusals from this frame, shown as toasts on the next.
@@ -319,6 +335,8 @@ impl EditorUi {
                 graph_key: None,
                 graph_drag: None,
                 graph_scale: None,
+                graphics_tab: 0,
+                template: 0,
                 scope: Default::default(),
                 track_drag: None,
             },
@@ -362,6 +380,11 @@ impl EditorUi {
             source_seek_on_open: None,
             pending_marks: None,
             graph_rect: None,
+            monitor_rect: None,
+            graphics_wanted: false,
+            template_tex: Vec::new(),
+            text_gesture: None,
+            color_gesture: None,
             errors: Vec::new(),
             requests: Vec::new(),
             touch,
@@ -409,6 +432,13 @@ impl EditorUi {
         let quality = ve_render::Quality { scale: [1.0, 0.5, 0.25][self.view.quality.min(2)], use_proxies: self.view.proxies };
         if self.gpu.is_none() {
             self.gpu = Some((device.clone(), queue.clone()));
+        }
+        // Template pictures, once, when a graphics panel first wants them.
+        if self.graphics_wanted && self.template_tex.is_empty() {
+            for t in graphics::templates() {
+                let tex = graphics::template_picture(self, &t).map(|(w, h, rgba)| upload_rgba(device, queue, renderer, w, h, &rgba));
+                self.template_tex.push(tex);
+            }
         }
         for (key, img) in self.thumb_uploads.drain(..) {
             if self.thumbs.contains_key(&key) {
@@ -751,7 +781,7 @@ impl EditorUi {
         if let (Some(id), Some(view)) = (self.source_tex, &self.source_view) {
             renderer.update_texture(id, view);
         }
-        for (tex, id) in self.thumbs.values() {
+        for (tex, id) in self.thumbs.values().chain(self.template_tex.iter().flatten()) {
             if bound.insert(*id) {
                 renderer.update_texture(*id, &tex.create_view(&Default::default()));
             }
@@ -762,6 +792,19 @@ impl EditorUi {
     #[doc(hidden)]
     pub fn graph_rect(&self) -> Option<Rect> {
         self.graph_rect
+    }
+
+    /// Each title template's name and picture (320×180 RGBA), as the
+    /// Essential Graphics cards show them; for tests.
+    #[doc(hidden)]
+    pub fn template_pictures(&self) -> Vec<(String, u32, u32, Vec<u8>)> {
+        graphics::templates().iter().filter_map(|t| graphics::template_picture(self, t).map(|(w, h, px)| (t.name.to_string(), w, h, px))).collect()
+    }
+
+    /// Where the Program monitor's picture was drawn, for tests that drive it.
+    #[doc(hidden)]
+    pub fn monitor_rect(&self) -> Option<Rect> {
+        self.monitor_rect
     }
 
     /// Show the user something the host could not do (a toast).
@@ -1120,6 +1163,7 @@ impl EditorUi {
             (Key::Y, Tool::Slip),
             (Key::P, Tool::Pen),
             (Key::H, Tool::Hand),
+            (Key::T, Tool::Type),
         ] {
             if key(ui, k) {
                 self.view.tool = tool;
@@ -1187,6 +1231,29 @@ impl EditorUi {
         });
         self.run_edit(r);
     }
+}
+
+/// An RGBA8 picture as a texture the UI renderer can draw.
+fn upload_rgba(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui_wgpu::Renderer, w: u32, h: u32, rgba: &[u8]) -> (wgpu::Texture, TextureId) {
+    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ui picture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        rgba,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+        size,
+    );
+    let id = renderer.register_texture(&tex.create_view(&Default::default()));
+    (tex, id)
 }
 
 #[cfg(test)]

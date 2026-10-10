@@ -22,27 +22,94 @@ pub fn panel(ui: &mut Ui, app: &mut EditorUi) {
 /// The sequence's frame, letterboxed into the panel.
 fn picture(ui: &mut Ui, app: &mut EditorUi) {
     let id = ui.make_id("picture");
-    let r = ui.interact(id);
-    if r.clicked {
-        toggle_play(app);
-    }
+    let r = ui.interact_drag(id);
     let (fw, fh) = app.snap().active().map(|s| (s.format.width as f32, s.format.height as f32)).unwrap_or((16.0, 9.0));
     let zoom = [None, Some(1.0), Some(0.5), Some(0.25)][app.view.fit.min(3)];
-    let tex = app.monitor;
-    let note = ui.frame_text("Decoding…");
-    let catching_up = app.catching_up && !app.engine.is_playing();
-    let faint = ui.theme.palette.text_faint;
-    ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, true, move |p, rect| {
-        p.rect(rect, REEL.line, 0.0);
+    // Where the picture sits in the panel, and sequence px per screen px.
+    let place = move |rect: Rect| {
         let scale = match zoom {
             None => (rect.w / fw).min(rect.h / fh),
             Some(z) => z,
         };
         let (w, h) = (fw * scale, fh * scale);
-        let f = Rect::new((rect.center().x - w * 0.5).round(), (rect.center().y - h * 0.5).round(), w.round(), h.round());
+        (Rect::new((rect.center().x - w * 0.5).round(), (rect.center().y - h * 0.5).round(), w.round(), h.round()), scale)
+    };
+    let (f, scale) = place(r.rect);
+    app.monitor_rect = Some(f);
+    let to_seq = |p: Vec2| [(p.x - f.x) / scale, (p.y - f.y) / scale];
+
+    // The title under the playhead that is selected (or the topmost one):
+    // its bounds on the monitor, padded as its background is.
+    let title = crate::graphics::subject(app).filter(|c| c.timeline_range().contains(app.playhead));
+    let bounds = title.as_ref().and_then(|c| {
+        let style = crate::graphics::style_of(app, c)?;
+        let b = ve_render::generate::title_bounds(&style, (fw as u32, fh as u32));
+        let pad = style.boxed.map_or(0.0, |(_, p)| p);
+        Some([b[0] - pad, b[1] - pad, b[2] + 2.0 * pad, b[3] + 2.0 * pad])
+    });
+    let inside = |p: Vec2, b: [f32; 4]| {
+        let q = to_seq(p);
+        q[0] >= b[0] && q[0] <= b[0] + b[2] && q[1] >= b[1] && q[1] <= b[1] + b[3]
+    };
+    let selected = title.as_ref().is_some_and(|c| app.view.selection.contains(&c.id));
+    let typing = app.view.tool == crate::Tool::Type;
+    let over_title = bounds.is_some_and(|b| inside(r.mouse_pos, b));
+
+    if r.pressed {
+        app.drag_gesture = app.next_gesture();
+    }
+    // Drag a title by its body (it is selected by the press).
+    if let (Some(c), true) = (&title, over_title || app.drag_start.is_some()) {
+        if r.pressed && over_title && !app.view.selection.contains(&c.id) {
+            app.view.selection = vec![c.id];
+        }
+        let pos = crate::graphics::style_of(app, c).and_then(|s| s.position).unwrap_or([fw / 2.0, fh / 2.0]);
+        if let Some((p0, d)) = crate::drag_from(&mut app.drag_start, &r, pos) {
+            let at = [(p0[0] + d.x / scale) as f64, (p0[1] + d.y / scale) as f64];
+            app.set_title_param(c, "position", ve_model::Value::Vec2(at), Some(app.drag_gesture));
+        }
+    }
+    if r.clicked && app.drag_start.is_none() {
+        match (typing, over_title, &title) {
+            // The Type tool on a title selects it to edit; elsewhere, a new title there.
+            (true, true, Some(c)) => {
+                app.view.selection = vec![c.id];
+                app.view.graphics_tab = 1;
+            }
+            (true, _, _) => {
+                let at = to_seq(r.mouse_pos);
+                let params = [("text", ve_model::Value::Text("Title".into())), ("position", ve_model::Value::Vec2([at[0] as f64, at[1] as f64]))];
+                app.add_title(&params, app.playhead, None);
+            }
+            (false, true, _) => {}
+            (false, false, _) => toggle_play(app),
+        }
+    }
+    if r.hovered {
+        ui.cursor = if typing && !over_title { Cursor::Text } else if over_title { Cursor::Grab } else { Cursor::Default };
+    }
+
+    let tex = app.monitor;
+    let note = ui.frame_text("Decoding…");
+    let catching_up = app.catching_up && !app.engine.is_playing();
+    let faint = ui.theme.palette.text_faint;
+    let accent = ui.theme.palette.accent;
+    let outline = bounds.filter(|_| selected || typing);
+    ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, true, move |p, rect| {
+        p.rect(rect, REEL.line, 0.0);
+        let (f, scale) = place(rect);
         match tex {
             Some(tex) => p.image(f, tex, 0.0),
             None => p.rect(f, Color::BLACK, 0.0),
+        }
+        // The selected title's bounds, with corner marks.
+        if let Some(b) = outline {
+            let r = Rect::new(f.x + b[0] * scale, f.y + b[1] * scale, b[2] * scale, b[3] * scale);
+            p.rect_bordered(r, Color::TRANSPARENT, 0.0, 1.0, accent);
+            for (x, y) in [(r.x, r.y), (r.right(), r.y), (r.x, r.bottom()), (r.right(), r.bottom())] {
+                p.rect(Rect::new(x - 3.0, y - 3.0, 6.0, 6.0), Color::WHITE, 0.0);
+                p.rect_bordered(Rect::new(x - 3.0, y - 3.0, 6.0, 6.0), Color::TRANSPARENT, 0.0, 1.0, accent);
+            }
         }
         if catching_up {
             p.text_left(Rect::new(f.x + 10.0, f.bottom() - 22.0, f.w - 20.0, 16.0), 11.0, faint, note);

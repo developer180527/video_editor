@@ -683,3 +683,139 @@ fn keyframe_graph_editing() {
     press(&mut ui, &mut app, Key::Delete, Modifiers::NONE);
     wait(&app.engine, |_| opacity_keys(&app).len() == 2);
 }
+
+/// Titles: a template lands on a free track (a new one when none is), one
+/// undo step; the Type tool makes one where the monitor is clicked; a drag
+/// on the monitor moves it; and the panels as they look.
+#[test]
+fn essential_graphics_titles() {
+    let mut app = editor();
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    for _ in 0..4 {
+        frame(&mut ui, &mut app);
+    }
+    let s = Time::from_seconds;
+    let title_clips = |app: &EditorUi| {
+        let seq = app.engine.snapshot().active().unwrap().clone();
+        seq.tracks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| t.clips.iter().filter(|c| matches!(&c.source, ClipSource::Generator { plugin } if plugin.id == ve_engine::intrinsic::TITLE)).map(move |c| (i, c.clone())))
+            .collect::<Vec<_>>()
+    };
+    let before = title_clips(&app).len();
+    let tracks_before = app.engine.snapshot().active().unwrap().tracks.len();
+
+    // At 4 s both video tracks are busy: the lower third gets a new V3.
+    app.engine.seek(s(4));
+    frame(&mut ui, &mut app);
+    app.perform(&ve_ui::Action::NewTitle);
+    wait(&app.engine, |_| title_clips(&app).len() == before + 1);
+    let seq = app.engine.snapshot().active().unwrap().clone();
+    assert_eq!(seq.tracks.len(), tracks_before + 1, "a new video track");
+    let (ti, clip) = title_clips(&app).into_iter().find(|(_, c)| c.timeline_start == s(4)).unwrap();
+    assert_eq!(seq.tracks[ti].name, "V3");
+    assert_eq!(clip.name, "Title", "named after its text");
+    assert_eq!(seq.tracks[ti].kind, TrackKind::Video);
+    // One undo takes both away.
+    app.engine.undo();
+    wait(&app.engine, |c| c.snapshot().active().unwrap().tracks.len() == tracks_before);
+
+    // The Type tool: click right of centre on the monitor, a title there.
+    for _ in 0..3 {
+        frame(&mut ui, &mut app);
+    }
+    let f = app.monitor_rect().expect("the monitor is drawn");
+    let scale = f.w / 1920.0;
+    press(&mut ui, &mut app, Key::T, Modifiers::NONE);
+    let mv = |ui: &mut Ui, x: f32, y: f32| ui.push(InputEvent::PointerMoved { pos: Vec2::new(x, y) });
+    let button = |ui: &mut Ui, down: bool| ui.push(InputEvent::PointerButton { button: PointerButton::Primary, pressed: down });
+    let (cx, cy) = (f.x + 1400.0 * scale, f.y + 300.0 * scale);
+    mv(&mut ui, cx, cy);
+    frame(&mut ui, &mut app);
+    button(&mut ui, true);
+    frame(&mut ui, &mut app);
+    button(&mut ui, false);
+    frame(&mut ui, &mut app);
+    wait(&app.engine, |_| title_clips(&app).len() == before + 1);
+    let (_, clip) = title_clips(&app).into_iter().find(|(_, c)| c.timeline_start == s(4)).unwrap();
+    let position = |app: &EditorUi, id: ClipId| {
+        let c = app.engine.snapshot().find_clip(id).unwrap().2.clone();
+        let e = c.effects.iter().find(|e| e.plugin.id == ve_engine::intrinsic::TITLE).unwrap().clone();
+        match e.params["position"].value_at(Time::ZERO) {
+            Value::Vec2([x, y]) => (x, y),
+            v => panic!("{v:?}"),
+        }
+    };
+    let (x, y) = position(&app, clip.id);
+    assert!((x - 1400.0).abs() < 2.0 && (y - 300.0).abs() < 2.0, "made where clicked: ({x}, {y})");
+
+    // Drag it 60 px left on screen: it moves 60 / scale in the sequence.
+    for _ in 0..3 {
+        frame(&mut ui, &mut app);
+    }
+    press(&mut ui, &mut app, Key::V, Modifiers::NONE);
+    button(&mut ui, true);
+    frame(&mut ui, &mut app);
+    for k in 1..=6 {
+        mv(&mut ui, cx - 10.0 * k as f32, cy);
+        frame(&mut ui, &mut app);
+    }
+    button(&mut ui, false);
+    frame(&mut ui, &mut app);
+    let moved = 1400.0 - 60.0 / scale as f64;
+    wait(&app.engine, |_| (position(&app, clip.id).0 - moved).abs() < 2.0);
+
+    // How it looks: Essential Graphics (Browse, then Edit) and the outline.
+    let show = |app: &mut EditorUi, tab: ve_ui::Tab| {
+        let at = app.dock().find_tab(|t| *t == tab).expect("panel");
+        app.dock_mut().focus_tab(at);
+    };
+    render(&mut app, 2000, 1129, "graphics-browse.png", |app| {
+        show(app, ve_ui::Tab::Graphics);
+        app.view.graphics_tab = 0;
+    });
+    render(&mut app, 2000, 1129, "graphics-edit.png", |app| {
+        show(app, ve_ui::Tab::Graphics);
+        app.view.graphics_tab = 1;
+    });
+}
+
+/// Every title template draws something; a contact sheet of them over a
+/// dark frame goes to target/ui-look/templates.png to look at.
+#[test]
+fn title_templates_draw() {
+    let app = editor();
+    let pictures = app.template_pictures();
+    assert_eq!(pictures.len(), 7);
+    let (cols, cw, ch) = (4u32, 320u32, 180u32);
+    let rows = (pictures.len() as u32).div_ceil(cols);
+    let (w, h) = (cols * cw, rows * ch);
+    let mut sheet = vec![0u8; (w * h * 4) as usize];
+    for (i, (name, pw, ph, px)) in pictures.iter().enumerate() {
+        let inked = px.chunks(4).filter(|p| p[3] > 128).count();
+        assert!(inked > 200, "{name} draws ({inked} px)");
+        let (ox, oy) = ((i as u32 % cols) * cw, (i as u32 / cols) * ch);
+        for y in 0..*ph {
+            for x in 0..*pw {
+                let s = ((y * pw + x) * 4) as usize;
+                let a = px[s + 3] as f32 / 255.0;
+                let d = (((oy + y) * w + ox + x) * 4) as usize;
+                // Over a slate grey, as the cards show them.
+                let bg = [42.0, 52.0, 64.0];
+                for k in 0..3 {
+                    sheet[d + k] = (px[s + k] as f32 * a + bg[k] * (1.0 - a)) as u8;
+                }
+                sheet[d + 3] = 255;
+            }
+        }
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-look");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = std::fs::File::create(dir.join("templates.png")).unwrap();
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header().unwrap().write_image_data(&sheet).unwrap();
+}
+

@@ -250,7 +250,10 @@ impl EditorUi {
                     self.edit_marker(id);
                 }
             }
-            Action::NewTitle => self.new_generator(intrinsic::TITLE, self.playhead, None),
+            Action::NewTitle => {
+                let all = crate::graphics::templates();
+                self.add_title(&all[0].params, self.playhead, None);
+            }
             Action::NewColorMatte => self.new_generator(intrinsic::COLOR_MATTE, self.playhead, None),
             Action::NewBars => self.new_generator(intrinsic::BARS, self.playhead, None),
             Action::Lift => self.lift(),

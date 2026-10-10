@@ -47,6 +47,7 @@ pub enum Icon {
     Rolling,
     Slip,
     Rect,
+    Type,
     Lock,
     Eye,
     Mic,
@@ -262,6 +263,11 @@ pub fn draw_icon(p: &mut Painter, r: Rect, icon: Icon, c: Color) {
             bar(p, 0.0, 4.0, 12.0, 1.4);
             tri_left(p, -3.0, 0.0, 3.0, 5.0);
             tri_right(p, 3.0, 0.0, 3.0, 5.0);
+        }
+        Icon::Type => {
+            // A "T": the bar and the stem.
+            p.rect(Rect::new(m.x - 5.5 * u, m.y - 5.5 * u, 11.0 * u, line * 1.4), c, 0.0);
+            p.rect(Rect::new(m.x - line * 0.7, m.y - 5.5 * u, line * 1.4, 11.0 * u), c, 0.0);
         }
         Icon::Rect => p.rect_bordered(Rect::new(m.x - 6.0 * u, m.y - 4.5 * u, 12.0 * u, 9.0 * u), Color::TRANSPARENT, 1.0, line, c),
         Icon::Lock => {

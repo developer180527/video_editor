@@ -192,6 +192,23 @@ pub fn all() -> Vec<EffectInfo> {
             p("size", "Size", Float, 1.0, 1000.0, [96.0, 0.0, 0.0, 0.0]),
             p("color", "Color", Color, 0.0, 1.0, [1.0; 4]),
             p("position", "Position", Vec2, -inf, inf, [960.0, 540.0, 0.0, 0.0]),
+            ParamInfo {
+                animatable: false,
+                ..p("align", "Alignment", Choice(["Left", "Center", "Right"].map(String::from).to_vec()), 0.0, 2.0, [1.0, 0.0, 0.0, 0.0])
+            },
+            p("tracking", "Tracking", Float, -100.0, 500.0, [0.0; 4]),
+            p("leading", "Leading", Float, 50.0, 300.0, [100.0, 0.0, 0.0, 0.0]),
+            ParamInfo { animatable: false, ..p("bold", "Bold", Bool, 0.0, 1.0, [0.0; 4]) },
+            ParamInfo { animatable: false, ..p("stroke", "Stroke", Bool, 0.0, 1.0, [0.0; 4]) },
+            p("stroke_color", "Stroke Color", Color, 0.0, 1.0, [0.0, 0.0, 0.0, 1.0]),
+            p("stroke_width", "Stroke Width", Float, 0.0, 50.0, [4.0, 0.0, 0.0, 0.0]),
+            ParamInfo { animatable: false, ..p("box", "Background", Bool, 0.0, 1.0, [0.0; 4]) },
+            p("box_color", "Background Color", Color, 0.0, 1.0, [0.0, 0.0, 0.0, 0.6]),
+            p("box_padding", "Background Padding", Float, 0.0, 300.0, [24.0, 0.0, 0.0, 0.0]),
+            ParamInfo { animatable: false, ..p("shadow", "Shadow", Bool, 0.0, 1.0, [0.0; 4]) },
+            p("shadow_color", "Shadow Color", Color, 0.0, 1.0, [0.0, 0.0, 0.0, 0.75]),
+            p("shadow_distance", "Shadow Distance", Float, 0.0, 200.0, [6.0, 0.0, 0.0, 0.0]),
+            p("shadow_softness", "Shadow Softness", Float, 0.0, 100.0, [4.0, 0.0, 0.0, 0.0]),
         ]),
     ]
 }
