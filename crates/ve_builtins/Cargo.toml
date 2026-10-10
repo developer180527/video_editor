@@ -13,3 +13,10 @@ ve_plugin_host.workspace = true
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+ve_render.workspace = true
+ve_ports.workspace = true
+ve_time.workspace = true
+wgpu.workspace = true
+pollster.workspace = true

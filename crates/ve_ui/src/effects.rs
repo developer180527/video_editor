@@ -268,6 +268,7 @@ fn transition_panel(ui: &mut Ui, app: &mut EditorUi, seq: &Sequence, ti: usize, 
     let total = frames(tr.before + tr.after);
     let opts = ScrollOptions { padding: Insets::all(10.0), gap: 6.0, ..ScrollOptions::new(Size::Grow(1.0)) };
     let mut next: Option<Transition> = None;
+    let mut param: Option<ParamChange> = None;
     let mut remove = false;
     ui.scroll_area_with("transition", opts, |ui| {
         ui.text_with(&name, t.metrics.font_size_heading, t.palette.text);
@@ -302,8 +303,13 @@ fn transition_panel(ui: &mut Ui, app: &mut EditorUi, seq: &Sequence, ti: usize, 
             next = Some(Transition { before, after, ..(**tr).clone() });
         }
         if let Some(info) = &info {
+            if !info.params.is_empty() {
+                ui.space(4.0);
+            }
             for p in &info.params {
-                ui.text_with(&p.label, t.metrics.font_size_small, t.palette.text_muted);
+                if let Some(change) = transition_param(ui, tr, p) {
+                    param = Some(change);
+                }
             }
         }
         ui.space(8.0);
@@ -311,6 +317,26 @@ fn transition_panel(ui: &mut Ui, app: &mut EditorUi, seq: &Sequence, ti: usize, 
         ui.space(4.0);
         ui.text_with("Delete removes it too. Drag another from Effects onto the edge to replace it.", t.metrics.font_size_small, t.palette.text_faint);
     });
+    if let Some(ch) = param {
+        // A drag is one undo step; a click or a pick is its own.
+        if let Some((id, v)) = ch.value {
+            let mut n = (**tr).clone();
+            n.params.insert(id, Param::Constant(v));
+            match edit::set_transition(app.snap(), clip.id, edge, Some(n)) {
+                Ok(cmd) => {
+                    let gesture = match app.view.transition_gesture {
+                        Some(g) => g,
+                        None => app.next_gesture(),
+                    };
+                    app.engine.execute_merging(cmd, gesture);
+                    app.view.transition_gesture = ch.dragging.then_some(gesture);
+                }
+                Err(e) => app.errors.push(e.to_string()),
+            }
+        } else if !ch.dragging {
+            app.view.transition_gesture = None;
+        }
+    }
     if remove {
         app.remove_transition(clip.id, edge);
     } else if let Some(n) = next {
@@ -318,6 +344,80 @@ fn transition_panel(ui: &mut Ui, app: &mut EditorUi, seq: &Sequence, ti: usize, 
         let r = edit::set_transition(app.snap(), clip.id, edge, Some(n));
         app.run_edit(r);
     }
+}
+
+/// A transition parameter's edit this frame: a new value (if it changed),
+/// and whether a drag is still going.
+struct ParamChange {
+    value: Option<(String, Value)>,
+    dragging: bool,
+}
+
+/// One of a transition's parameters, editable. Transitions are short: their
+/// parameters hold one value for the whole transition.
+fn transition_param(ui: &mut Ui, tr: &Transition, p: &ParamInfo) -> Option<ParamChange> {
+    let current = tr.params.get(&p.id).map(|v| v.value_at(Time::ZERO)).unwrap_or_else(|| ve_engine::default_value(&p.kind, p.default));
+    let key = (tr.id, p.id.as_str());
+    let mut out: Option<ParamChange> = None;
+    let set = |v: Value, dragging: bool| Some(ParamChange { value: Some((p.id.clone(), v)), dragging });
+    let speed = if p.max.is_finite() && p.min.is_finite() { ((p.max - p.min) / 400.0).max(0.01) } else { 0.5 };
+    let decimals = if p.max.is_finite() && p.max - p.min <= 1.0 { 2 } else { 1 };
+    prop_row(ui, key, Prop { depth: 0, reset: false, ..Prop::new(&p.label) }, |ui| match (&p.kind, current.clone()) {
+        (ParamKind::Float, Value::Float(mut v)) => {
+            let r = value(ui, (key, 0), &mut v, speed, (p.min, p.max), decimals, "");
+            if r.active && Value::Float(v) != current {
+                out = set(Value::Float(v), true);
+            } else if r.released {
+                out = Some(ParamChange { value: None, dragging: false });
+            }
+        }
+        (ParamKind::Int, Value::Int(i)) => {
+            let mut v = i as f64;
+            let r = value(ui, (key, 0), &mut v, speed.max(0.05), (p.min, p.max), 0, "");
+            if r.active && v.round() as i64 != i {
+                out = set(Value::Int(v.round() as i64), true);
+            } else if r.released {
+                out = Some(ParamChange { value: None, dragging: false });
+            }
+        }
+        (ParamKind::Vec2, Value::Vec2([mut x, mut y])) => {
+            let rx = value(ui, (key, 0), &mut x, speed, (p.min, p.max), decimals, "");
+            let ry = value(ui, (key, 1), &mut y, speed, (p.min, p.max), decimals, "");
+            if (rx.active || ry.active) && Value::Vec2([x, y]) != current {
+                out = set(Value::Vec2([x, y]), true);
+            } else if rx.released || ry.released {
+                out = Some(ParamChange { value: None, dragging: false });
+            }
+        }
+        (ParamKind::Bool, Value::Bool(mut b)) => {
+            if ui.checkbox_keyed(key, "", &mut b).clicked {
+                out = set(Value::Bool(b), false);
+            }
+        }
+        (ParamKind::Choice(options), Value::Choice(c)) => {
+            let opts: Vec<&str> = options.iter().map(String::as_str).collect();
+            let mut sel = c as usize;
+            ui.container(Layout::row().width(Size::Fixed(130.0)).height(Size::Fixed(20.0)), Frame::none(), |ui| {
+                ui.combo(&format!("{}-{}", tr.id, p.id), &mut sel, &opts);
+            });
+            if sel != c as usize {
+                out = set(Value::Choice(sel as u32), false);
+            }
+        }
+        (ParamKind::Color, Value::Color(c)) => {
+            let mut col = Color::rgba(c[0], c[1], c[2], c[3]);
+            let r = ui.color_button(&format!("{}-{}", tr.id, p.id), &mut col);
+            if r.changed {
+                out = set(Value::Color([col.r, col.g, col.b, col.a]), !r.finished);
+            } else if r.finished {
+                out = Some(ParamChange { value: None, dragging: false });
+            }
+        }
+        (_, other) => {
+            ui.text_with(&format!("{other:?}"), 11.0, REEL.label);
+        }
+    });
+    out
 }
 
 fn section(ui: &mut Ui, label: &str) {

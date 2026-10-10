@@ -254,8 +254,8 @@ impl EditorUi {
                 let all = crate::graphics::templates();
                 self.add_title(&all[0].params, self.playhead, None);
             }
-            Action::NewColorMatte => self.new_generator(intrinsic::COLOR_MATTE, self.playhead, None),
-            Action::NewBars => self.new_generator(intrinsic::BARS, self.playhead, None),
+            Action::NewColorMatte => self.new_generator(&intrinsic::plugin_ref(intrinsic::COLOR_MATTE), self.playhead, None),
+            Action::NewBars => self.new_generator(&intrinsic::plugin_ref(intrinsic::BARS), self.playhead, None),
             Action::Lift => self.lift(),
             Action::Extract => self.extract(),
             Action::MatchFrame => self.match_frame(),

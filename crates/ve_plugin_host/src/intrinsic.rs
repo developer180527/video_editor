@@ -117,12 +117,12 @@ fn info(id: &str, name: &str, category: &str, params: Vec<ParamInfo>) -> EffectI
     }
 }
 
-fn transition(id: &str, name: &str, wgsl: Option<&str>) -> EffectInfo {
+fn transition(id: &str, name: &str, category: &str, wgsl: Option<&str>) -> EffectInfo {
     EffectInfo {
         kind: EffectKind::Transition,
         wgsl: wgsl.map(String::from),
         implementation: if wgsl.is_some() { Implementation::ShaderOnly } else { Implementation::Intrinsic },
-        ..info(id, name, "Transitions", vec![])
+        ..info(id, name, category, vec![])
     }
 }
 
@@ -156,10 +156,10 @@ pub fn all() -> Vec<EffectInfo> {
         ]),
         info(VOLUME, "Volume", "Intrinsic", vec![p("level", "Level", Float, -96.0, 15.0, [0.0; 4])]),
         info(PANNER, "Panner", "Intrinsic", vec![p("balance", "Balance", Float, -100.0, 100.0, [0.0; 4])]),
-        transition(DISSOLVE, "Cross Dissolve", Some(DISSOLVE_WGSL)),
-        transition(DIP_TO_BLACK, "Dip to Black", Some(DIP_WGSL)),
+        transition(DISSOLVE, "Cross Dissolve", "Dissolve", Some(DISSOLVE_WGSL)),
+        transition(DIP_TO_BLACK, "Dip to Black", "Dissolve", Some(DIP_WGSL)),
         // Audio: equal power, done by the mixer.
-        transition(CROSSFADE, "Constant Power", None),
+        transition(CROSSFADE, "Constant Power", "Crossfade", None),
         // Colours are display-referred (what a colour picker shows); the
         // generators draw in display space, so their pictures take the same
         // colour path as footage.

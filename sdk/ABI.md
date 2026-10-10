@@ -66,7 +66,8 @@ and what a plugin must do in return. Each rule has a test in
   in and out.
 - Parameters arrive keyframed to the current frame, packed as the contract
   says; colours converted to linear working space.
-- `scale` tells you the preview resolution; `time` and `progress` are as
-  documented.
+- `source` and `source_b` carry full mip chains.
+- `scale` tells you the texels per full-quality pixel; `time` and
+  `progress` are as documented.
 - A shader is checked when the plugin loads; a broken one is refused there,
   with its error, not on the GPU mid-edit.

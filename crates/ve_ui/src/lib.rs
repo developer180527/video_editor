@@ -183,6 +183,8 @@ pub struct View {
     pub quality: usize,
     pub thumb: f32,
     pub search: String,
+    /// The Effects panel's filter.
+    pub effects_search: String,
     /// Effect Controls twirls, closed when present.
     pub closed: HashSet<EffectId>,
     pub param_edit: Option<ParamEdit>,
@@ -195,6 +197,8 @@ pub struct View {
     pub selected_marker: Option<MarkerId>,
     /// A transition's duration, in frames, while it is being dragged.
     pub transition_frames: Option<f32>,
+    /// The undo step a drag of a transition's parameter is building.
+    pub transition_gesture: Option<u64>,
     /// Effect parameters whose keyframe graph is open.
     pub graphs: HashSet<(EffectId, String)>,
     /// The selected key in a graph, and what a graph drag holds.
@@ -324,6 +328,7 @@ impl EditorUi {
                 quality: 1,
                 thumb: 0.7,
                 search: String::new(),
+                effects_search: String::new(),
                 closed: HashSet::new(),
                 param_edit: None,
                 proxies: false,
@@ -331,6 +336,7 @@ impl EditorUi {
                 selected_transition: None,
                 selected_marker: None,
                 transition_frames: None,
+                transition_gesture: None,
                 graphs: HashSet::new(),
                 graph_key: None,
                 graph_drag: None,

@@ -40,7 +40,10 @@ fn wait(client: &EngineClient, f: impl Fn(&EngineClient) -> bool) {
 /// An engine holding a small hiking edit like the reference screenshot.
 fn editor() -> EditorUi {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("look");
-    let mut e = Engine::new(platform_headless::platform(&dir, Arc::new(platform_headless::NoMedia)));
+    // With the plugins the app links in (the standard effects).
+    let mut platform = platform_headless::platform(&dir, Arc::new(platform_headless::NoMedia));
+    platform.libraries = Arc::new(platform_headless::LinkedOnly { make: ve_builtins::linked() });
+    let mut e = Engine::new(platform);
     e.new_project("Hiking");
     let assets = [
         asset("DockAtitlanTL.mp4", 60, true, true),
@@ -185,6 +188,37 @@ fn features() {
         app.view.selected_transition = Some((cut, ve_engine::Edge::Start));
         app.view.selection = vec![snap.active().unwrap().tracks[0].clips[2].id];
         app.view.dialog = Some(ve_ui::Dialog::Speed { clip: app.view.selection[0], percent: 50.0, reverse: false, ripple: true });
+        app.view.selection.clear();
+    });
+}
+
+/// The Effects panel with the standard pack (whole, and searched), and a
+/// plugin transition's parameters in Effect Controls.
+#[test]
+fn effects_panel_and_transition_parameters() {
+    let mut app = editor();
+    let show = |app: &mut EditorUi, tab: ve_ui::Tab| {
+        let at = app.dock().find_tab(|t| *t == tab).expect("panel in the layout");
+        app.dock_mut().focus_tab(at);
+    };
+    assert!(app.engine.plugins().effects().len() > 70, "the standard pack is loaded");
+    render(&mut app, 2000, 1129, "panel-effects.png", |app| show(app, ve_ui::Tab::Effects));
+    render(&mut app, 2000, 1129, "panel-effects-search.png", |app| {
+        show(app, ve_ui::Tab::Effects);
+        app.view.effects_search = "iris".into();
+    });
+    // A Clock Wipe on the cut, its direction set to counter-clockwise.
+    let snap = app.engine.snapshot();
+    let cut = snap.active().unwrap().tracks[0].clips[1].id;
+    let wipe = app.engine.plugins().effects().iter().find(|e| e.name == "Clock Wipe").unwrap().plugin.clone();
+    let mut params = OrdMap::new();
+    params.insert("direction".to_string(), Param::Constant(Value::Choice(1)));
+    let half = Time::from_seconds_f64(0.5);
+    let tr = Transition { id: EffectId::new(), plugin: wipe.clone(), before: half, after: half, params };
+    app.engine.execute(edit::set_transition(&snap, cut, ve_engine::Edge::Start, Some(tr)).unwrap());
+    wait(&app.engine, |c| c.snapshot().active().unwrap().tracks[0].clips[1].transition_in.as_ref().is_some_and(|t| t.plugin == wipe));
+    render(&mut app, 2000, 1129, "transition-parameters.png", |app| {
+        app.view.selected_transition = Some((cut, ve_engine::Edge::Start));
         app.view.selection.clear();
     });
 }

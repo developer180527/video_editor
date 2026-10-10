@@ -20,5 +20,6 @@ wgpu.workspace = true
 
 [dev-dependencies]
 platform_headless.workspace = true
+ve_builtins.workspace = true
 libgui_soft = { path = "../../third_party/libgui/crates/libgui_soft" }
 png = "0.18"

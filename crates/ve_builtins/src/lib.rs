@@ -5,6 +5,8 @@
 //! Each is compiled with `VE_PLUGIN_STATIC_NAME` and listed here as a
 //! [`LinkedLibrary`] the platform hands to the engine.
 
+pub mod standard;
+
 use ve_plugin_abi::{VeHost, VePluginDesc};
 use ve_plugin_host::LinkedLibrary;
 use ve_ports::NativeLibrary;
@@ -16,5 +18,8 @@ extern "C" {
 /// Every built-in plugin, as the platform's `NativeLibraries::linked` wants
 /// them. A library's name is its static link name.
 pub fn linked() -> Vec<fn() -> Box<dyn NativeLibrary>> {
-    vec![|| Box::new(LinkedLibrary::new("invert").with("ve_plugin_entry_invert", ve_plugin_entry_invert as *const _))]
+    vec![
+        || Box::new(LinkedLibrary::new("invert").with("ve_plugin_entry_invert", ve_plugin_entry_invert as *const _)),
+        || Box::new(LinkedLibrary::new("standard").with("ve_plugin_entry_standard", standard::ve_plugin_entry_standard as *const _)),
+    ]
 }

@@ -331,8 +331,16 @@ pub fn effects_list(ui: &mut Ui, app: &mut EditorUi) {
     let t = ui.theme.clone();
     let registry = app.st.plugins.clone();
     let all = registry.effects();
+    let row = Layout::row().width(Size::Grow(1.0)).height(Size::Fixed(26.0)).padding(Insets::xy(6.0, 0.0)).gap(4.0).align(Align::Start, Align::Center);
+    ui.container(row, Frame::none(), |ui| {
+        let _ = icon_button(ui, "find-effect", Icon::Search, 16.0, false);
+        ui.text_input("effects-search", &mut app.view.effects_search, "Search effects");
+    });
+    // A search matches a name or a category ("blur", "wipe").
+    let q = app.view.effects_search.trim().to_lowercase();
+    let matches = |e: &EffectInfo| q.is_empty() || e.name.to_lowercase().contains(&q) || e.category.to_lowercase().contains(&q);
     let of = |f: &dyn Fn(&EffectInfo) -> bool| {
-        let mut v: Vec<&EffectInfo> = all.iter().filter(|e| f(e)).collect();
+        let mut v: Vec<&EffectInfo> = all.iter().filter(|e| f(e) && matches(e)).collect();
         v.sort_by(|a, b| (&a.category, &a.name).cmp(&(&b.category, &b.name)));
         v
     };
@@ -340,38 +348,54 @@ pub fn effects_list(ui: &mut Ui, app: &mut EditorUi) {
     let audio_tr = of(&|e| e.kind == EffectKind::Transition && e.wgsl.is_none());
     let generators = of(&|e| e.kind == EffectKind::Generator);
     let filters = of(&|e| e.kind == EffectKind::Filter && !matches!(e.implementation, Implementation::Intrinsic));
+    if !q.is_empty() && video_tr.is_empty() && audio_tr.is_empty() && generators.is_empty() && filters.is_empty() {
+        ui.space(6.0);
+        ui.label_muted("Nothing matches.");
+        return;
+    }
 
     #[derive(Clone)]
     enum Pick {
         Transition(TrackKind, PluginRef),
-        Generator(String),
+        Generator(PluginRef),
         Effect(PluginRef),
     }
     let mut pick = None;
-    for (title, list, kind) in [("Video Transitions", &video_tr, Some(TrackKind::Video)), ("Audio Transitions", &audio_tr, Some(TrackKind::Audio))] {
+    for (title, list, kind) in [("Video Transitions", &video_tr, TrackKind::Video), ("Audio Transitions", &audio_tr, TrackKind::Audio)] {
+        if list.is_empty() {
+            continue;
+        }
         ui.section(title);
+        let mut group = String::new();
         for e in list.iter() {
+            // Grouped by category under the section (Dissolve, Wipe, Iris…).
+            if kind == TrackKind::Video && e.category != group {
+                group = e.category.clone();
+                ui.text_with(&group, t.metrics.font_size_small, t.palette.text_faint);
+            }
             let r = ui.selectable_keyed(&e.plugin.id, &e.name, false);
             let (plugin, label) = (e.plugin.clone(), e.name.clone());
             ui.drag_source_from(&r, move || Payload::new(TRANSITION_PAYLOAD, plugin).with_label(label));
             ui.tooltip(&r, "Drag onto a clip's edge, or double-click for the nearest edit point");
             if r.double_clicked {
-                pick = Some(Pick::Transition(kind.unwrap(), e.plugin.clone()));
+                pick = Some(Pick::Transition(kind, e.plugin.clone()));
             }
         }
     }
-    ui.section("Generators");
+    if !generators.is_empty() {
+        ui.section("Generators");
+    }
     for e in &generators {
         let r = ui.selectable_keyed(&e.plugin.id, &e.name, false);
-        let (id, label) = (e.plugin.id.clone(), e.name.clone());
-        ui.drag_source_from(&r, move || Payload::new(GENERATOR_PAYLOAD, id).with_label(label));
+        let (plugin, label) = (e.plugin.clone(), e.name.clone());
+        ui.drag_source_from(&r, move || Payload::new(GENERATOR_PAYLOAD, plugin).with_label(label));
         ui.tooltip(&r, "Drag onto a video track, or double-click to add at the playhead");
         if r.double_clicked {
-            pick = Some(Pick::Generator(e.plugin.id.clone()));
+            pick = Some(Pick::Generator(e.plugin.clone()));
         }
     }
     let mut last = String::new();
-    if filters.is_empty() {
+    if filters.is_empty() && q.is_empty() {
         ui.section("Video Effects");
         ui.label_muted("No plugin effects loaded.");
     }
@@ -393,7 +417,7 @@ pub fn effects_list(ui: &mut Ui, app: &mut EditorUi) {
     ui.text_with("Drag onto the timeline, or double-click to apply.", t.metrics.font_size_small, t.palette.text_faint);
     match pick {
         Some(Pick::Transition(kind, plugin)) => app.apply_transition(kind, plugin),
-        Some(Pick::Generator(id)) => app.new_generator(&id, app.playhead, None),
+        Some(Pick::Generator(plugin)) => app.new_generator(&plugin, app.playhead, None),
         Some(Pick::Effect(plugin)) => {
             if let Some(&clip) = app.view.selection.first() {
                 add_effect(app, clip, &plugin);

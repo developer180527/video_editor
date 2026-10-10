@@ -361,7 +361,7 @@ impl EditorUi {
 
     /// A new generator clip (`ve.color`, `ve.bars`, `ve.title`) at `at` on
     /// `track` (the targeted video track when `None`).
-    pub(crate) fn new_generator(&mut self, id: &str, at: Time, track: Option<TrackId>) {
+    pub(crate) fn new_generator(&mut self, plugin: &PluginRef, at: Time, track: Option<TrackId>) {
         let Some(seq) = self.active_seq() else { return };
         let Some(track) = track
             .filter(|t| seq.track(*t).is_some_and(|(_, tr)| tr.kind == TrackKind::Video))
@@ -371,7 +371,7 @@ impl EditorUi {
             return;
         };
         let duration = Time::from_seconds_f64(self.settings().still_seconds as f64).round_to_frame(self.rate());
-        let Some(clip) = ve_engine::make_generator_clip(&self.st.plugins, &seq.format, &intrinsic::plugin_ref(id), duration) else { return };
+        let Some(clip) = ve_engine::make_generator_clip(&self.st.plugins, &seq.format, plugin, duration) else { return };
         self.view.selection = vec![clip.id];
         let r = edit::overwrite(self.snap(), seq.id, at, &[(track, Arc::new(clip))]);
         self.run_edit(r);

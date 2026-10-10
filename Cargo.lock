@@ -2669,9 +2669,13 @@ name = "ve_builtins"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "pollster 1.0.1",
  "ve_plugin_abi",
  "ve_plugin_host",
  "ve_ports",
+ "ve_render",
+ "ve_time",
+ "wgpu",
 ]
 
 [[package]]
@@ -2800,6 +2804,7 @@ dependencies = [
  "png",
  "serde",
  "toml",
+ "ve_builtins",
  "ve_engine",
  "ve_model",
  "ve_render",

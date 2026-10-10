@@ -620,8 +620,8 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
                 }
             }
             GENERATOR_PAYLOAD => {
-                if let Ok(id) = p.take::<String>() {
-                    app.new_generator(&id, t, track);
+                if let Ok(plugin) = p.take::<PluginRef>() {
+                    app.new_generator(&plugin, t, track);
                 }
             }
             _ => {

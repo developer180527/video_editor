@@ -48,6 +48,14 @@ error and its line, counted from the start of your source.
   0..1 over the output, (0, 0) at the top left.
 - Filters read `source`; transitions read `source` (outgoing) and
   `source_b` (incoming); generators read neither.
+- `source` and `source_b` carry a **full mip chain**, each level a 2×2
+  average of the one above. Level 0 is the picture; a wide filter (a
+  blur, a glow, a zoom) can read a pre-filtered level with
+  `textureSampleLevel(source, source_sampler, uv, lod)` instead of
+  thousands of taps. `textureSample` picks a level from the derivatives
+  as usual (level 0 for a 1:1 read).
+- Sampling outside 0..1 clamps to the edge pixels; to treat the outside
+  as transparent, test the coordinate yourself.
 
 ## Parameters
 
@@ -75,6 +83,10 @@ appears on the monitor as 50 % grey, in either working space.
 
 - `params.time`: seconds since the clip's start.
 - `params.progress`: transitions only, 0 → 1 across the transition.
-- `params.scale`: output pixels per sequence pixel (0.5 for a half-size
-  preview). Multiply any size you measure in sequence pixels (a blur
-  radius, an offset) by it, so a preview looks like the full render.
+- `params.scale`: pixels of the texture you read and write, per pixel of
+  the picture at full quality. A filter runs on its clip's own picture: 1
+  for a clip decoded whole (at any preview quality), 0.5 for a half-size
+  proxy. A transition or generator draws the sequence frame: 0.5 in a
+  half-size preview. Express sizes in the picture's pixels (a blur
+  radius, an offset) and multiply by `scale` to get texels, so every
+  quality looks like the full render.

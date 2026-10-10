@@ -389,3 +389,67 @@ fn a_picked_colour_comes_back_unchanged() {
         assert!((p[1] as i32 - 128).abs() <= 1, "{space:?} matte: {p:?}");
     }
 }
+
+/// Black on the left half, white on the right (display-referred RGBA).
+fn halves(w: u32, h: u32) -> Arc<VideoFrame> {
+    let px: Vec<u8> = (0..h).flat_map(|_| (0..w).flat_map(move |x| if x < w / 2 { [0, 0, 0, 255] } else { [255, 255, 255, 255] })).collect();
+    Arc::new(VideoFrame {
+        pts: Time::ZERO,
+        duration: Time::from_seconds(1),
+        width: w,
+        height: h,
+        format: PixelFormat::Rgba8,
+        color: ColorTags { primaries: "bt709".into(), transfer: "srgb".into(), matrix: "bt709".into(), full_range: true },
+        data: FrameData::Cpu { planes: vec![px], strides: vec![w as usize * 4] },
+    })
+}
+
+fn probe(key: &str, body: &str) -> GpuEffect {
+    let wgsl = format!("@fragment\nfn effect(i: EffectIn) -> @location(0) vec4<f32> {{\n    {body}\n}}\n");
+    GpuEffect { key: key.into(), wgsl: wgsl.into(), params: vec![], time: 0.0 }
+}
+
+/// `scale` is texels per full-quality pixel of the picture being drawn: a
+/// clip decoded whole sees 1 even in a half-size preview; a transition,
+/// drawing the sequence frame, sees the preview's 0.5.
+#[test]
+fn effects_see_scale_in_their_own_texels() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let show_scale = "return vec4<f32>(vec3<f32>(params.scale), 1.0);";
+    let half = plan(32, 18);
+    let at = |l: RenderLayer| {
+        let mut c = Compositor::new(&device);
+        c.render(&device, &queue, &half, &[l], (64, 36), WorkingSpace::LinearRec709);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        px(&c.read_output(&device, &queue).unwrap(), 16, 9)[0]
+    };
+    let mut clip = layer(gray(64, 36, 16), 100.0, 1.0);
+    clip.effects.push(probe("scale", show_scale));
+    assert_eq!(at(clip), 255, "a clip's effect sees scale 1");
+    let mut tr = layer(gray(64, 36, 16), 100.0, 1.0);
+    tr.transition = Some(Box::new(RenderTransition { effect: probe("scale-tr", show_scale), progress: 0.5, incoming: None, self_incoming: false }));
+    // Linear 0.5 on the monitor: 0.5^(1/2.4) ≈ 0.749 → 191.
+    assert!((189..=193).contains(&at(tr)), "a transition sees the preview's 0.5");
+}
+
+/// Effects and transitions can read their sources' mip chains: the
+/// smallest level of a half-black, half-white picture is mid grey.
+#[test]
+fn effect_sources_carry_mip_chains() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let render = |l: RenderLayer| {
+        let mut c = Compositor::new(&device);
+        c.render(&device, &queue, &plan(64, 36), &[l], (64, 36), WorkingSpace::LinearRec709);
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        px(&c.read_output(&device, &queue).unwrap(), 8, 18)[0]
+    };
+    let mut l = layer(halves(64, 36), 100.0, 1.0);
+    l.effects.push(probe("mips", "return textureSampleLevel(source, source_sampler, i.uv, 20.0);"));
+    let grey = render(l);
+    assert!((186..=196).contains(&grey), "an effect's source: {grey}");
+    let mut t = layer(gray(64, 36, 16), 100.0, 1.0);
+    let incoming = layer(halves(64, 36), 100.0, 1.0);
+    t.transition = Some(Box::new(RenderTransition { effect: probe("mips-tr", "return textureSampleLevel(source_b, source_sampler, i.uv, 20.0);"), progress: 0.5, incoming: Some(incoming), self_incoming: false }));
+    let grey = render(t);
+    assert!((186..=196).contains(&grey), "a transition's incoming source: {grey}");
+}

@@ -6,6 +6,12 @@ Native plugins are C (or anything exporting C) against the frozen v1 ABI
 
 - **Example:** [`examples/invert/invert.c`](examples/invert/invert.c): one
   filter, one animatable parameter, a WGSL shader.
+- **A full pack:** the app's standard effects — 40 effects and 25
+  transitions — are one v1 plugin
+  ([`crates/ve_builtins/src/standard.rs`](../crates/ve_builtins/src/standard.rs)),
+  with every shader in
+  [`crates/ve_builtins/shaders`](../crates/ve_builtins/shaders): blurs that
+  read the mip chain, distortions, keyers, wipes, a 3D card flip.
 - **Desktop install:** build a shared library named `*.vep` and put it in the
   app's plugin folder (macOS: `~/Library/Application Support/VideoEditor/Plugins`).
 - **iPadOS:** plugins cannot be loaded from files. They are compiled into the

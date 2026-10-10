@@ -530,8 +530,12 @@ struct Slot {
     effect_bg: Vec<[Option<wgpu::BindGroup>; 2]>,
     /// By texture, then by level (reading the level above).
     mip_bg: [Vec<wgpu::BindGroup>; 2],
-    /// A transition's pictures going out and coming in, and their mix.
-    trans: [Option<Target>; 3],
+    /// A transition's pictures going out and coming in (with mip chains,
+    /// which its shader may read), their size and levels, and their mix.
+    trans: Option<[LayerTex; 2]>,
+    trans_key: (u32, u32, u32),
+    trans_mip_bg: [Vec<wgpu::BindGroup>; 2],
+    trans_mix: Option<Target>,
     trans_buf: wgpu::Buffer,
     /// The whole-frame quad that lays a transition's mix down.
     ident_buf: wgpu::Buffer,
@@ -564,7 +568,10 @@ impl Slot {
             quad_bg: [None, None],
             effect_bg: Vec::new(),
             mip_bg: [Vec::new(), Vec::new()],
-            trans: [None, None, None],
+            trans: None,
+            trans_key: (0, 0, 0),
+            trans_mip_bg: [Vec::new(), Vec::new()],
+            trans_mix: None,
             trans_buf: uniform_buf(device, EFFECT_BYTES),
             ident_buf: uniform_buf(device, QUAD_BYTES),
         }
@@ -574,11 +581,32 @@ impl Slot {
 /// Mip levels worth having for a layer drawn at `scale` (target pixels per
 /// source pixel): enough that the composite never minifies by more than 2×.
 fn mip_levels(scale: f32, w: u32, h: u32) -> u32 {
-    let max = 32 - w.max(h).max(1).leading_zeros();
+    let max = full_levels(w, h);
     if !(scale > 0.0 && scale < 0.5) {
         return 1;
     }
     ((1.0 / scale).log2().floor() as u32 + 1).min(max)
+}
+
+/// Every mip level down to 1×1.
+fn full_levels(w: u32, h: u32) -> u32 {
+    32 - w.max(h).max(1).leading_zeros()
+}
+
+/// A working-format texture of `levels` mip levels, with its views.
+fn layer_tex(device: &wgpu::Device, w: u32, h: u32, levels: u32) -> LayerTex {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("layer"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: WORKING_FORMAT,
+        usage: LAYER_USAGE,
+        view_formats: &[],
+    });
+    let level = |l: u32| tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: l, mip_level_count: Some(1), ..Default::default() });
+    LayerTex { base: level(0), all: tex.create_view(&Default::default()), levels: (1..levels).map(level).collect() }
 }
 
 pub struct Compositor {
@@ -877,25 +905,38 @@ impl Compositor {
         if slot.pair.is_some() && slot.pair_key == (w, h, levels) {
             return;
         }
-        let make = || {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("layer"),
-                size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
-                mip_level_count: levels,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: WORKING_FORMAT,
-                usage: LAYER_USAGE,
-                view_formats: &[],
-            });
-            let level = |l: u32| tex.create_view(&wgpu::TextureViewDescriptor { base_mip_level: l, mip_level_count: Some(1), ..Default::default() });
-            LayerTex { base: level(0), all: tex.create_view(&Default::default()), levels: (1..levels).map(level).collect() }
-        };
-        slot.pair = Some([make(), make()]);
+        slot.pair = Some([layer_tex(device, w, h, levels), layer_tex(device, w, h, levels)]);
         slot.pair_key = (w, h, levels);
         slot.quad_bg = [None, None];
         slot.effect_bg.iter_mut().for_each(|b| *b = [None, None]);
         slot.mip_bg = [Vec::new(), Vec::new()];
+    }
+
+    /// Bind groups for `t`'s mip passes: each level reads the one above.
+    fn mip_groups(&self, device: &wgpu::Device, t: &LayerTex) -> Vec<wgpu::BindGroup> {
+        (1..=t.levels.len()).map(|l| self.bind(device, &self.one_layout, &self.empty_buf, &[if l == 1 { &t.base } else { &t.levels[l - 2] }])).collect()
+    }
+
+    /// Fill `t`'s levels 1.., each a 2×2 average of the level above
+    /// (bilinear at its centre).
+    fn mip_passes(&self, enc: &mut wgpu::CommandEncoder, t: &LayerTex, groups: &[wgpu::BindGroup]) {
+        for (l, bg) in groups.iter().enumerate() {
+            let mut pass = begin(enc, &t.levels[l], Some(wgpu::Color::TRANSPARENT));
+            pass.set_pipeline(&self.mip);
+            pass.set_bind_group(0, bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// Fill the mip chain of slot `i`'s texture `cur` (bind groups made
+    /// once, kept with the slot).
+    fn layer_mips(&mut self, device: &wgpu::Device, enc: &mut wgpu::CommandEncoder, i: usize, cur: usize) {
+        if self.slots[i].mip_bg[cur].is_empty() {
+            let bgs = self.mip_groups(device, &self.slots[i].pair.as_ref().unwrap()[cur]);
+            self.slots[i].mip_bg[cur] = bgs;
+        }
+        let s = &self.slots[i];
+        self.mip_passes(enc, &s.pair.as_ref().unwrap()[cur], &s.mip_bg[cur]);
     }
 
     /// Draw `layers` (bottom first) for `plan` and produce the monitor image.
@@ -984,11 +1025,19 @@ impl Compositor {
         next: &mut usize,
     ) {
         let i = self.slot(device, next);
-        for k in 0..3 {
-            Self::target(&mut self.slots[i].trans[k], device, "transition", out.0, out.1, WORKING_FORMAT, LAYER_USAGE);
+        // Both sides carry mip chains, for shaders that blur or zoom.
+        let key = (out.0, out.1, full_levels(out.0, out.1));
+        if self.slots[i].trans.is_none() || self.slots[i].trans_key != key {
+            let s = &mut self.slots[i];
+            s.trans = Some([layer_tex(device, out.0, out.1, key.2), layer_tex(device, out.0, out.1, key.2)]);
+            s.trans_key = key;
+            s.trans_mip_bg = [Vec::new(), Vec::new()];
         }
-        let views: Vec<wgpu::TextureView> = self.slots[i].trans.iter().map(|t| t.as_ref().unwrap().view.clone()).collect();
-        let (a, b, c) = (&views[0], &views[1], &views[2]);
+        Self::target(&mut self.slots[i].trans_mix, device, "transition", out.0, out.1, WORKING_FORMAT, LAYER_USAGE);
+        let [ta, tb] = self.slots[i].trans.as_ref().unwrap();
+        let (a, b, a_all, b_all) = (ta.base.clone(), tb.base.clone(), ta.all.clone(), tb.all.clone());
+        let c = self.slots[i].trans_mix.as_ref().unwrap().view.clone();
+        let (a, b, c) = (&a, &b, &c);
         for v in [a, b] {
             let _clear = begin(enc, v, Some(wgpu::Color::TRANSPARENT));
         }
@@ -1002,6 +1051,14 @@ impl Compositor {
         }
         // The mix: the transition's shader, or a cut at half-way without one.
         let mixed = if self.effect_pipeline(device, &tr.effect).is_some() {
+            for k in 0..2 {
+                if self.slots[i].trans_mip_bg[k].is_empty() {
+                    let bgs = self.mip_groups(device, &self.slots[i].trans.as_ref().unwrap()[k]);
+                    self.slots[i].trans_mip_bg[k] = bgs;
+                }
+                let s = &self.slots[i];
+                self.mip_passes(enc, &s.trans.as_ref().unwrap()[k], &s.trans_mip_bg[k]);
+            }
             let mut vals = vec![0f32; 64 * 4 + 4];
             for (n, p) in tr.effect.params.iter().take(64).enumerate() {
                 vals[n * 4..n * 4 + 4].copy_from_slice(p);
@@ -1010,7 +1067,7 @@ impl Compositor {
             vals[257] = tr.progress.clamp(0.0, 1.0);
             vals[258] = out.0 as f32 / seq_size.0.max(1) as f32;
             queue.write_buffer(&self.slots[i].trans_buf, 0, &floats(&vals));
-            let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf, &[a, &self.dummy_view, b]);
+            let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf, &[&a_all, &self.dummy_view, &b_all]);
             let mut pass = begin(enc, c, Some(wgpu::Color::TRANSPARENT));
             pass.set_pipeline(self.effects[&tr.effect.key].as_ref().unwrap());
             pass.set_bind_group(0, &bg, &[]);
@@ -1051,7 +1108,11 @@ impl Compositor {
         let i = self.slot(device, next);
         let (tw, th) = match &layer.source {
             LayerSource::Frame(f) => (f.width, f.height),
-            LayerSource::Shader(_) => layer.size,
+            // Drawn at the output's resolution, like a CPU generator.
+            LayerSource::Shader(_) => {
+                let k = out.0 as f32 / seq_size.0.max(1) as f32;
+                (((layer.size.0 as f32 * k).round() as u32).max(1), ((layer.size.1 as f32 * k).round() as u32).max(1))
+            }
             LayerSource::Nested(n) => (n.width, n.height),
         };
         if let LayerSource::Frame(f) = &layer.source {
@@ -1061,8 +1122,14 @@ impl Compositor {
         }
         // Output pixels per texture pixel decides the mip chain.
         let scale = layer.motion.scale / 100.0 * out.0 as f32 / seq_size.0.max(1) as f32 * layer.size.0 as f32 / tw.max(1) as f32;
-        let levels = mip_levels(scale, tw, th);
+        // Effects may read a mip chain (wide blurs); otherwise only a
+        // layer drawn small needs one.
+        let levels = if layer.effects.is_empty() { mip_levels(scale, tw, th) } else { full_levels(tw, th) };
         self.layer_pair(device, i, tw, th, levels);
+        // Texture pixels per pixel of the picture at full quality: what an
+        // effect multiplies its sizes by (a proxy is smaller; a clip at any
+        // preview quality is decoded whole).
+        let fx_scale = tw as f32 / layer.size.0.max(1) as f32;
         let first = self.slots[i].pair.as_ref().unwrap()[0].base.clone();
 
         // 1. The picture, into the first texture of the pair.
@@ -1107,7 +1174,7 @@ impl Compositor {
                     vals[n * 4..n * 4 + 4].copy_from_slice(p);
                 }
                 vals[256] = e.time;
-                vals[258] = out.0 as f32 / seq_size.0.max(1) as f32;
+                vals[258] = fx_scale;
                 queue.write_buffer(&self.slots[i].trans_buf, 0, &floats(&vals));
                 let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf, &[&self.dummy_view, &self.dummy_view, &self.dummy_view]);
                 let mut pass = begin(enc, &first, Some(wgpu::Color::TRANSPARENT));
@@ -1134,7 +1201,8 @@ impl Compositor {
                 vals[n * 4..n * 4 + 4].copy_from_slice(p);
             }
             vals[256] = e.time;
-            vals[258] = out.0 as f32 / seq_size.0.max(1) as f32;
+            vals[258] = fx_scale;
+            self.layer_mips(device, enc, i, cur);
             let s = &mut self.slots[i];
             while s.effect_bufs.len() <= k {
                 s.effect_bufs.push(uniform_buf(device, EFFECT_BYTES));
@@ -1143,8 +1211,8 @@ impl Compositor {
             queue.write_buffer(&s.effect_bufs[k], 0, &floats(&vals));
             if self.slots[i].effect_bg[k][cur].is_none() {
                 let s = &self.slots[i];
-                // Bindings: source, (unused slot), source_b.
-                let src = &s.pair.as_ref().unwrap()[cur].base;
+                // Bindings: source (with its mip chain), (unused slot), source_b.
+                let src = &s.pair.as_ref().unwrap()[cur].all;
                 let bg = self.bind(device, &self.effect_layout, &s.effect_bufs[k], &[src, &self.dummy_view, &self.dummy_view]);
                 self.slots[i].effect_bg[k][cur] = Some(bg);
             }
@@ -1159,28 +1227,10 @@ impl Compositor {
             cur = nxt;
         }
 
-        // 3. Mip chain, when the layer is drawn below half size: each
-        // level a 2×2 average of the one above (bilinear at its centre).
+        // 3. Mip chain, when the layer is drawn below half size (or has
+        // effects): each level a 2×2 average of the one above.
         if levels > 1 {
-            if self.slots[i].mip_bg[cur].is_empty() {
-                let s = &self.slots[i];
-                let t = &s.pair.as_ref().unwrap()[cur];
-                let bgs = (1..levels as usize)
-                    .map(|l| {
-                        let above = if l == 1 { &t.base } else { &t.levels[l - 2] };
-                        self.bind(device, &self.one_layout, &self.empty_buf, &[above])
-                    })
-                    .collect();
-                self.slots[i].mip_bg[cur] = bgs;
-            }
-            let s = &self.slots[i];
-            let t = &s.pair.as_ref().unwrap()[cur];
-            for (l, bg) in s.mip_bg[cur].iter().enumerate() {
-                let mut pass = begin(enc, &t.levels[l], Some(wgpu::Color::TRANSPARENT));
-                pass.set_pipeline(&self.mip);
-                pass.set_bind_group(0, bg, &[]);
-                pass.draw(0..3, 0..1);
-            }
+            self.layer_mips(device, enc, i, cur);
         }
 
         // 4. Composite, by Motion, in the picture's logical size.
