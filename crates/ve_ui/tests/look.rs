@@ -223,6 +223,46 @@ fn effects_panel_and_transition_parameters() {
     });
 }
 
+/// In a narrow window the tabs that do not fit scroll sideways: the wheel
+/// over a pane's tab bar brings the hidden ones into view.
+#[test]
+fn tabs_scroll_when_they_do_not_fit() {
+    let mut app = editor();
+    render(&mut app, 1200, 800, "tabs-narrow.png", |_| {});
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    ui.reserve(8_000);
+    let info = FrameInfo { screen_size: Vec2::new(1200.0, 800.0), scale: 1.0, dt: 1.0 / 60.0 };
+    let frame = |ui: &mut Ui, app: &mut EditorUi| {
+        ui.begin_frame(info);
+        app.ui(ui);
+        let _ = ui.end_frame();
+    };
+    for _ in 0..3 {
+        frame(&mut ui, &mut app);
+    }
+    // The wheel, turned down over the upper-left pane's tab bar.
+    ui.push(InputEvent::PointerMoved { pos: Vec2::new(300.0, 52.0) });
+    frame(&mut ui, &mut app);
+    for _ in 0..4 {
+        ui.push(InputEvent::Wheel { delta: Vec2::new(0.0, -10.0), unit: WheelUnit::Line });
+        frame(&mut ui, &mut app);
+    }
+    for _ in 0..30 {
+        frame(&mut ui, &mut app);
+    }
+    ui.begin_frame(info);
+    app.ui(&mut ui);
+    let out = ui.end_frame();
+    let img = SoftRenderer::new().render_to_image(&out, 1200, 800);
+    drop(out);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-look");
+    let file = std::fs::File::create(dir.join("tabs-scrolled.png")).unwrap();
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), img.width, img.height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header().unwrap().write_image_data(&img.data).unwrap();
+}
+
 /// The title bar as the editor draws it: the window buttons it draws
 /// itself (Windows, Linux), and room left for the OS's (macOS).
 #[test]

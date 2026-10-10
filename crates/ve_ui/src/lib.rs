@@ -15,6 +15,8 @@ mod effects;
 mod features;
 mod graph;
 mod graphics;
+mod icon_shapes;
+mod icons;
 mod menu;
 mod mixer_panel;
 mod program;

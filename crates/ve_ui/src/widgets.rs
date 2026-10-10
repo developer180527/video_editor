@@ -3,12 +3,13 @@
 //!
 //! The icons are drawn, not typed. A font is not guaranteed to have a play
 //! triangle or a padlock, and a missing glyph is a tofu box in the middle of
-//! your toolbar — so every one of these is rectangles, lines and circles.
+//! your toolbar — so every one is a vector mask ([`crate::icons`]), tinted
+//! with whatever colour the theme gives it.
 
 use crate::theme::REEL;
 use libgui::*;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Icon {
     Home,
     Share,
@@ -64,274 +65,68 @@ pub enum Icon {
     AddTrack,
 }
 
-/// Draw `icon` centred in `r`, in `c`. Sizes are relative to the box, so the
-/// same call works in a 14 px toolbar and a 24 px transport row.
-pub fn draw_icon(p: &mut Painter, r: Rect, icon: Icon, c: Color) {
-    let m = r.center();
-    let s = r.w.min(r.h);
-    let u = s / 16.0; // a 16-unit grid, like the icon sets these copy
-    let line = (u * 1.4).max(1.0);
-    let bar = |p: &mut Painter, x: f32, y: f32, w: f32, h: f32| {
-        p.rect(Rect::new(m.x + x * u - w * u * 0.5, m.y + y * u - h * u * 0.5, w * u, h * u), c, 0.0);
-    };
-    let tri_right = |p: &mut Painter, cx: f32, cy: f32, w: f32, h: f32| {
-        // A triangle out of columns: the shader has no polygon.
-        let steps = (h * u).max(3.0) as usize;
-        for i in 0..steps {
-            let t = i as f32 / steps as f32;
-            let hh = h * u * (1.0 - t);
-            let x = m.x + cx * u + t * w * u;
-            p.rect(Rect::new(x, m.y + cy * u - hh * 0.5, (w * u / steps as f32).ceil(), hh), c, 0.0);
-        }
-    };
-    let tri_left = |p: &mut Painter, cx: f32, cy: f32, w: f32, h: f32| {
-        let steps = (h * u).max(3.0) as usize;
-        for i in 0..steps {
-            let t = i as f32 / steps as f32;
-            let hh = h * u * (1.0 - t);
-            let x = m.x + cx * u - t * w * u;
-            p.rect(Rect::new(x - (w * u / steps as f32).ceil(), m.y + cy * u - hh * 0.5, (w * u / steps as f32).ceil(), hh), c, 0.0);
-        }
-    };
-    let ring = |p: &mut Painter, rad: f32, w: f32| {
-        p.rect_bordered(Rect::new(m.x - rad * u, m.y - rad * u, rad * 2.0 * u, rad * 2.0 * u), Color::TRANSPARENT, rad * u, w, c);
-    };
-
-    match icon {
-        Icon::Home => {
-            // Roof from stacked rows, then the body.
-            let steps = (5.0 * u).max(3.0) as usize;
-            for i in 0..steps {
-                let t = i as f32 / steps as f32;
-                let w = 12.0 * u * t;
-                let y = m.y - 6.0 * u + t * 5.0 * u;
-                p.rect(Rect::new(m.x - w * 0.5, y, w, (5.0 * u / steps as f32).ceil()), c, 0.0);
-            }
-            p.rect_bordered(Rect::new(m.x - 4.0 * u, m.y - 1.0 * u, 8.0 * u, 7.0 * u), Color::TRANSPARENT, 0.0, line, c);
-        }
-        Icon::Share | Icon::Export => {
-            bar(p, 0.0, 1.0, 1.4, 8.0);
-            tri_right(p, -3.5, -4.5, 3.5, 5.0);
-            tri_left(p, 3.5, -4.5, 3.5, 5.0);
-            bar(p, 0.0, 6.0, 12.0, 1.4);
-        }
-        Icon::Menu => {
-            for y in [-4.0, 0.0, 4.0] {
-                bar(p, 0.0, y, 13.0, 1.4);
-            }
-        }
-        Icon::Expand => {
-            for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                bar(p, sx * 4.5, sy * 6.0, 5.0, 1.4);
-                bar(p, sx * 6.0, sy * 4.5, 1.4, 5.0);
-            }
-        }
-        Icon::Panel => {
-            p.rect_bordered(Rect::new(m.x - 6.0 * u, m.y - 5.0 * u, 12.0 * u, 10.0 * u), Color::TRANSPARENT, 1.0, line, c);
-            bar(p, -1.0, 0.0, 1.2, 10.0);
-        }
-        Icon::Play => tri_right(p, -3.0, 0.0, 7.0, 10.0),
-        Icon::Pause => {
-            bar(p, -2.2, 0.0, 2.2, 10.0);
-            bar(p, 2.2, 0.0, 2.2, 10.0);
-        }
-        Icon::StepBack => {
-            tri_left(p, 2.0, 0.0, 6.0, 9.0);
-            bar(p, -3.5, 0.0, 1.4, 9.0);
-        }
-        Icon::StepForward => {
-            tri_right(p, -2.0, 0.0, 6.0, 9.0);
-            bar(p, 3.5, 0.0, 1.4, 9.0);
-        }
-        Icon::JumpStart => {
-            bar(p, -5.0, 0.0, 1.6, 10.0);
-            tri_left(p, 5.0, 0.0, 7.0, 10.0);
-        }
-        Icon::JumpEnd => {
-            bar(p, 5.0, 0.0, 1.6, 10.0);
-            tri_right(p, -5.0, 0.0, 7.0, 10.0);
-        }
-        Icon::MarkIn => {
-            bar(p, -4.0, 0.0, 1.6, 11.0);
-            bar(p, 0.5, -4.7, 8.0, 1.6);
-            bar(p, 0.5, 4.7, 8.0, 1.6);
-        }
-        Icon::MarkOut => {
-            bar(p, 4.0, 0.0, 1.6, 11.0);
-            bar(p, -0.5, -4.7, 8.0, 1.6);
-            bar(p, -0.5, 4.7, 8.0, 1.6);
-        }
-        Icon::Marker => {
-            p.rect(Rect::new(m.x - 4.0 * u, m.y - 5.0 * u, 8.0 * u, 7.0 * u), c, 1.0);
-            tri_down(p, m, u, c, 4.0, 2.0, 3.0);
-        }
-        Icon::Insert | Icon::Overwrite => {
-            p.rect_bordered(Rect::new(m.x - 6.0 * u, m.y - 4.0 * u, 12.0 * u, 8.0 * u), Color::TRANSPARENT, 1.0, line, c);
-            if icon == Icon::Overwrite {
-                p.rect(Rect::new(m.x - 6.0 * u, m.y - 4.0 * u, 6.0 * u, 8.0 * u), c, 0.0);
-            } else {
-                bar(p, 0.0, 0.0, 1.4, 8.0);
-            }
-        }
-        Icon::Camera => {
-            p.rect_bordered(Rect::new(m.x - 6.5 * u, m.y - 4.0 * u, 13.0 * u, 9.0 * u), Color::TRANSPARENT, 1.5, line, c);
-            ring(p, 2.6, line);
-            bar(p, 3.5, -5.5, 4.0, 1.6);
-        }
-        Icon::Settings | Icon::Wrench => {
-            ring(p, 3.0, line);
-            for (dx, dy) in [(0.0, 6.0), (0.0, -6.0), (6.0, 0.0), (-6.0, 0.0)] {
-                bar(p, dx * 0.85, dy * 0.85, if dx == 0.0 { 1.6 } else { 4.0 }, if dx == 0.0 { 4.0 } else { 1.6 });
-            }
-        }
-        Icon::Search | Icon::Zoom => {
-            p.rect_bordered(Rect::new(m.x - 6.0 * u, m.y - 6.0 * u, 9.0 * u, 9.0 * u), Color::TRANSPARENT, 4.5 * u, line, c);
-            p.line(Vec2::new(m.x + 2.0 * u, m.y + 2.0 * u), Vec2::new(m.x + 6.0 * u, m.y + 6.0 * u), line, c);
-        }
-        Icon::Folder | Icon::NewBin => {
-            p.rect(Rect::new(m.x - 6.5 * u, m.y - 4.5 * u, 6.0 * u, 2.0 * u), c, 0.5);
-            p.rect_bordered(Rect::new(m.x - 6.5 * u, m.y - 3.0 * u, 13.0 * u, 8.5 * u), Color::TRANSPARENT, 1.0, line, c);
-            if icon == Icon::NewBin {
-                bar(p, 0.0, 1.5, 5.0, 1.3);
-                bar(p, 0.0, 1.5, 1.3, 5.0);
-            }
-        }
-        Icon::List | Icon::Sort => {
-            for (i, y) in [-4.0, 0.0, 4.0].iter().enumerate() {
-                let w = if icon == Icon::Sort { 11.0 - i as f32 * 3.0 } else { 9.0 };
-                p.rect(Rect::new(m.x - 6.0 * u, m.y + y * u - line * 0.5, w * u, line), c, 0.0);
-                if icon == Icon::List {
-                    p.rect(Rect::new(m.x - 8.0 * u, m.y + y * u - line * 0.5, line, line), c, 0.0);
-                }
-            }
-        }
-        Icon::Grid | Icon::Freeform => {
-            for (ix, iy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let (x, y) = (m.x - 6.0 * u + ix as f32 * 7.0 * u, m.y - 6.0 * u + iy as f32 * 7.0 * u);
-                if icon == Icon::Grid {
-                    p.rect(Rect::new(x, y, 5.0 * u, 5.0 * u), c, 0.5);
-                } else {
-                    p.rect_bordered(Rect::new(x, y, 5.0 * u, 5.0 * u), Color::TRANSPARENT, 0.5, line, c);
-                }
-            }
-        }
-        Icon::Trash => {
-            bar(p, 0.0, -5.0, 10.0, 1.4);
-            p.rect_bordered(Rect::new(m.x - 4.0 * u, m.y - 3.5 * u, 8.0 * u, 9.5 * u), Color::TRANSPARENT, 1.0, line, c);
-        }
-        Icon::Pen => {
-            p.line(Vec2::new(m.x - 5.0 * u, m.y + 5.0 * u), Vec2::new(m.x + 4.0 * u, m.y - 4.0 * u), line * 1.6, c);
-            tri_right(p, 3.0, -5.0, 3.0, 3.0);
-        }
-        Icon::Hand => {
-            p.rect(Rect::new(m.x - 4.0 * u, m.y - 2.0 * u, 8.0 * u, 7.0 * u), c, 2.0 * u);
-            for i in 0..3 {
-                p.rect(Rect::new(m.x - 4.0 * u + i as f32 * 3.0 * u, m.y - 6.0 * u, 2.2 * u, 5.0 * u), c, 1.0 * u);
-            }
-        }
-        Icon::Razor => {
-            p.rect(Rect::new(m.x - 5.0 * u, m.y - 6.0 * u, 4.0 * u, 7.0 * u), c, 0.5);
-            p.rect_bordered(Rect::new(m.x - 5.0 * u, m.y + 1.0 * u, 10.0 * u, 5.0 * u), Color::TRANSPARENT, 0.5, line, c);
-        }
-        Icon::Select => {
-            // Arrow: a triangle with a tail.
-            let steps = (11.0 * u).max(4.0) as usize;
-            for i in 0..steps {
-                let t = i as f32 / steps as f32;
-                let w = 7.0 * u * (1.0 - t * 0.75);
-                p.rect(Rect::new(m.x - 4.0 * u, m.y - 6.0 * u + t * 11.0 * u, w, (11.0 * u / steps as f32).ceil()), c, 0.0);
-            }
-            p.line(Vec2::new(m.x - 0.5 * u, m.y + 2.0 * u), Vec2::new(m.x + 2.5 * u, m.y + 6.5 * u), line * 1.6, c);
-        }
-        Icon::TrackSelect => {
-            tri_right(p, -6.0, 0.0, 6.0, 9.0);
-            bar(p, 3.0, 0.0, 1.4, 9.0);
-            bar(p, 6.0, 0.0, 1.4, 9.0);
-        }
-        Icon::Ripple => {
-            bar(p, -5.0, 0.0, 1.4, 10.0);
-            tri_right(p, -2.0, 0.0, 5.0, 8.0);
-            bar(p, 5.0, 0.0, 1.4, 10.0);
-        }
-        Icon::Rolling => {
-            bar(p, 0.0, 0.0, 1.4, 11.0);
-            tri_left(p, -2.0, 0.0, 4.0, 7.0);
-            tri_right(p, 2.0, 0.0, 4.0, 7.0);
-        }
-        Icon::Slip => {
-            bar(p, 0.0, -4.0, 12.0, 1.4);
-            bar(p, 0.0, 4.0, 12.0, 1.4);
-            tri_left(p, -3.0, 0.0, 3.0, 5.0);
-            tri_right(p, 3.0, 0.0, 3.0, 5.0);
-        }
-        Icon::Type => {
-            // A "T": the bar and the stem.
-            p.rect(Rect::new(m.x - 5.5 * u, m.y - 5.5 * u, 11.0 * u, line * 1.4), c, 0.0);
-            p.rect(Rect::new(m.x - line * 0.7, m.y - 5.5 * u, line * 1.4, 11.0 * u), c, 0.0);
-        }
-        Icon::Rect => p.rect_bordered(Rect::new(m.x - 6.0 * u, m.y - 4.5 * u, 12.0 * u, 9.0 * u), Color::TRANSPARENT, 1.0, line, c),
-        Icon::Lock => {
-            p.rect(Rect::new(m.x - 4.5 * u, m.y - 0.5 * u, 9.0 * u, 7.0 * u), c, 1.0 * u);
-            p.rect_bordered(Rect::new(m.x - 3.0 * u, m.y - 6.0 * u, 6.0 * u, 7.0 * u), Color::TRANSPARENT, 3.0 * u, line, c);
-        }
-        Icon::Eye => {
-            ring(p, 2.2, line);
-            p.rect_bordered(Rect::new(m.x - 7.0 * u, m.y - 4.5 * u, 14.0 * u, 9.0 * u), Color::TRANSPARENT, 4.5 * u, line, c);
-        }
-        Icon::Mic => {
-            p.rect(Rect::new(m.x - 2.0 * u, m.y - 6.5 * u, 4.0 * u, 8.0 * u), c, 2.0 * u);
-            p.rect_bordered(Rect::new(m.x - 4.5 * u, m.y - 2.0 * u, 9.0 * u, 6.0 * u), Color::TRANSPARENT, 4.5 * u, line, c);
-            bar(p, 0.0, 5.5, 1.4, 3.0);
-        }
-        Icon::Speaker => {
-            p.rect(Rect::new(m.x - 6.0 * u, m.y - 2.5 * u, 4.0 * u, 5.0 * u), c, 0.0);
-            tri_right(p, -2.0, 0.0, 4.0, 10.0);
-        }
-        Icon::Snap => {
-            bar(p, -3.5, 0.0, 1.4, 11.0);
-            bar(p, 3.5, 0.0, 1.4, 11.0);
-            bar(p, 0.0, 0.0, 5.0, 1.4);
-        }
-        Icon::LinkedSelection => {
-            p.rect_bordered(Rect::new(m.x - 6.5 * u, m.y - 3.0 * u, 7.0 * u, 6.0 * u), Color::TRANSPARENT, 3.0 * u, line, c);
-            p.rect_bordered(Rect::new(m.x - 0.5 * u, m.y - 3.0 * u, 7.0 * u, 6.0 * u), Color::TRANSPARENT, 3.0 * u, line, c);
-        }
-        Icon::Captions => {
-            p.rect_bordered(Rect::new(m.x - 7.0 * u, m.y - 5.0 * u, 14.0 * u, 10.0 * u), Color::TRANSPARENT, 1.5 * u, line, c);
-            bar(p, -2.0, 1.0, 4.0, 1.3);
-            bar(p, 3.0, 1.0, 3.0, 1.3);
-        }
-        Icon::Stopwatch => {
-            ring(p, 4.5, line);
-            bar(p, 0.0, -6.0, 4.0, 1.4);
-        }
-        Icon::Reset => {
-            // An open circle with an arrow head: "go back to the default".
-            p.rect_bordered(Rect::new(m.x - 5.0 * u, m.y - 5.0 * u, 10.0 * u, 10.0 * u), Color::TRANSPARENT, 5.0 * u, line, c);
-            p.rect(Rect::new(m.x - 1.0 * u, m.y - 6.5 * u, 6.0 * u, 3.0 * u), Color::TRANSPARENT, 0.0);
-            tri_left(p, -2.5, -5.0, 3.0, 4.0);
-        }
-        Icon::Chevron => tri_down(p, m, u, c, 4.5, 0.0, 3.5),
-        Icon::ChevronRight => tri_right(p, -2.0, 0.0, 4.5, 7.0),
-        Icon::Effects => {
-            ring(p, 5.0, line);
-            bar(p, 0.0, 0.0, 9.0, 1.3);
-        }
-        Icon::AddTrack => {
-            p.rect_bordered(Rect::new(m.x - 6.0 * u, m.y - 5.0 * u, 12.0 * u, 10.0 * u), Color::TRANSPARENT, 1.0, line, c);
-            bar(p, 0.0, 0.0, 6.0, 1.3);
-            bar(p, 0.0, 0.0, 1.3, 6.0);
-        }
-    }
+impl Icon {
+    pub const ALL: &'static [Icon] = &[
+        Icon::Home,
+        Icon::Share,
+        Icon::Menu,
+        Icon::Expand,
+        Icon::Panel,
+        Icon::Play,
+        Icon::Pause,
+        Icon::StepBack,
+        Icon::StepForward,
+        Icon::JumpStart,
+        Icon::JumpEnd,
+        Icon::MarkIn,
+        Icon::MarkOut,
+        Icon::Marker,
+        Icon::Insert,
+        Icon::Overwrite,
+        Icon::Camera,
+        Icon::Export,
+        Icon::Settings,
+        Icon::Wrench,
+        Icon::Search,
+        Icon::Folder,
+        Icon::List,
+        Icon::Grid,
+        Icon::Freeform,
+        Icon::Zoom,
+        Icon::NewBin,
+        Icon::Trash,
+        Icon::Pen,
+        Icon::Hand,
+        Icon::Razor,
+        Icon::Select,
+        Icon::TrackSelect,
+        Icon::Ripple,
+        Icon::Rolling,
+        Icon::Slip,
+        Icon::Rect,
+        Icon::Type,
+        Icon::Lock,
+        Icon::Eye,
+        Icon::Mic,
+        Icon::Speaker,
+        Icon::Snap,
+        Icon::LinkedSelection,
+        Icon::Captions,
+        Icon::Stopwatch,
+        Icon::Reset,
+        Icon::Chevron,
+        Icon::ChevronRight,
+        Icon::Sort,
+        Icon::Effects,
+        Icon::AddTrack,
+    ];
 }
 
-fn tri_down(p: &mut Painter, m: Vec2, u: f32, c: Color, w: f32, top: f32, h: f32) {
-    let steps = (h * u).max(3.0) as usize;
-    for i in 0..steps {
-        let t = i as f32 / steps as f32;
-        let ww = w * u * (1.0 - t);
-        p.rect(Rect::new(m.x - ww * 0.5, m.y + top * u + t * h * u, ww, (h * u / steps as f32).ceil()), c, 0.0);
-    }
+/// Draw `icon` centred in `r`, in `c`: as large as fits, square.
+pub fn draw_icon(p: &mut Painter, r: Rect, icon: Icon, c: Color) {
+    let s = r.w.min(r.h);
+    let m = r.center();
+    p.fill_path(crate::icons::path(icon), Rect::new(m.x - s * 0.5, m.y - s * 0.5, s, s), c);
 }
 
 /// A square icon button, the toolbars' unit.
