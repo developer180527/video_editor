@@ -93,6 +93,7 @@ tick = "#3a3a3a"         # ruler ticks, scrollbar thumbs
 label = "#7d7d7d"        # small labels and scales
 text_soft = "#c4c4c4"
 bright = "#ececec"
+icon = "#ffffff"          # icons: pure white on dark
 
 # The timeline.
 ruler_bg = "#0f0f0f"

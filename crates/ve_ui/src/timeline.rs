@@ -1135,7 +1135,7 @@ impl Shot {
                 if on {
                     p.rect(b, REEL.raised_hi, 2.0);
                 }
-                draw_icon(p, b.shrink(3.0, 3.0, 3.0, 3.0), icon, if on { REEL.bright } else { REEL.label });
+                draw_icon(p, b.shrink(3.0, 3.0, 3.0, 3.0), icon, if on { REEL.icon } else { REEL.label });
             };
             icon(p, 5.0, Icon::Lock, tr.locked);
             let patch = Rect::new(r.x + 28.0, mid, 20.0, 16.0);

@@ -138,7 +138,7 @@ pub fn icon_button(ui: &mut Ui, key: impl std::hash::Hash, icon: Icon, size: f32
     if r.hovered {
         ui.cursor = Cursor::Pointer;
     }
-    let (fg, bg) = (t.palette.text_muted, t.palette.surface);
+    let bg = t.palette.surface;
     let accent = t.palette.accent;
     ui.add_leaf(id, Layout::leaf(Size::Fixed(size), Size::Fixed(size)), Vec2::ZERO, true, move |p, rect| {
         if on {
@@ -146,7 +146,9 @@ pub fn icon_button(ui: &mut Ui, key: impl std::hash::Hash, icon: Icon, size: f32
         } else if hot > 0.01 {
             p.rect(rect, bg.with_alpha(bg.a * hot), 2.0);
         }
-        let c = if on { Color::WHITE } else { fg.lerp(REEL.bright, hot) };
+        // Pure white on the dark theme, pure black on the light; white on
+        // the accent when lit. Hover shows in the background.
+        let c = if on { Color::WHITE } else { REEL.icon };
         draw_icon(p, rect.shrink(3.0, 3.0, 3.0, 3.0), icon, c);
     });
     r

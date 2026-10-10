@@ -42,6 +42,7 @@ pub struct Reel {
     pub label: Color,
     pub text_soft: Color,
     pub bright: Color,
+    pub icon: Color,
     // Timeline.
     pub ruler_bg: Color,
     pub track_bg: Color,
@@ -134,6 +135,7 @@ fn parse(src: &str) -> Result<(Theme, Reel), String> {
         label: c("label")?,
         text_soft: c("text_soft")?,
         bright: c("bright")?,
+        icon: c("icon")?,
         ruler_bg: c("ruler_bg")?,
         track_bg: c("track_bg")?,
         track_bg_alt: c("track_bg_alt")?,
@@ -163,7 +165,7 @@ fn parse(src: &str) -> Result<(Theme, Reel), String> {
         meter_hi: c("meter_hi")?,
     };
     let known = [
-        "line", "inset", "chrome_deep", "chrome", "panel", "raised", "raised_hi", "tick", "label", "text_soft", "bright", "ruler_bg", "track_bg", "track_bg_alt",
+        "line", "inset", "chrome_deep", "chrome", "panel", "raised", "raised_hi", "tick", "label", "text_soft", "bright", "icon", "ruler_bg", "track_bg", "track_bg_alt",
         "track_head", "grid", "playhead", "in_out", "in_out_range", "timecode", "selected", "video_fill", "video_head", "audio_fill", "audio_head", "title_fill",
         "title_head", "nest_fill", "nest_head", "wave", "clip_text", "clip_border", "transition", "transition_text", "badge", "meter_lo", "meter_mid", "meter_hi",
     ];

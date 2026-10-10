@@ -17,6 +17,10 @@ pub struct Settings {
     pub preview_quality: usize,
     /// Play proxies at startup, where assets have them.
     pub use_proxies: bool,
+    /// Draw a paused frame at full resolution, whatever the playback
+    /// quality (Premiere's "paused resolution").
+    #[serde(default = "yes")]
+    pub paused_full: bool,
     /// Snapping at startup.
     pub snap: bool,
     /// Linked selection at startup.
@@ -30,6 +34,10 @@ pub struct Settings {
     /// Light, dark, or as the system is set.
     #[serde(default)]
     pub theme: ThemeMode,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The Theme setting.
@@ -61,6 +69,7 @@ impl Default for Settings {
         Settings {
             preview_quality: 1,
             use_proxies: false,
+            paused_full: true,
             snap: true,
             linked_selection: true,
             transition_seconds: 1.0,
@@ -125,9 +134,10 @@ pub(crate) fn panel(ui: &mut Ui, app: &mut EditorUi) {
 
     ui.text_with("Playback", t.metrics.font_size_heading, t.palette.text);
     ui.text_with("Used when the editor starts.", t.metrics.font_size_small, t.palette.text_faint);
-    row(ui, "Preview quality", |ui| ui.combo_keyed("set-quality", &mut s.preview_quality, &["Full", "1/2", "1/4"]));
+    row(ui, "Playback quality", |ui| ui.combo_keyed("set-quality", &mut s.preview_quality, &["Full", "1/2", "1/4"]));
     commit |= s.preview_quality != app.settings.preview_quality;
     commit |= row(ui, "Play proxies", |ui| ui.checkbox_keyed("set-proxies", "", &mut s.use_proxies).clicked);
+    commit |= row(ui, "Full quality when paused", |ui| ui.checkbox_keyed("set-paused-full", "", &mut s.paused_full).clicked);
     ui.space(10.0);
 
     ui.text_with("Timeline", t.metrics.font_size_heading, t.palette.text);

@@ -440,8 +440,12 @@ impl EditorUi {
     /// Render the program monitor and hand its texture (and new thumbnails)
     /// to the main window's UI renderer.
     pub fn prepare_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui_wgpu::Renderer) {
-        // Resolution from the quality menu; proxies from their toggle.
-        let quality = ve_render::Quality { scale: [1.0, 0.5, 0.25][self.view.quality.min(2)], use_proxies: self.view.proxies };
+        // Resolution from the quality menu while playing; a still frame is
+        // drawn whole (titles and fine detail stay sharp), as the setting
+        // says. Proxies from their toggle.
+        let playing = self.engine.is_playing();
+        let level = if !playing && self.settings.paused_full { 0 } else { self.view.quality.min(2) };
+        let quality = ve_render::Quality { scale: [1.0, 0.5, 0.25][level], use_proxies: self.view.proxies };
         if self.gpu.is_none() {
             self.gpu = Some((device.clone(), queue.clone()));
         }
