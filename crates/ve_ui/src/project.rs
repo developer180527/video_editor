@@ -211,7 +211,7 @@ fn thumbnail(ui: &mut Ui, a: &Arc<Asset>, selected: bool, rate: Rate, tex: Optio
             if tc.hours > 0 { format!("{}:{:02}:{:02}", tc.hours, tc.minutes, tc.seconds) } else { format!("{}:{:02}", tc.minutes, tc.seconds) }
         })
         .unwrap_or_else(|| "—".into());
-    let (name, dur) = (ui.frame_text(&a.name), ui.frame_text(&dur));
+    let (name, dur) = (a.name.clone(), ui.frame_text(&dur));
     let size = t.metrics.font_size_small;
     let accent = t.palette.accent;
     ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, true, move |p, rect| {
@@ -272,7 +272,10 @@ fn thumbnail(ui: &mut Ui, a: &Arc<Asset>, selected: bool, rate: Rate, tex: Optio
             p.rect(badge, REEL.badge, 1.5);
             p.text_centered(badge, size, REEL.bright, proxy_text);
         }
-        p.text_left(Rect::new(rect.x + 6.0, rect.bottom() - 26.0, rect.w - 60.0, 14.0), size, REEL.text_soft, name);
+        // Long names lose their middle, not their end (Finder does the same).
+        let name_box = Rect::new(rect.x + 6.0, rect.bottom() - 26.0, rect.w - 60.0, 14.0);
+        let shown = crate::widgets::middle_ellipsis(p, size, &name, name_box.w);
+        p.text_left(name_box, size, REEL.text_soft, shown);
         p.text_right(Rect::new(rect.x, rect.bottom() - 26.0, rect.w - 6.0, 14.0), size, REEL.label, dur);
     });
     r

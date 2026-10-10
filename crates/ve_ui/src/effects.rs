@@ -107,8 +107,12 @@ fn chip(ui: &mut Ui, key: &str, icon: Icon, label: &str, on: bool) {
 fn row<R, L>(ui: &mut Ui, key: impl std::hash::Hash, height: f32, left: impl FnOnce(&mut Ui) -> R, lane: impl FnOnce(&mut Ui) -> L) -> (R, L) {
     let id = ui.make_id(("fxrow", key));
     ui.container_id(id, Layout::row().width(Size::Grow(1.0)).height(Size::Fixed(height)), Frame::none(), |ui| {
-        let out = ui.container(Layout::row().width(Size::Grow(1.5)).height(Size::Grow(1.0)).align(Align::Start, Align::Center), Frame::none(), left);
-        let l = ui.container(Layout::row().width(Size::Grow(1.0)).height(Size::Grow(1.0)), Frame::none(), lane);
+        // Both sides take their share whatever their content (it clips), so
+        // every row's lane starts at the same x and the playhead runs
+        // straight down them.
+        let clip = Frame { clip: true, ..Frame::none() };
+        let out = ui.container(Layout::row().width(Size::Grow(1.5)).height(Size::Grow(1.0)).align(Align::Start, Align::Center).shrink(), clip, left);
+        let l = ui.container(Layout::row().width(Size::Grow(1.0)).height(Size::Grow(1.0)).shrink(), clip, lane);
         (out, l)
     })
 }

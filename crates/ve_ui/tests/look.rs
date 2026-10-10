@@ -47,7 +47,7 @@ fn editor() -> EditorUi {
     e.new_project("Hiking");
     let assets = [
         asset("DockAtitlanTL.mp4", 60, true, true),
-        asset("AdobeStock_1166400934.mp4", 245, true, false),
+        asset("Explosive Colors | Fantastic HDR 4K 120 FPS Dolby Vision - 4K Video [3FdY6vrK4y8].webm", 245, true, false),
         asset("Tikal.mp4", 22, true, true),
         asset("AntiguaArchTL.mp4", 134, true, true),
         asset("Atitlan.mp4", 48, true, true),
@@ -287,6 +287,18 @@ fn light_theme() {
     assert_eq!(app.appearance(), ve_ui::Appearance::Dark);
     app.set_system_dark(Some(false));
     assert_eq!(app.appearance(), ve_ui::Appearance::Light);
+}
+
+/// A long file name in the bin loses its middle; Effect Controls rows keep
+/// one lane even where a row's controls are wide (a narrow, iPad-like window).
+#[test]
+fn long_names_and_narrow_effect_controls() {
+    let mut app = editor();
+    render(&mut app, 1180, 1000, "narrow-ipad.png", |app| {
+        app.view.search = "explosive".into();
+        let snap = app.engine.snapshot();
+        app.view.selection = edit::linked(&snap, snap.active().unwrap().tracks[0].clips[0].id);
+    });
 }
 
 /// The title bar as the editor draws it: the window buttons it draws

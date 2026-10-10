@@ -129,6 +129,33 @@ pub fn draw_icon(p: &mut Painter, r: Rect, icon: Icon, c: Color) {
     p.fill_path(crate::icons::path(icon), Rect::new(m.x - s * 0.5, m.y - s * 0.5, s, s), c);
 }
 
+/// `text` shortened to fit `width` the way macOS shortens file names:
+/// the middle gives way, so the start and the extension stay
+/// ("Explosive Col…4y8].webm").
+pub fn middle_ellipsis(p: &Painter, size: f32, text: &str, width: f32) -> String {
+    if p.measure(size, text).x <= width {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let fits = |keep: usize| {
+        let head = keep.div_ceil(2);
+        let tail = keep - head;
+        let s: String = chars[..head].iter().chain(['…'].iter()).chain(chars[chars.len() - tail..].iter()).collect();
+        (p.measure(size, s.as_str()).x <= width).then_some(s)
+    };
+    // The most characters that still fit.
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid).is_some() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    fits(lo).unwrap_or_else(|| "…".into())
+}
+
 /// A square icon button, the toolbars' unit.
 pub fn icon_button(ui: &mut Ui, key: impl std::hash::Hash, icon: Icon, size: f32, on: bool) -> Response {
     let t = ui.theme.clone();
