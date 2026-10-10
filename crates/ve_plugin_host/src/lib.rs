@@ -18,6 +18,7 @@ pub mod native;
 pub mod ofx;
 pub mod process;
 pub mod wasm;
+pub mod wgsl;
 
 mod linked;
 mod registry;

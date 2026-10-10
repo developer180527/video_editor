@@ -1,6 +1,7 @@
 /*
- * Invert: the smallest complete ve plugin. One filter with one parameter,
- * both a GPU (WGSL) and a CPU implementation.
+ * Invert: the smallest complete ve plugin (ABI v1). One filter with one
+ * animatable parameter, rendered by its WGSL shader on the GPU. Pixels are
+ * premultiplied, so "white minus colour" is alpha minus colour.
  *
  *   dynamic:  cc -shared -fPIC -I../../../crates/ve_plugin_abi/include invert.c -o invert.vep
  *   static:   cc -c -DVE_PLUGIN_STATIC_NAME=invert ...   (iPadOS, built-ins)
@@ -27,27 +28,6 @@ static const char wgsl[] =
     "    return vec4<f32>(mix(c.rgb, vec3<f32>(c.a) - c.rgb, amount), c.a);\n"
     "}\n";
 
-static int32_t render_cpu(void *instance, const VeRenderArgs *args, const VeImage *const *inputs, uint32_t input_count,
-                          VeImage *out) {
-    (void)instance;
-    if (input_count != 1) return -1;
-    const VeImage *in = inputs[0];
-    double amount = args->params.count > 0 ? args->params.values[0][0] : 1.0;
-    for (uint32_t y = 0; y < out->height; y++) {
-        const float *src = (const float *)((const char *)in->pixels + y * in->stride);
-        float *dst = (float *)((char *)out->pixels + y * out->stride);
-        for (uint32_t x = 0; x < out->width; x++) {
-            float a = src[4 * x + 3];
-            for (int c = 0; c < 3; c++) {
-                float v = src[4 * x + c];
-                dst[4 * x + c] = (float)(v + ((a - v) - v) * amount);
-            }
-            dst[4 * x + 3] = a;
-        }
-    }
-    return 0;
-}
-
 static const VeEffectDesc invert = {
     .struct_size = sizeof(VeEffectDesc),
     .kind = VE_KIND_FILTER,
@@ -56,11 +36,10 @@ static const VeEffectDesc invert = {
     .category = "Color",
     .major_version = 1,
     .minor_version = 0,
-    .flags = VE_FLAG_THREAD_SAFE,
     .params = params,
     .param_count = 1,
     .wgsl = wgsl,
-    .render_cpu = render_cpu,
+    /* create, destroy, render_cpu: reserved in v1, left NULL. */
 };
 
 static const VeEffectDesc *const effects[] = {&invert};

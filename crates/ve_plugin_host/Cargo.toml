@@ -11,6 +11,7 @@ ve_model.workspace = true
 ve_ports.workspace = true
 ve_plugin_abi.workspace = true
 thiserror.workspace = true
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }
 
 [dev-dependencies]
 ve_builtins.workspace = true

@@ -29,19 +29,6 @@ static HOST: abi::VeHost = abi::VeHost {
     get_extension: Some(host_extension),
 };
 
-/// One effect inside a loaded native library. Holds the library open.
-pub struct NativeEffect {
-    _lib: Arc<dyn NativeLibrary>,
-    /// Our copy, at our layout (see `read_versioned`): reading the plugin's
-    /// own struct could run past the end of an older, smaller one.
-    desc: abi::VeEffectDesc,
-}
-
-// The descriptor's pointers are to immutable static data in the plugin;
-// instances are created per use.
-unsafe impl Send for NativeEffect {}
-unsafe impl Sync for NativeEffect {}
-
 /// Read the plugin in `lib` and describe its effects.
 ///
 /// `static_name` is the plugin's link name when it is statically linked.
@@ -88,13 +75,22 @@ pub fn load(lib: Arc<dyn NativeLibrary>, static_name: Option<&str>) -> Result<Ve
             abi::VeEffectKind::Generator => EffectKind::Generator,
             other => return Err(bad(&format!("unknown effect kind {}", other.0))),
         };
-        let implementation = if ed.render_cpu.is_some() {
-            Implementation::Native(Arc::new(NativeEffect { _lib: lib.clone(), desc: ed }))
-        } else if wgsl.is_some() {
-            Implementation::ShaderOnly
-        } else {
-            return Err(bad("effect with neither wgsl nor render_cpu"));
-        };
+        // ABI v1 hosts render on the GPU: WGSL is required. The CPU path
+        // (`create`, `destroy`, `render_cpu`) is reserved and never called;
+        // an effect that also has one simply loads as a shader effect.
+        if wgsl.is_none() {
+            return Err(bad(&format!("effect `{id}` has no WGSL: this host renders effects on the GPU (the CPU path is reserved in ABI v1)")));
+        }
+        // Checked now, not on the GPU at the first frame.
+        if let Some(src) = &wgsl {
+            crate::wgsl::validate(src).map_err(|e| bad(&format!("effect `{id}`: its shader does not meet the WGSL contract: {e}")))?;
+        }
+        let implementation = Implementation::ShaderOnly;
+        // An effect is known by its id and major version: one plugin cannot
+        // declare the same one twice.
+        if out.iter().any(|e: &EffectInfo| e.plugin.id == id && e.plugin.major_version == major_version) {
+            return Err(bad(&format!("effect `{id}` (major version {major_version}) is declared twice")));
+        }
         out.push(EffectInfo {
             plugin: PluginRef { api: PluginApi::Native, id, major_version },
             name,
@@ -154,65 +150,6 @@ fn param_info(p: &abi::VeParamDesc) -> Option<ParamInfo> {
         default: p.default_value,
         animatable: p.flags & abi::VE_PARAM_ANIMATABLE != 0,
     })
-}
-
-/// An RGBA f32 image owned by the host.
-pub struct CpuImage {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<f32>,
-}
-
-impl CpuImage {
-    pub fn new(width: u32, height: u32) -> Self {
-        CpuImage { width, height, pixels: vec![0.0; (width * height * 4) as usize] }
-    }
-
-    fn view(&mut self) -> abi::VeImage {
-        abi::VeImage {
-            struct_size: std::mem::size_of::<abi::VeImage>() as u32,
-            width: self.width,
-            height: self.height,
-            stride: self.width as usize * 16,
-            pixels: self.pixels.as_mut_ptr(),
-        }
-    }
-}
-
-impl NativeEffect {
-    /// Render on the CPU. `params` are the values at this time, in the
-    /// plugin's declaration order.
-    pub fn render_cpu(
-        &self,
-        time: f64,
-        params: &[[f64; 4]],
-        inputs: &mut [&mut CpuImage],
-        output: &mut CpuImage,
-    ) -> Result<(), PluginError> {
-        let d = &self.desc;
-        let render = d.render_cpu.ok_or(PluginError::Unavailable("CPU rendering"))?;
-        let instance = d.create.map(|c| unsafe { c(&HOST) }).unwrap_or(std::ptr::null_mut());
-        let args = abi::VeRenderArgs {
-            struct_size: std::mem::size_of::<abi::VeRenderArgs>() as u32,
-            time,
-            frame_duration: 0.0,
-            scale: 1.0,
-            params: abi::VeParamValues { count: params.len() as u32, values: params.as_ptr() },
-            progress: 0.0,
-        };
-        let views: Vec<abi::VeImage> = inputs.iter_mut().map(|i| i.view()).collect();
-        let ptrs: Vec<*const abi::VeImage> = views.iter().map(|v| v as *const _).collect();
-        let mut out = output.view();
-        let code = unsafe { render(instance, &args, ptrs.as_ptr(), ptrs.len() as u32, &mut out) };
-        if let Some(destroy) = d.destroy {
-            unsafe { destroy(instance) };
-        }
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(PluginError::RenderFailed(code))
-        }
-    }
 }
 
 #[cfg(test)]

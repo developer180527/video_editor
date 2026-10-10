@@ -652,7 +652,8 @@ fn keyframe_graph_editing() {
     }
     button(&mut ui, false);
     frame(&mut ui, &mut app);
-    wait(&app.engine, |_| matches!(opacity_keys(&app)[1].value, Value::Float(v) if v > 40.0));
+    // The drag sends a change each frame (5, 10, … 50): wait for the last.
+    wait(&app.engine, |_| matches!(opacity_keys(&app)[1].value, Value::Float(v) if (v - 50.0).abs() < 3.0));
     let k = opacity_keys(&app);
     assert!(matches!(k[1].value, Value::Float(v) if (v - 50.0).abs() < 3.0), "dragged to ~50: {:?}", k[1].value);
     assert_eq!(k[1].time, Time::from_seconds(4), "straight up: same time");

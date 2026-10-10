@@ -2749,6 +2749,7 @@ dependencies = [
 name = "ve_plugin_host"
 version = "0.1.0"
 dependencies = [
+ "naga",
  "thiserror 2.0.21",
  "ve_builtins",
  "ve_model",
@@ -2773,6 +2774,7 @@ dependencies = [
  "pollster 1.0.1",
  "ve_builtins",
  "ve_model",
+ "ve_plugin_abi",
  "ve_plugin_host",
  "ve_ports",
  "ve_time",

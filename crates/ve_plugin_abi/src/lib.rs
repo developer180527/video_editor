@@ -12,6 +12,26 @@ pub const VE_FLAG_THREAD_SAFE: u32 = 1 << 0;
 /// The header, for tools that ship it (the SDK, the CLI's `sdk` command).
 pub const HEADER: &str = include_str!("../include/ve_plugin.h");
 
+/// What every effect shader sees before its own source: frozen in ABI v1
+/// (sdk/WGSL_CONTRACT.md holds it verbatim; a test checks). The host's own
+/// declarations after it are named `ve_*`, a prefix plugins must not use.
+pub const WGSL_PRELUDE: &str = r#"struct EffectIn {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+struct Params {
+    values: array<vec4<f32>, 64>,
+    time: f32,
+    progress: f32,
+    scale: f32,
+    _pad: f32,
+};
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var source: texture_2d<f32>;
+@group(0) @binding(2) var source_sampler: sampler;
+@group(0) @binding(3) var source_b: texture_2d<f32>;
+"#;
+
 /// A log message's level (`VeLogLevel` in C). A plain `u32`, not a Rust enum: a newer plugin may send a value
 /// this host does not know, which must be refused, not undefined behaviour.
 #[repr(transparent)]

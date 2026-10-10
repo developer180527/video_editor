@@ -360,3 +360,32 @@ fn scopes_measure_a_flat_grey() {
     assert!(px(&img, col, 2)[0] > 100 && px(&img, col, 2)[2] > 100, "a full bar at {col}: {:?}", px(&img, col, 2));
     assert!(px(&img, 20, 250)[0] < 10, "no bar elsewhere");
 }
+
+/// The ABI's colour rule: a colour parameter is stored as the picker shows
+/// it and reaches shaders linear in the working space, so a picked 50 %
+/// grey comes back on the monitor as 50 % grey (128) in either working
+/// space; and a 50 % grey matte, drawn by a generator, reads the same.
+#[test]
+fn a_picked_colour_comes_back_unchanged() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let fill = "@fragment\nfn effect(i: EffectIn) -> @location(0) vec4<f32> {\n    let c = params.values[0];\n    return vec4<f32>(c.rgb * c.a, c.a);\n}\n";
+    for space in [WorkingSpace::AcesCg, WorkingSpace::LinearRec709] {
+        for (picked, expect) in [([0.5, 0.5, 0.5, 1.0], [128, 128, 128]), ([0.8, 0.3, 0.1, 1.0], [204, 77, 26])] {
+            let mut l = layer(gray(64, 36, 16), 100.0, 1.0);
+            l.effects.push(GpuEffect { key: "fill".into(), wgsl: fill.into(), params: vec![display_color_to_working(picked, space)], time: 0.0 });
+            let mut c = Compositor::new(&device);
+            c.render(&device, &queue, &plan(64, 36), &[l], (64, 36), space);
+            assert!(c.errors.is_empty(), "{:?}", c.errors);
+            let p = px(&c.read_output(&device, &queue).unwrap(), 32, 18);
+            for k in 0..3 {
+                assert!((p[k] as i32 - expect[k]).abs() <= 1, "{space:?} {picked:?}: {p:?}");
+            }
+        }
+        // A grey matte: the generator draws the stored value as is.
+        let matte = generate::picture("ve.color", &[("color".into(), ve_model::Value::Color([0.5, 0.5, 0.5, 1.0]))], 64, 36, 1.0).unwrap();
+        let mut c = Compositor::new(&device);
+        c.render(&device, &queue, &plan(64, 36), &[layer(matte, 100.0, 1.0)], (64, 36), space);
+        let p = px(&c.read_output(&device, &queue).unwrap(), 32, 18);
+        assert!((p[1] as i32 - 128).abs() <= 1, "{space:?} matte: {p:?}");
+    }
+}

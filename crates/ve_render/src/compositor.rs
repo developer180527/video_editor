@@ -346,24 +346,9 @@ fn fs_mip(i: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Declarations every plugin shader sees (the contract in sdk/WGSL_CONTRACT.md).
-const EFFECT_HEADER: &str = r#"
-struct EffectIn {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-struct Params {
-    values: array<vec4<f32>, 64>,
-    time: f32,
-    progress: f32,
-    scale: f32,
-    _pad: f32,
-};
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var source: texture_2d<f32>;
-@group(0) @binding(2) var source_sampler: sampler;
-@group(0) @binding(3) var source_b: texture_2d<f32>;
-
+/// The host's vertex stage for effects, after the frozen prelude
+/// (`ve_plugin_abi::WGSL_PRELUDE`, the contract plugins are written to).
+const EFFECT_VERTEX: &str = r#"
 @vertex
 fn ve_effect_vs(@builtin(vertex_index) i: u32) -> EffectIn {
     let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
@@ -451,6 +436,18 @@ fn inverse(m: M3) -> M3 {
 
 fn ap1_to_709() -> M3 {
     inverse(REC709_TO_AP1)
+}
+
+/// A colour parameter as stored (display-encoded: what the colour picker
+/// and the monitor show, straight alpha) to what a shader works in: linear
+/// light in the working space, straight alpha. The exact inverse of the
+/// monitor's encoding (working → Rec.709 → γ 2.4), so a picked colour
+/// comes back on the monitor as the same value.
+pub fn display_color_to_working(c: [f32; 4], space: WorkingSpace) -> [f32; 4] {
+    let lin = [0, 1, 2].map(|k| c[k].max(0.0).powf(2.4));
+    let m = primaries_to(space, "bt709");
+    let w = [0, 1, 2].map(|r| m[r][0] * lin[0] + m[r][1] * lin[1] + m[r][2] * lin[2]);
+    [w[0], w[1], w[2], c[3]]
 }
 
 fn primaries_to(work: WorkingSpace, primaries: &str) -> M3 {
@@ -771,7 +768,7 @@ impl Compositor {
 
     fn effect_pipeline(&mut self, device: &wgpu::Device, e: &GpuEffect) -> Option<&wgpu::RenderPipeline> {
         if !self.effects.contains_key(&e.key) {
-            let src = format!("{EFFECT_HEADER}\n{}", e.wgsl);
+            let src = format!("{}{EFFECT_VERTEX}\n{}", ve_plugin_abi::WGSL_PRELUDE, e.wgsl);
             // A plugin's shader may not compile; catch it rather than abort.
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let p = pipeline(device, &src, "ve_effect_vs", "effect", &self.effect_layout, WORKING_FORMAT, None);

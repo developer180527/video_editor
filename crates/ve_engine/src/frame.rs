@@ -33,9 +33,18 @@ fn as_vec4(v: &Value) -> [f32; 4] {
     }
 }
 
-fn param_values(info: &[ParamInfo], given: &[(String, Value)]) -> Vec<[f32; 4]> {
+/// Parameter values as a shader receives them, in declaration order.
+/// Colours are stored display-encoded (what the picker shows) and reach
+/// the shader linear, in the working space (the ABI's rule).
+fn param_values(info: &[ParamInfo], given: &[(String, Value)], space: WorkingSpace) -> Vec<[f32; 4]> {
     info.iter()
-        .map(|p| given.iter().find(|(k, _)| *k == p.id).map(|(_, v)| as_vec4(v)).unwrap_or(p.default.map(|d| d as f32)))
+        .map(|p| {
+            let v = given.iter().find(|(k, _)| *k == p.id).map(|(_, v)| as_vec4(v)).unwrap_or(p.default.map(|d| d as f32));
+            match p.kind {
+                ve_plugin_host::ParamKind::Color => ve_render::display_color_to_working(v, space),
+                _ => v,
+            }
+        })
         .collect()
 }
 
@@ -46,7 +55,7 @@ pub fn resolve(project: &Project, plan: FramePlan, registry: &Registry, pool: &A
     let seq_size = seq.map(|s| (s.format.width, s.format.height)).unwrap_or((1920, 1080));
     let space = WorkingSpace::from_name(seq.map(|s| s.format.working_space.as_str()).unwrap_or("ACEScg"));
     let scale = plan.width as f32 / seq_size.0.max(1) as f32;
-    let mut r = Resolver { project, registry, pool, wait, proxies: plan.proxies, scale, complete: true, missing: Vec::new() };
+    let mut r = Resolver { project, registry, pool, wait, proxies: plan.proxies, scale, space, complete: true, missing: Vec::new() };
     let layers = plan.layers.iter().filter_map(|l| r.layer(l, seq_size)).collect();
     let (complete, missing) = (r.complete, r.missing);
     Frame { plan, layers, seq_size, space, complete, missing }
@@ -60,6 +69,7 @@ struct Resolver<'a> {
     proxies: bool,
     /// Output pixels per sequence pixel (preview quality).
     scale: f32,
+    space: WorkingSpace,
     complete: bool,
     missing: Vec<String>,
 }
@@ -115,7 +125,7 @@ impl Resolver<'_> {
                         LayerSource::Shader(GpuEffect {
                             key: format!("{}@{}", plugin.id, plugin.major_version),
                             wgsl: info.wgsl.as_deref()?.into(),
-                            params: param_values(&info.params, &params),
+                            params: param_values(&info.params, &params, self.space),
                             time: l.clip_time.as_seconds_f64() as f32,
                         })
                     }
@@ -150,7 +160,7 @@ impl Resolver<'_> {
                 Some(GpuEffect {
                     key: format!("{}@{}", e.plugin.id, e.plugin.major_version),
                     wgsl: info.wgsl.as_deref()?.into(),
-                    params: param_values(&info.params, &e.params),
+                    params: param_values(&info.params, &e.params, self.space),
                     time: l.clip_time.as_seconds_f64() as f32,
                 })
             })
@@ -164,7 +174,7 @@ impl Resolver<'_> {
                 |i| GpuEffect {
                     key: format!("{}@{}", i.plugin.id, i.plugin.major_version),
                     wgsl: i.wgsl.as_deref().unwrap_or_default().into(),
-                    params: param_values(&i.params, &t.params),
+                    params: param_values(&i.params, &t.params, self.space),
                     time: 0.0,
                 },
             );

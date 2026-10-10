@@ -69,13 +69,15 @@ pub fn picture_rgba(id: &str, params: &[(String, Value)], w: u32, h: u32, scale:
     }
 }
 
-/// Linear-light 0..1 → a display-encoded byte (BT.1886, 2.4).
-fn encode(v: f32) -> u8 {
-    (v.clamp(0.0, 1.0).powf(1.0 / 2.4) * 255.0).round() as u8
+/// A display-encoded 0..1 value as a byte. Colour parameters are stored
+/// display-encoded (what the picker and the monitor show), and a
+/// generator's picture is display-encoded too: no conversion between.
+fn byte(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn solid(w: u32, h: u32, c: [f32; 4]) -> Vec<u8> {
-    let px = [encode(c[0]), encode(c[1]), encode(c[2]), (c[3].clamp(0.0, 1.0) * 255.0).round() as u8];
+    let px = [byte(c[0]), byte(c[1]), byte(c[2]), byte(c[3])];
     px.repeat((w * h) as usize)
 }
 
@@ -341,7 +343,7 @@ fn title(w: u32, h: u32, s: &TitleStyle, scale: f32) -> Vec<u8> {
     let mut out = vec![[0f32; 4]; wu * hu];
     let over = |dst: &mut [f32; 4], c: [f32; 4], a: f32| {
         let a = (a * c[3]).clamp(0.0, 1.0);
-        let rgb = [encode(c[0]) as f32 / 255.0, encode(c[1]) as f32 / 255.0, encode(c[2]) as f32 / 255.0];
+        let rgb = [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)];
         for k in 0..3 {
             dst[k] = rgb[k] * a + dst[k] * (1.0 - a);
         }

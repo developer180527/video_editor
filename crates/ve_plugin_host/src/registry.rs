@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use thiserror::Error;
 use ve_model::{PluginApi, PluginRef};
 
@@ -10,10 +9,6 @@ pub enum PluginError {
     Malformed(String, String),
     #[error("the plugin declined to load")]
     Declined,
-    #[error("render failed with code {0}")]
-    RenderFailed(i32),
-    #[error("{0} is not available on this platform")]
-    Unavailable(&'static str),
     #[error(transparent)]
     Library(#[from] ve_ports::LibraryError),
 }
@@ -64,7 +59,6 @@ pub struct EffectInfo {
 
 #[derive(Clone)]
 pub enum Implementation {
-    Native(Arc<crate::native::NativeEffect>),
     ShaderOnly,
     /// Implemented by the engine itself (Motion, Opacity, Volume, Panner).
     Intrinsic,

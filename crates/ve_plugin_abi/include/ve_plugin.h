@@ -1,5 +1,5 @@
 /*
- * ve_plugin.h — the native plugin ABI, version 1.
+ * ve_plugin.h — the native plugin ABI, version 1. FROZEN: see sdk/ABI.md.
  *
  * A plugin is C (or anything that exports C): no C++ types, exceptions or
  * allocator crossings at this boundary. Every struct starts with
@@ -14,10 +14,12 @@
  * The host owns parameters, keyframes, undo and UI. A plugin declares its
  * parameters and renders; it never draws interface.
  *
- * Two ways to render, so effects work everywhere:
- *   - `wgsl`: a WGSL fragment shader, run by the host on the GPU. Shader-only
- *     plugins carry no native code and run on every platform, iPad included.
- *   - `render_cpu`: a C function over RGBA float pixels.
+ * Effects render on the GPU: `wgsl` is a WGSL fragment shader the host runs
+ * (contract: sdk/WGSL_CONTRACT.md). Every effect must have one; it carries
+ * no native code to run, so it works on every platform, iPad included.
+ * The CPU fields (`create`, `destroy`, `render_cpu`) are RESERVED in v1:
+ * v1 hosts never call them. A later host may offer CPU rendering through
+ * an extension the plugin asks for by name.
  *
  * Loading: a dynamic plugin exports `ve_plugin_entry`. A statically linked
  * plugin (iPadOS, where loading code from files is forbidden) is built with
@@ -133,7 +135,8 @@ typedef struct VeEffectDesc {
      * contract for it lives in sdk/WGSL_CONTRACT.md. */
     const char *wgsl;
 
-    /* CPU path, or NULLs. `instance` is whatever `create` returned. */
+    /* RESERVED in v1 (never called by v1 hosts): leave NULL. A future
+     * CPU-rendering extension will define their use. */
     void *(*create)(const VeHost *host);
     void (*destroy)(void *instance);
     /* inputs: 0, 1 or 2 images by kind. Returns 0 on success. */

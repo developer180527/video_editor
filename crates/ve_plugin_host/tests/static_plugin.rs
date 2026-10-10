@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use ve_model::PluginApi;
-use ve_plugin_host::native::{self, CpuImage};
+use ve_plugin_host::native;
 use ve_plugin_host::{EffectKind, Implementation, LinkedLibrary, Registry};
 
 
@@ -21,13 +21,8 @@ fn load_and_render_linked_plugin() {
     assert!(fx.params[0].animatable);
     assert!(fx.wgsl.as_deref().unwrap().contains("@fragment"));
 
-    let Implementation::Native(n) = &fx.implementation else { panic!("has a CPU path") };
-    let mut input = CpuImage::new(2, 1);
-    input.pixels.copy_from_slice(&[0.25, 0.5, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5]);
-    let mut out = CpuImage::new(2, 1);
-    n.render_cpu(0.0, &[[1.0, 0.0, 0.0, 0.0]], &mut [&mut input], &mut out).unwrap();
-    // Premultiplied invert: a - c.
-    assert_eq!(out.pixels, [0.75, 0.5, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5]);
+    // It also has a CPU path; ABI v1 hosts never call it.
+    assert!(matches!(fx.implementation, Implementation::ShaderOnly));
 }
 
 #[test]
@@ -92,7 +87,7 @@ fn newer_plugins_with_larger_structs_load() {
                     flags: 0,
                     params: params.as_ptr() as *const VeParamDesc,
                     param_count: 2,
-                    wgsl: c"@fragment fn effect() {}".as_ptr(),
+                    wgsl: c"@fragment fn effect(i: EffectIn) -> @location(0) vec4<f32> { return textureSample(source, source_sampler, i.uv); }".as_ptr(),
                     create: None,
                     destroy: None,
                     render_cpu: None,
