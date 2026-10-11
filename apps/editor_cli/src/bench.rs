@@ -207,7 +207,8 @@ fn monitor(name: &str, client: &EngineClient, gpu: &(wgpu::Device, wgpu::Queue),
     let (device, queue) = gpu;
     let mut c = Compositor::new(device);
     c.set_importer(gpu_import::importer());
-    let mut last: Option<(Time, bool)> = None;
+    let mut last: Option<(i64, bool)> = None;
+    let rate = client.snapshot().active().map_or(ve_time::Rate::FPS_24, |s| s.format.rate);
     let mut run = Run { name: name.into(), wall: Duration::ZERO, cpu: Duration::ZERO, drawn: 0, late: 0, gpu_ms: vec![], frame_ms: vec![] };
     let (t0, c0) = (Instant::now(), cpu_time());
     let tick = Duration::from_secs_f64(1.0 / 60.0);
@@ -217,9 +218,9 @@ fn monitor(name: &str, client: &EngineClient, gpu: &(wgpu::Device, wgpu::Queue),
         each(client, n);
         let start = Instant::now();
         if let Some(f) = client.frame(quality) {
-            let key = (f.plan.time, f.complete);
-            // The app draws when the picture changes (a new time, or the exact
-            // frame arriving), not every tick.
+            let key = (f.plan.time.to_frame(rate), f.complete);
+            // The app draws when the picture changes (a new frame, or the
+            // exact one arriving), not every tick.
             if last != Some(key) {
                 last = Some(key);
                 c.render(device, queue, &f.plan, &f.layers, f.seq_size, f.space);

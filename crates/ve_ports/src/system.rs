@@ -61,3 +61,52 @@ pub trait System: Send + Sync {
     /// is the audio device's.
     fn monotonic(&self) -> Duration;
 }
+
+/// How this platform makes the calling thread a background one: lower
+/// priority, and on Apple silicon the efficiency cores. Set once by the
+/// platform; workers that nobody waits on (thumbnails, waveforms) call
+/// [`run_in_background`] when they start.
+static BACKGROUND: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the platform's way of lowering a thread (first call wins).
+pub fn set_background_thread_hook(f: fn()) {
+    let _ = BACKGROUND.set(f);
+}
+
+/// Make the calling thread a background thread, where the platform can.
+pub fn run_in_background() {
+    if let Some(f) = BACKGROUND.get() {
+        f();
+    }
+}
+
+/// What to do when the OS says memory is short (iOS's memory warning):
+/// caches that can be rebuilt let go. Handlers are added once, by whoever
+/// owns such caches (the engine).
+static ON_MEMORY_WARNING: std::sync::Mutex<Vec<Box<dyn Fn() + Send + Sync>>> = std::sync::Mutex::new(Vec::new());
+
+/// Run `f` whenever the platform reports a memory warning.
+pub fn on_memory_warning(f: impl Fn() + Send + Sync + 'static) {
+    ON_MEMORY_WARNING.lock().unwrap().push(Box::new(f));
+}
+
+/// The platform calls this when the OS warns that memory is short.
+pub fn memory_warning() {
+    for f in ON_MEMORY_WARNING.lock().unwrap().iter() {
+        f();
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    #[test]
+    fn a_memory_warning_reaches_its_handlers() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static HEARD: AtomicU32 = AtomicU32::new(0);
+        super::on_memory_warning(|| {
+            HEARD.fetch_add(1, Ordering::SeqCst);
+        });
+        super::memory_warning();
+        assert!(HEARD.load(Ordering::SeqCst) >= 1);
+    }
+}

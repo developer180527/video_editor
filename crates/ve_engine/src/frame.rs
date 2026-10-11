@@ -131,6 +131,7 @@ impl Resolver<'_> {
                             wgsl: info.wgsl.as_deref()?.into(),
                             params: param_values(&info.params, &params, self.space),
                             time: l.clip_time.as_seconds_f64() as f32,
+                            mips: info.reads_levels,
                         })
                     }
                 };
@@ -166,6 +167,7 @@ impl Resolver<'_> {
                     wgsl: info.wgsl.as_deref()?.into(),
                     params: param_values(&info.params, &e.params, self.space),
                     time: l.clip_time.as_seconds_f64() as f32,
+                    mips: info.reads_levels,
                 })
             })
             .collect();
@@ -174,12 +176,13 @@ impl Resolver<'_> {
             // put on video) dissolves.
             let info = self.registry.find(&t.plugin).filter(|i| i.wgsl.is_some()).or_else(|| self.registry.find(&intrinsic::plugin_ref(intrinsic::DISSOLVE)));
             let effect = info.map_or_else(
-                || GpuEffect { key: String::new(), wgsl: "".into(), params: vec![], time: 0.0 },
+                || GpuEffect { key: String::new(), wgsl: "".into(), params: vec![], time: 0.0, mips: false },
                 |i| GpuEffect {
                     key: format!("{}@{}", i.plugin.id, i.plugin.major_version),
                     wgsl: i.wgsl.as_deref().unwrap_or_default().into(),
                     params: param_values(&i.params, &t.params, self.space),
                     time: 0.0,
+                    mips: i.reads_levels,
                 },
             );
             let incoming = t.incoming.as_ref().and_then(|x| self.layer(x, seq_size));
@@ -201,4 +204,34 @@ pub fn prefetch(project: &Project, t: ve_time::Time, ahead: ve_time::Time, proxi
             }
         }
     }
+}
+
+/// Every effect shader `project` uses — filters, generators, transitions,
+/// in every sequence — keyed as frames resolve them, so they can be
+/// compiled ahead of the first frame that shows them
+/// ([`ve_render::EffectPipelines::warm`]).
+pub fn effect_shaders(project: &Project, registry: &Registry) -> Vec<GpuEffect> {
+    let mut out: Vec<GpuEffect> = Vec::new();
+    let mut add = |r: &PluginRef| {
+        let Some(info) = registry.find(r) else { return };
+        let Some(wgsl) = info.wgsl.as_deref() else { return };
+        let key = format!("{}@{}", r.id, r.major_version);
+        if !out.iter().any(|e| e.key == key) {
+            out.push(GpuEffect { key, wgsl: wgsl.into(), params: vec![], time: 0.0, mips: info.reads_levels });
+        }
+    };
+    for seq in project.sequences.values() {
+        for track in seq.tracks.iter().filter(|t| t.kind == TrackKind::Video) {
+            for clip in track.clips.iter() {
+                if let ClipSource::Generator { plugin } = &clip.source {
+                    add(plugin);
+                }
+                clip.effects.iter().for_each(|e| add(&e.plugin));
+                for t in [&clip.transition_in, &clip.transition_out].into_iter().flatten() {
+                    add(&t.plugin);
+                }
+            }
+        }
+    }
+    out
 }

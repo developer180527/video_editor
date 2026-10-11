@@ -57,6 +57,9 @@ fn frame_bytes(f: &VideoFrame) -> usize {
 #[derive(Default)]
 struct State {
     want: Option<Time>,
+    /// The last ask got a stand-in (a nearby frame) or nothing: the asker is
+    /// waiting, so the frame it wants arriving is news worth a wake.
+    waiting: bool,
     frames: BTreeMap<Time, Arc<VideoFrame>>,
     bytes: usize,
     /// Size of the last frame decoded: what one more frame will cost.
@@ -233,10 +236,12 @@ impl VideoPool {
         if st.upcoming().is_some_and(|u| t >= u) {
             st.upcoming = None; // arrived
         }
-        match st.covering(t).or_else(|| st.past_end(t)) {
+        let found = match st.covering(t).or_else(|| st.past_end(t)) {
             Some(f) => Lookup::Exact(f.clone()),
             None => st.nearest(t).map_or(Lookup::Pending, |f| Lookup::Nearest(f.clone())),
-        }
+        };
+        st.waiting = !matches!(found, Lookup::Exact(_));
+        found
     }
 
     /// A clip of `asset` will start showing source time `t` soon: decode its
@@ -403,7 +408,9 @@ fn worker(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef) {
                 let fresh;
                 {
                     let mut st = src.state.lock().unwrap();
-                    fresh = st.want.is_some_and(|t| key <= t && t < f.pts + f.duration);
+                    // Only someone who was shown a stand-in needs waking:
+                    // playback that keeps up asks for each frame on time.
+                    fresh = st.waiting && st.want.is_some_and(|t| key <= t && t < f.pts + f.duration);
                     st.frame_bytes = frame_bytes(&f);
                     st.bytes += frame_bytes(&f);
                     if let Some(old) = st.frames.insert(key, f) {

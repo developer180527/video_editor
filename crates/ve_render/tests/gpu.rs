@@ -128,7 +128,7 @@ fn plugin_wgsl_runs_as_an_effect() {
     let name = lib.name().to_string();
     let fx = ve_plugin_host::native::load(Arc::from(lib), Some(&name)).unwrap().remove(0);
     let mut l = layer(gray(64, 36, 16), 100.0, 1.0); // black…
-    l.effects.push(GpuEffect { key: fx.plugin.id.clone(), wgsl: fx.wgsl.unwrap().into(), params: vec![[1.0, 0.0, 0.0, 0.0]], time: 0.0 });
+    l.effects.push(GpuEffect { key: fx.plugin.id.clone(), wgsl: fx.wgsl.unwrap().into(), params: vec![[1.0, 0.0, 0.0, 0.0]], time: 0.0, mips: true });
     let mut c = Compositor::new(&device);
     c.render(&device, &queue, &plan(64, 36), &[l], (64, 36), WorkingSpace::LinearRec709);
     assert!(c.errors.is_empty(), "{:?}", c.errors);
@@ -287,7 +287,7 @@ fn the_grade_effect_compiles_and_grades() {
             params[index(id)][0] = *v;
         }
         let mut l = layer(gray(64, 36, 126), 100.0, 1.0);
-        l.effects.push(GpuEffect { key: "grade".into(), wgsl: info.wgsl.clone().unwrap().into(), params, time: 0.0 });
+        l.effects.push(GpuEffect { key: "grade".into(), wgsl: info.wgsl.clone().unwrap().into(), params, time: 0.0, mips: true });
         let mut c = Compositor::new(&device);
         c.render(&device, &queue, &plan(64, 36), &[l], (64, 36), WorkingSpace::AcesCg);
         assert!(c.errors.is_empty(), "{:?}", c.errors);
@@ -372,7 +372,7 @@ fn a_picked_colour_comes_back_unchanged() {
     for space in [WorkingSpace::AcesCg, WorkingSpace::LinearRec709] {
         for (picked, expect) in [([0.5, 0.5, 0.5, 1.0], [128, 128, 128]), ([0.8, 0.3, 0.1, 1.0], [204, 77, 26])] {
             let mut l = layer(gray(64, 36, 16), 100.0, 1.0);
-            l.effects.push(GpuEffect { key: "fill".into(), wgsl: fill.into(), params: vec![display_color_to_working(picked, space)], time: 0.0 });
+            l.effects.push(GpuEffect { key: "fill".into(), wgsl: fill.into(), params: vec![display_color_to_working(picked, space)], time: 0.0, mips: true });
             let mut c = Compositor::new(&device);
             c.render(&device, &queue, &plan(64, 36), &[l], (64, 36), space);
             assert!(c.errors.is_empty(), "{:?}", c.errors);
@@ -406,12 +406,12 @@ fn halves(w: u32, h: u32) -> Arc<VideoFrame> {
 
 fn probe(key: &str, body: &str) -> GpuEffect {
     let wgsl = format!("@fragment\nfn effect(i: EffectIn) -> @location(0) vec4<f32> {{\n    {body}\n}}\n");
-    GpuEffect { key: key.into(), wgsl: wgsl.into(), params: vec![], time: 0.0 }
+    GpuEffect { key: key.into(), wgsl: wgsl.into(), params: vec![], time: 0.0, mips: true }
 }
 
-/// `scale` is texels per full-quality pixel of the picture being drawn: a
-/// clip decoded whole sees 1 even in a half-size preview; a transition,
-/// drawing the sequence frame, sees the preview's 0.5.
+/// `scale` is texels per full-quality pixel of the picture being drawn.
+/// A clip's effects run at the size it is shown, so in a half-size preview
+/// they see 0.5 — as does a transition, drawing the sequence frame.
 #[test]
 fn effects_see_scale_in_their_own_texels() {
     let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
@@ -425,7 +425,8 @@ fn effects_see_scale_in_their_own_texels() {
     };
     let mut clip = layer(gray(64, 36, 16), 100.0, 1.0);
     clip.effects.push(probe("scale", show_scale));
-    assert_eq!(at(clip), 255, "a clip's effect sees scale 1");
+    // Linear 0.5 on the monitor: 0.5^(1/2.4) ≈ 0.749 → 191.
+    assert!((189..=193).contains(&at(clip)), "a clip's effect, run at the half-size preview's size, sees 0.5");
     let mut tr = layer(gray(64, 36, 16), 100.0, 1.0);
     tr.transition = Some(Box::new(RenderTransition { effect: probe("scale-tr", show_scale), progress: 0.5, incoming: None, self_incoming: false }));
     // Linear 0.5 on the monitor: 0.5^(1/2.4) ≈ 0.749 → 191.
@@ -471,4 +472,23 @@ fn turned_pictures_stand_upright() {
     assert!(px(&img, 18, 10)[0] < 10, "top is the stored left half (black): {:?}", px(&img, 18, 10));
     assert!(px(&img, 18, 54)[0] > 245, "bottom is the stored right half (white): {:?}", px(&img, 18, 54));
     assert_eq!(turn_uv([0.25, 0.75], 270), [0.25, 0.25], "270: the stored picture's point under an upright one");
+}
+
+/// Effect shaders compiled ahead, on another thread, are the ones a
+/// compositor sharing the cache draws with: nothing compiles on the frame.
+#[test]
+fn warmed_effect_shaders_are_shared() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let pipes = EffectPipelines::new(&device);
+    let fx = probe("warm-me", "return vec4<f32>(1.0, 1.0, 1.0, 1.0);");
+    let (p, f) = (pipes.clone(), fx.clone());
+    std::thread::spawn(move || p.warm(&[f])).join().unwrap();
+    assert!(pipes.has("warm-me"));
+    let mut c = Compositor::with_pipelines(&device, pipes.clone());
+    let mut l = layer(gray(64, 36, 16), 100.0, 1.0);
+    l.effects.push(fx);
+    c.render(&device, &queue, &plan(64, 36), &[l], (64, 36), WorkingSpace::LinearRec709);
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    assert_eq!(px(&c.read_output(&device, &queue).unwrap(), 32, 18)[0], 255);
+    assert!(Arc::ptr_eq(&pipes, &c.pipelines()));
 }

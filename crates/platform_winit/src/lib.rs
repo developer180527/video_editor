@@ -302,6 +302,9 @@ struct Win {
     presented: bool,
     /// Frames built and presented this second (VE_PROFILE_FPS=1 prints them).
     stats: (u32, u32, Instant),
+    /// Why frames were built this second: rebuild asked (another thread,
+    /// an event), the app animating, the dock, libgui (input, a due wake).
+    why: [u32; 4],
 }
 
 struct Shell<A: ShellApp> {
@@ -491,6 +494,7 @@ impl<A: ShellApp> Shell<A> {
                 wake: None,
                 presented: false,
                 stats: (0, 0, Instant::now()),
+                why: [0; 4],
             }),
         );
         id
@@ -584,8 +588,16 @@ impl<A: ShellApp> Shell<A> {
         };
         let dark = w.window.theme().map(|t| t == winit::window::Theme::Dark);
         let mut ctx = ShellCtx { chrome, geometry, dark, ..ShellCtx::default() };
-        if w.rebuild || self.app.animating() || dock_wants || w.ui.needs_frame_for(&info, w.idle) {
+        let (rebuild, animating) = (w.rebuild, self.app.animating());
+        // A wake the UI asked for has come: build, whatever libgui's own
+        // clock says. (The two measure from slightly different moments; if
+        // they disagreed, the event loop would ask for this frame again and
+        // again, spinning a core, until libgui's clock caught up.)
+        let due = w.wake.is_some_and(|t| t <= now);
+        if rebuild || animating || dock_wants || due || w.ui.needs_frame_for(&info, w.idle) {
             w.stats.0 += 1;
+            let k = if rebuild { 0 } else if animating { 1 } else if dock_wants { 2 } else { 3 };
+            w.why[k] += 1;
             w.idle = 0.0;
             w.rebuild = false;
             self.app.prepare(&g.gpu, &mut w.renderer, w.dock_id);
@@ -646,7 +658,12 @@ impl<A: ShellApp> Shell<A> {
                     let secs = w.stats.2.elapsed().as_secs_f64();
                     let cpu = cpu_seconds();
                     let used = PROFILE_CPU.with(|c| cpu - c.replace(cpu));
-                    eprintln!("[fps] window {:?}: {} built, {} presented, process {:.0}% CPU", w.dock_id, w.stats.0, w.stats.1, used / secs * 100.0);
+                    let [r, a, d, l] = w.why;
+                    eprintln!(
+                        "[fps] window {:?}: {} built (rebuild {r}, animating {a}, dock {d}, ui {l}), {} presented, process {:.0}% CPU, peak {:.0} MB",
+                        w.dock_id, w.stats.0, w.stats.1, used / secs * 100.0, peak_mb()
+                    );
+                    w.why = [0; 4];
                 }
                 w.stats = (0, 0, Instant::now());
             }
@@ -1024,6 +1041,20 @@ pub fn run<A: ShellApp + 'static>(cfg: ShellConfig, make_app: impl FnOnce(Waker)
 thread_local! {
     /// Process CPU seconds at the last profile line.
     static PROFILE_CPU: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// The most memory the process has held, MB.
+fn peak_mb() -> f64 {
+    #[cfg(unix)]
+    unsafe {
+        let mut u: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut u);
+        // Bytes on Apple, kilobytes elsewhere.
+        let b = if cfg!(target_vendor = "apple") { u.ru_maxrss as f64 } else { u.ru_maxrss as f64 * 1024.0 };
+        b / 1_048_576.0
+    }
+    #[cfg(not(unix))]
+    0.0
 }
 
 /// CPU time the whole process has used (every thread), seconds.

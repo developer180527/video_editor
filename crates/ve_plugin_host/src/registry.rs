@@ -55,6 +55,9 @@ pub struct EffectInfo {
     /// GPU implementation as WGSL, when the plugin has one.
     pub wgsl: Option<String>,
     pub implementation: Implementation,
+    /// Its shader may sample below level 0 (wide blurs, zooms): the host
+    /// builds mip chains only for effects that do (`wgsl::reads_lower_levels`).
+    pub reads_levels: bool,
 }
 
 #[derive(Clone)]

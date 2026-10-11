@@ -115,7 +115,12 @@ impl FfEncoder {
                 oc,
                 video: Stream { ctx: ptr::null_mut(), st: ptr::null_mut(), hw_frames: ptr::null_mut(), sw_pix: sys::AVPixelFormat::AV_PIX_FMT_NV12 },
                 audio: None,
-                sws: sys::sws_alloc_context(),
+                sws: {
+                    // The RGB → YUV conversion of each frame, threaded too.
+                    let sws = sys::sws_alloc_context();
+                    sys::av_opt_set_int(sws as *mut std::ffi::c_void, c"threads".as_ptr(), 0, 0);
+                    sws
+                },
                 pkt: sys::av_packet_alloc(),
                 frames: 0,
                 samples: 0,
@@ -166,6 +171,9 @@ impl FfEncoder {
             (*ctx).time_base = sys::AVRational { num: s.rate.den as c_int, den: s.rate.num as c_int };
             (*ctx).framerate = sys::AVRational { num: s.rate.num as c_int, den: s.rate.den as c_int };
             (*ctx).pix_fmt = sw_pix;
+            // Every core the codec can use (ProRes and other software
+            // encoders slice a frame up; hardware ones ignore it).
+            (*ctx).thread_count = 0;
             (*ctx).color_primaries = sys::AVColorPrimaries::AVCOL_PRI_BT709;
             (*ctx).color_trc = sys::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
             (*ctx).colorspace = sys::AVColorSpace::AVCOL_SPC_BT709;

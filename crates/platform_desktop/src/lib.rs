@@ -178,7 +178,34 @@ impl ProcessHost for DesktopProcesses {
 
 /// The desktop platform. `media` is the decoding backend (FFmpeg in the app);
 /// `linked` lists built-in plugins.
+/// The calling thread becomes a background one (thumbnails, waveforms).
+fn background_thread() {
+    #[cfg(target_vendor = "apple")]
+    {
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos: u32, relative_priority: i32) -> i32;
+        }
+        // QOS_CLASS_UTILITY: efficiency cores, out of the way of playback.
+        unsafe { pthread_set_qos_class_self_np(0x11, 0) };
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // Nice applies per thread on Linux.
+        libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 10);
+    }
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
+        }
+        // THREAD_MODE_BACKGROUND_BEGIN: low CPU, I/O and memory priority.
+        unsafe { SetThreadPriority(GetCurrentThread(), 0x0001_0000) };
+    }
+}
+
 pub fn platform(media: Arc<dyn MediaBackend>, linked: Vec<fn() -> Box<dyn NativeLibrary>>) -> Platform {
+    ve_ports::set_background_thread_hook(background_thread);
     Platform {
         system: Arc::new(DesktopSystem { start: Instant::now() }),
         storage: Arc::new(storage()),

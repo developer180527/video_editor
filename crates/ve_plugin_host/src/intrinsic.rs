@@ -25,8 +25,8 @@ pub const GRADE: &str = "ve.grade";
 const DISSOLVE_WGSL: &str = r#"
 @fragment
 fn effect(i: EffectIn) -> @location(0) vec4<f32> {
-    let a = textureSample(source, source_sampler, i.uv);
-    let b = textureSample(source_b, source_sampler, i.uv);
+    let a = textureSampleLevel(source, source_sampler, i.uv, 0.0);
+    let b = textureSampleLevel(source_b, source_sampler, i.uv, 0.0);
     return mix(a, b, params.progress);
 }
 "#;
@@ -36,8 +36,8 @@ const DIP_WGSL: &str = r#"
 @fragment
 fn effect(i: EffectIn) -> @location(0) vec4<f32> {
     let p = params.progress;
-    let a = textureSample(source, source_sampler, i.uv);
-    let b = textureSample(source_b, source_sampler, i.uv);
+    let a = textureSampleLevel(source, source_sampler, i.uv, 0.0);
+    let b = textureSampleLevel(source_b, source_sampler, i.uv, 0.0);
     let black = vec4<f32>(0.0, 0.0, 0.0, max(a.a, b.a));
     if (p < 0.5) { return mix(a, black, p * 2.0); }
     return mix(black, b, p * 2.0 - 1.0);
@@ -59,7 +59,7 @@ fn grade_wheel(w: vec2<f32>) -> vec3<f32> {
 }
 @fragment
 fn effect(i: EffectIn) -> @location(0) vec4<f32> {
-    let s = textureSample(source, source_sampler, i.uv);
+    let s = textureSampleLevel(source, source_sampler, i.uv, 0.0);
     let a = s.a;
     if (a <= 0.0) { return s; }
     var c = max(s.rgb / a, vec3<f32>(0.0));
@@ -114,6 +114,7 @@ fn info(id: &str, name: &str, category: &str, params: Vec<ParamInfo>) -> EffectI
         params,
         wgsl: None,
         implementation: Implementation::Intrinsic,
+        reads_levels: false,
     }
 }
 
@@ -122,6 +123,7 @@ fn transition(id: &str, name: &str, category: &str, wgsl: Option<&str>) -> Effec
         kind: EffectKind::Transition,
         wgsl: wgsl.map(String::from),
         implementation: if wgsl.is_some() { Implementation::ShaderOnly } else { Implementation::Intrinsic },
+        reads_levels: wgsl.is_some_and(crate::wgsl::reads_lower_levels),
         ..info(id, name, category, vec![])
     }
 }
@@ -166,6 +168,7 @@ pub fn all() -> Vec<EffectInfo> {
         EffectInfo {
             implementation: Implementation::ShaderOnly,
             wgsl: Some(GRADE_WGSL.into()),
+            reads_levels: crate::wgsl::reads_lower_levels(GRADE_WGSL),
             ..info(GRADE, "Lumetri Color", "Color Correction", vec![
                 p("temperature", "Temperature", Float, -100.0, 100.0, [0.0; 4]),
                 p("tint", "Tint", Float, -100.0, 100.0, [0.0; 4]),

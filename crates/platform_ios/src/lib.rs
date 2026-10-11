@@ -76,11 +76,22 @@ pub fn storage() -> FileStorage {
     }
 }
 
+/// The calling thread becomes a background one: utility QoS, which iPadOS
+/// runs on the efficiency cores.
+#[cfg(target_os = "ios")]
+fn background_thread() {
+    extern "C" {
+        fn pthread_set_qos_class_self_np(qos: u32, relative_priority: i32) -> i32;
+    }
+    unsafe { pthread_set_qos_class_self_np(0x11, 0) };
+}
+
 pub fn platform(media: Arc<dyn MediaBackend>, linked: Vec<fn() -> Box<dyn NativeLibrary>>) -> Platform {
     #[cfg(target_os = "ios")]
     {
         memory::observe();
         audio_session::configure();
+        ve_ports::set_background_thread_hook(background_thread);
     }
     Platform {
         system: Arc::new(IosSystem { start: Instant::now() }),

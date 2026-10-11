@@ -1,5 +1,54 @@
 # Energy and performance — measurements and work orders
 
+**Status: WO-1 to WO-8 done** (2026-10-11); results below. WO-9 needs a PC.
+
+## Results
+
+| | Before | After |
+|---|---|---|
+| Mac, playing UHD HEVC: UI frames/s | 121 | **24** (the sequence's rate) |
+| Mac, playing UHD HEVC: CPU | 33–42 % | **18–20 %** |
+| Mac, playing 1080p: CPU | 42 % | **15 %** |
+| Mac, idle · paused (settled) | 0.4 % · 0 % | 0.3 % · 0.4 % |
+| Mac, playing UHD HEVC + blur, grade, glow, title, dissolve | can't hold 60 fps; GPU 20 ms/frame | **every frame**; GPU 6.6 ms (1/2), 9.3 ms (full); ~31 % CPU |
+| First paused frame with effects | 295 ms | 35 ms; shaders compile ahead in the background |
+| Export ProRes (bench) | 1 core, 0.7–0.8× real time | **~10 cores, 5.3–6.0× real time** (4.0× with effects) |
+| **iPad Pro M5, playing UHD HEVC** | **121 frames/s, 62–75 % CPU** | **24–25 frames/s, 13–16 % CPU**, peak 735 MB |
+| Icon path hashing | ≈25 % of all CPU | gone from the profile |
+
+What was done:
+
+- **WO-1** — the UI is rebuilt when something visible changes: while
+  playing, at each frame boundary of the picture (faster when shuttling;
+  the audio clock's steps are allowed for), otherwise at 30 Hz only while
+  meters fall, a frame decodes, thumbnails arrive or work runs. The
+  monitors and scopes redraw only when their picture changes (document,
+  time, size, decoded pictures). The decode pool wakes the UI only when a
+  viewer was shown a stand-in. The shell builds when a requested wake is
+  due (two clocks disagreeing had made it spin).
+- **WO-2** — libgui paths fold each segment into a hash as they are built;
+  the per-frame key only mixes in size, rule and view box.
+- **WO-3** — thumbnail and waveform work runs as a background thread
+  (Apple: utility QoS, the efficiency cores; Linux: nice 10; Windows:
+  background mode), through a `ve_ports` hook.
+- **WO-4** — a layer with effects shown much smaller than stored is
+  filtered down once (a short mip chain and a trilinear pass) and its
+  effects run at the size seen. `params.scale` says so; the contract's
+  wording was updated.
+- **WO-5** — mip chains are built only before shaders that can sample
+  below level 0, found with naga when an effect loads
+  (`wgsl::reads_lower_levels`). The built-in dissolve, dip and grade read
+  level 0 explicitly.
+- **WO-6** — one `EffectPipelines` cache per device, shared by both
+  monitors, warmed on a background thread whenever the document changes.
+- **WO-7** — encoders and the RGB → YUV conversion use every core.
+- **WO-8** — iOS memory warnings purge the decode pool and thumbnails
+  (`ve_ports::on_memory_warning`); peak memory is reported by
+  `VE_PROFILE_FPS`.
+
+Measuring note: the first few launches of a freshly built binary cost a
+core or more for many seconds on macOS (caches rebuilding) — discard them.
+
 **Measured 2026-10-11** on a MacBook Pro, Apple M4 Pro (12 cores, 24 GB),
 built-in ProMotion display (120 Hz), and an iPad Pro M5 (see the end).
 

@@ -102,6 +102,19 @@ impl Engine {
         let budget = (platform.capabilities().memory_budget / 8) as usize;
         let video = ve_media::VideoPool::new(platform.storage.clone(), platform.media.clone(), budget);
         let stills = ve_media::Stills::new(platform.storage.clone(), platform.media.clone());
+        // On a memory warning, decoded frames and thumbnails are dropped:
+        // both are made again as they are needed. (Weak: the engine may go.)
+        {
+            let (v, s) = (Arc::downgrade(&video), Arc::downgrade(&stills));
+            ve_ports::on_memory_warning(move || {
+                if let Some(v) = v.upgrade() {
+                    v.purge();
+                }
+                if let Some(s) = s.upgrade() {
+                    s.purge();
+                }
+            });
+        }
         let mut e = Engine {
             platform,
             project: Arc::new(Project::new("Untitled")),

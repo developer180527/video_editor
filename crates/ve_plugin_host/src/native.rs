@@ -91,7 +91,9 @@ pub fn load(lib: Arc<dyn NativeLibrary>, static_name: Option<&str>) -> Result<Ve
         if out.iter().any(|e: &EffectInfo| e.plugin.id == id && e.plugin.major_version == major_version) {
             return Err(bad(&format!("effect `{id}` (major version {major_version}) is declared twice")));
         }
+        let reads_levels = wgsl.as_deref().is_some_and(crate::wgsl::reads_lower_levels);
         out.push(EffectInfo {
+            reads_levels,
             plugin: PluginRef { api: PluginApi::Native, id, major_version },
             name,
             category,

@@ -60,7 +60,14 @@ impl Stills {
     pub fn new(storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>) -> Arc<Self> {
         let s = Arc::new(Stills { state: Mutex::new(State::default()), wake: Condvar::new(), waker: Mutex::new(None) });
         let w = Arc::downgrade(&s);
-        std::thread::Builder::new().name("ve-stills".into()).spawn(move || worker(w, storage, media)).expect("stills thread");
+        std::thread::Builder::new()
+            .name("ve-stills".into())
+            .spawn(move || {
+                // Thumbnails and waveforms are never waited on: efficiency cores.
+                ve_ports::run_in_background();
+                worker(w, storage, media)
+            })
+            .expect("stills thread");
         s
     }
 

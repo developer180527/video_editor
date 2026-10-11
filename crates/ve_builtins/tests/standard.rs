@@ -95,7 +95,7 @@ fn at_defaults(e: &EffectInfo, space: WorkingSpace) -> GpuEffect {
             if p.kind == ParamKind::Color { display_color_to_working(v, space) } else { v }
         })
         .collect();
-    GpuEffect { key: format!("{}@{}", e.plugin.id, e.plugin.major_version), wgsl: e.wgsl.as_deref().unwrap().into(), params, time: 0.5 }
+    GpuEffect { key: format!("{}@{}", e.plugin.id, e.plugin.major_version), wgsl: e.wgsl.as_deref().unwrap().into(), params, time: 0.5, mips: e.reads_levels }
 }
 
 struct Gpu {

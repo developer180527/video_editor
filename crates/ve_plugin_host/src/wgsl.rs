@@ -59,8 +59,84 @@ fn local_lines(msg: &str, shift: usize) -> String {
     out.trim_end().to_string()
 }
 
+/// Whether a shader (meeting the contract) may sample its inputs below
+/// level 0 — implicitly (`textureSample`), with a bias or gradients, or at
+/// an explicit level that is not the literal `0`. Only shaders that do need
+/// the host to build mip chains for them first; the rest skip that work.
+/// Answers "yes" when unsure (a level passed in as an argument, say) or
+/// when the source does not parse.
+pub fn reads_lower_levels(source: &str) -> bool {
+    use naga::{Expression, Literal, SampleLevel, Statement};
+    let full = format!("{WGSL_PRELUDE}{source}");
+    let Ok(module) = naga::front::wgsl::parse_str(&full) else { return true };
+    let Some(ep) = module.entry_points.iter().find(|e| e.name == "effect") else { return true };
+
+    fn samples_below_zero(f: &naga::Function) -> bool {
+        f.expressions.iter().any(|(_, e)| match e {
+            Expression::ImageSample { level, .. } => match level {
+                SampleLevel::Zero => false,
+                SampleLevel::Exact(h) => !matches!(f.expressions[*h], Expression::Literal(Literal::F32(v)) if v == 0.0)
+                    && !matches!(f.expressions[*h], Expression::Literal(Literal::AbstractFloat(v)) if v == 0.0),
+                _ => true,
+            },
+            _ => false,
+        })
+    }
+    fn calls(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Function>>) {
+        for s in block.iter() {
+            match s {
+                Statement::Call { function, .. } => out.push(*function),
+                Statement::Block(b) => calls(b, out),
+                Statement::If { accept, reject, .. } => {
+                    calls(accept, out);
+                    calls(reject, out);
+                }
+                Statement::Loop { body, continuing, .. } => {
+                    calls(body, out);
+                    calls(continuing, out);
+                }
+                Statement::Switch { cases, .. } => cases.iter().for_each(|c| calls(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+    if samples_below_zero(&ep.function) {
+        return true;
+    }
+    // Every function `effect` can reach.
+    let mut todo = Vec::new();
+    calls(&ep.function.body, &mut todo);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(h) = todo.pop() {
+        if !seen.insert(h) {
+            continue;
+        }
+        let f = &module.functions[h];
+        if samples_below_zero(f) {
+            return true;
+        }
+        calls(&f.body, &mut todo);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn which_shaders_read_lower_levels() {
+        let level0 = "@fragment fn effect(i: EffectIn) -> @location(0) vec4<f32> { return textureSampleLevel(source, source_sampler, i.uv, 0.0); }";
+        assert!(!super::reads_lower_levels(level0), "level 0 only");
+        let implicit = "@fragment fn effect(i: EffectIn) -> @location(0) vec4<f32> { return textureSample(source, source_sampler, i.uv); }";
+        assert!(super::reads_lower_levels(implicit), "implicit levels");
+        let deep = "fn wide(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(source, source_sampler, uv, 3.0); }\n\
+                    @fragment fn effect(i: EffectIn) -> @location(0) vec4<f32> { return wide(i.uv); }";
+        assert!(super::reads_lower_levels(deep), "through a called function");
+        let unused = "fn wide(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(source, source_sampler, uv, 3.0); }\n\
+                      @fragment fn effect(i: EffectIn) -> @location(0) vec4<f32> { return textureSampleLevel(source, source_sampler, i.uv, 0.0); }";
+        assert!(!super::reads_lower_levels(unused), "a helper never called does not count");
+    }
+
     use super::*;
 
     const GOOD: &str = "@fragment\nfn effect(i: EffectIn) -> @location(0) vec4<f32> {\n    return textureSample(source, source_sampler, i.uv) * params.values[0].x;\n}\n";

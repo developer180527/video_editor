@@ -78,6 +78,8 @@ pub struct GpuEffect {
     pub wgsl: Arc<str>,
     pub params: Vec<[f32; 4]>,
     pub time: f32,
+    /// The shader reads its inputs below level 0: build mip chains first.
+    pub mips: bool,
 }
 
 /// One layer, with everything resolved.
@@ -348,6 +350,13 @@ const MIP: &str = r#"
 fn fs_mip(i: VsOut) -> @location(0) vec4<f32> {
     return textureSampleLevel(above, samp, i.uv, 0.0);
 }
+
+// A picture made smaller in one pass: the mip chain under it, read
+// trilinearly at the level the reduction calls for.
+@fragment
+fn fs_reduce(i: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(above, samp, i.uv);
+}
 "#;
 
 /// The host's vertex stage for effects, after the frozen prelude
@@ -534,6 +543,14 @@ struct Slot {
     effect_bg: Vec<[Option<wgpu::BindGroup>; 2]>,
     /// By texture, then by level (reading the level above).
     mip_bg: [Vec<wgpu::BindGroup>; 2],
+    /// A layer with effects shown much smaller than it is stored: the
+    /// picture whole (with its mip chain), which `pair` holds reduced to
+    /// the size it is seen, for the effects to run at. With its size and
+    /// levels, mip and reduce bind groups.
+    whole: Option<LayerTex>,
+    whole_key: (u32, u32, u32),
+    whole_mip_bg: Vec<wgpu::BindGroup>,
+    reduce_bg: Option<wgpu::BindGroup>,
     /// A transition's pictures going out and coming in (with mip chains,
     /// which its shader may read), their size and levels, and their mix.
     trans: Option<[LayerTex; 2]>,
@@ -572,6 +589,10 @@ impl Slot {
             quad_bg: [None, None],
             effect_bg: Vec::new(),
             mip_bg: [Vec::new(), Vec::new()],
+            whole: None,
+            whole_key: (0, 0, 0),
+            whole_mip_bg: Vec::new(),
+            reduce_bg: None,
             trans: None,
             trans_key: (0, 0, 0),
             trans_mip_bg: [Vec::new(), Vec::new()],
@@ -613,6 +634,54 @@ fn layer_tex(device: &wgpu::Device, w: u32, h: u32, levels: u32) -> LayerTex {
     LayerTex { base: level(0), all: tex.create_view(&Default::default()), levels: (1..levels).map(level).collect() }
 }
 
+/// Compiled effect shaders for one device, shared by every compositor on it
+/// (the Program and Source monitors, export) and fillable ahead of time from
+/// another thread — so an effect's first frame on screen does not stop to
+/// compile its shader.
+pub struct EffectPipelines {
+    device: wgpu::Device,
+    layout: wgpu::BindGroupLayout,
+    map: std::sync::Mutex<HashMap<String, Arc<Result<wgpu::RenderPipeline, String>>>>,
+}
+
+impl EffectPipelines {
+    pub fn new(device: &wgpu::Device) -> Arc<Self> {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries(3) });
+        Arc::new(EffectPipelines { device: device.clone(), layout, map: Default::default() })
+    }
+
+    /// `e`'s pipeline, compiled now if no one has yet. A shader that does
+    /// not compile is an `Err` (kept, so it is not tried every frame).
+    pub fn get(&self, e: &GpuEffect) -> Arc<Result<wgpu::RenderPipeline, String>> {
+        if let Some(p) = self.map.lock().unwrap().get(&e.key) {
+            return p.clone();
+        }
+        // Compiled outside the lock: others look up (or compile) meanwhile.
+        let src = format!("{}{EFFECT_VERTEX}\n{}", ve_plugin_abi::WGSL_PRELUDE, e.wgsl);
+        // A plugin's shader may not compile; catch it rather than abort.
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let p = pipeline(&self.device, &src, "ve_effect_vs", "effect", &self.layout, WORKING_FORMAT, None);
+        let r = Arc::new(match pollster::block_on(scope.pop()) {
+            Some(err) => Err(err.to_string()),
+            None => Ok(p),
+        });
+        self.map.lock().unwrap().entry(e.key.clone()).or_insert(r).clone()
+    }
+
+    /// Compile every one of `effects` not yet compiled (call from a
+    /// background thread when a project opens or an effect is added).
+    pub fn warm(&self, effects: &[GpuEffect]) {
+        for e in effects {
+            let _ = self.get(e);
+        }
+    }
+
+    /// Whether `key` is compiled (or known not to compile).
+    pub fn has(&self, key: &str) -> bool {
+        self.map.lock().unwrap().contains_key(key)
+    }
+}
+
 pub struct Compositor {
     sixteen_bit: bool,
     sampler: wgpu::Sampler,
@@ -626,7 +695,11 @@ pub struct Compositor {
     /// Render the output at 16 bits ([`DEEP_FORMAT`]) instead of 8.
     deep_output: bool,
     mip: wgpu::RenderPipeline,
-    effects: HashMap<String, Result<wgpu::RenderPipeline, String>>,
+    reduce: wgpu::RenderPipeline,
+    /// Compiled effect shaders, shared with other compositors on the device.
+    pipes: Arc<EffectPipelines>,
+    /// The ones this compositor has used (a lock-free look-up while drawing).
+    effects: HashMap<String, Arc<Result<wgpu::RenderPipeline, String>>>,
     effect_layout: wgpu::BindGroupLayout,
     work: Option<Target>,
     out: Option<Target>,
@@ -708,6 +781,12 @@ fn blend_state(b: Blend) -> wgpu::BlendState {
 
 impl Compositor {
     pub fn new(device: &wgpu::Device) -> Self {
+        Self::with_pipelines(device, EffectPipelines::new(device))
+    }
+
+    /// A compositor sharing compiled effect shaders with others (`pipes`
+    /// must be on `device`).
+    pub fn with_pipelines(device: &wgpu::Device, pipes: Arc<EffectPipelines>) -> Self {
         let sixteen_bit = device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -718,7 +797,7 @@ impl Compositor {
         let mk_layout = |n| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries(n) });
         let decode_layout = mk_layout(2);
         let one_layout = mk_layout(1);
-        let effect_layout = mk_layout(3);
+        let effect_layout = pipes.layout.clone();
         let decode = pipeline(device, &format!("{COMMON}{DECODE_STRUCT}{TRANSFER}{DECODE}"), "vs_full", "fs_decode", &decode_layout, WORKING_FORMAT, None);
         let decode_rgba = pipeline(device, &format!("{COMMON}{DECODE_STRUCT}{TRANSFER}{RGBA_DECODE}"), "vs_full", "fs_rgba", &one_layout, WORKING_FORMAT, None);
         let composite = [Blend::Normal, Blend::Multiply, Blend::Screen, Blend::Add, Blend::Overlay]
@@ -728,6 +807,7 @@ impl Compositor {
         let display = pipeline(device, &format!("{COMMON}{DISPLAY}"), "vs_full", "fs_display", &one_layout, DISPLAY_FORMAT, None);
         let display_deep = pipeline(device, &format!("{COMMON}{DISPLAY}"), "vs_full", "fs_display_deep", &one_layout, DEEP_FORMAT, None);
         let mip = pipeline(device, &format!("{COMMON}{MIP}"), "vs_full", "fs_mip", &one_layout, WORKING_FORMAT, None);
+        let reduce = pipeline(device, &format!("{COMMON}{MIP}"), "vs_full", "fs_reduce", &one_layout, WORKING_FORMAT, None);
         let dummy = texture(device, "dummy", 1, 1, WORKING_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
         Compositor {
             sixteen_bit,
@@ -741,6 +821,8 @@ impl Compositor {
             display_deep,
             deep_output: false,
             mip,
+            reduce,
+            pipes,
             effects: HashMap::new(),
             effect_layout,
             work: None,
@@ -798,23 +880,20 @@ impl Compositor {
         device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout, entries: &entries })
     }
 
-    fn effect_pipeline(&mut self, device: &wgpu::Device, e: &GpuEffect) -> Option<&wgpu::RenderPipeline> {
+    fn effect_pipeline(&mut self, _device: &wgpu::Device, e: &GpuEffect) -> Option<&wgpu::RenderPipeline> {
         if !self.effects.contains_key(&e.key) {
-            let src = format!("{}{EFFECT_VERTEX}\n{}", ve_plugin_abi::WGSL_PRELUDE, e.wgsl);
-            // A plugin's shader may not compile; catch it rather than abort.
-            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let p = pipeline(device, &src, "ve_effect_vs", "effect", &self.effect_layout, WORKING_FORMAT, None);
-            let err = pollster::block_on(scope.pop());
-            let r = match err {
-                Some(e2) => {
-                    self.errors.push(format!("{}: {e2}", e.key));
-                    Err(e2.to_string())
-                }
-                None => Ok(p),
-            };
+            let r = self.pipes.get(e);
+            if let Err(err) = r.as_ref() {
+                self.errors.push(format!("{}: {err}", e.key));
+            }
             self.effects.insert(e.key.clone(), r);
         }
-        self.effects.get(&e.key).and_then(|r| r.as_ref().ok())
+        self.effects.get(&e.key).and_then(|r| r.as_ref().as_ref().ok())
+    }
+
+    /// The effect shaders this compositor compiles into (to share, or warm).
+    pub fn pipelines(&self) -> Arc<EffectPipelines> {
+        self.pipes.clone()
     }
 
     /// Upload one frame's planes into slot `i`. False if the frame is not in
@@ -1055,7 +1134,7 @@ impl Compositor {
         }
         // The mix: the transition's shader, or a cut at half-way without one.
         let mixed = if self.effect_pipeline(device, &tr.effect).is_some() {
-            for k in 0..2 {
+            for k in (0..2).filter(|_| tr.effect.mips) {
                 if self.slots[i].trans_mip_bg[k].is_empty() {
                     let bgs = self.mip_groups(device, &self.slots[i].trans.as_ref().unwrap()[k]);
                     self.slots[i].trans_mip_bg[k] = bgs;
@@ -1073,7 +1152,7 @@ impl Compositor {
             queue.write_buffer(&self.slots[i].trans_buf, 0, &floats(&vals));
             let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf, &[&a_all, &self.dummy_view, &b_all]);
             let mut pass = begin(enc, c, Some(wgpu::Color::TRANSPARENT));
-            pass.set_pipeline(self.effects[&tr.effect.key].as_ref().unwrap());
+            pass.set_pipeline((*self.effects[&tr.effect.key]).as_ref().unwrap());
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
             c
@@ -1129,15 +1208,36 @@ impl Compositor {
         let across = if turned { th } else { tw };
         // Output pixels per texture pixel decides the mip chain.
         let scale = layer.motion.scale / 100.0 * out.0 as f32 / seq_size.0.max(1) as f32 * layer.size.0 as f32 / across.max(1) as f32;
+        // Effects run at the size the layer is seen, not stored: a 4K clip
+        // in an HD sequence (or any half-size preview) is filtered down
+        // once, and its effects touch a quarter of the pixels or fewer.
+        let reduce = !layer.effects.is_empty() && scale < 0.75;
+        let (pw, ph) = if reduce { (((tw as f32 * scale).ceil() as u32).max(1), ((th as f32 * scale).ceil() as u32).max(1)) } else { (tw, th) };
+        let p_across = if turned { ph } else { pw };
         // Effects may read a mip chain (wide blurs); otherwise only a
         // layer drawn small needs one.
-        let levels = if layer.effects.is_empty() { mip_levels(scale, tw, th) } else { full_levels(tw, th) };
-        self.layer_pair(device, i, tw, th, levels);
+        let p_scale = scale * tw as f32 / pw.max(1) as f32;
+        let levels = if layer.effects.iter().any(|e| e.mips) { full_levels(pw, ph) } else { mip_levels(p_scale, pw, ph) };
+        self.layer_pair(device, i, pw, ph, levels);
+        if reduce {
+            // Levels down to the reduced size and one more (the trilinear
+            // read blends two), not to 1×1: a 4K picture shown at a quarter
+            // needs 3 levels, not 12.
+            let down = ((1.0 / scale).log2().ceil() as u32 + 2).min(full_levels(tw, th));
+            let key = (tw, th, down);
+            if self.slots[i].whole.is_none() || self.slots[i].whole_key != key {
+                let s = &mut self.slots[i];
+                s.whole = Some(layer_tex(device, tw, th, key.2));
+                s.whole_key = key;
+                s.whole_mip_bg = Vec::new();
+                s.reduce_bg = None;
+            }
+        }
         // Texture pixels per pixel of the picture at full quality: what an
         // effect multiplies its sizes by (a proxy is smaller; a clip at any
-        // preview quality is decoded whole).
-        let fx_scale = across as f32 / layer.size.0.max(1) as f32;
-        let first = self.slots[i].pair.as_ref().unwrap()[0].base.clone();
+        // preview quality is decoded whole, then maybe reduced).
+        let fx_scale = p_across as f32 / layer.size.0.max(1) as f32;
+        let first = if reduce { self.slots[i].whole.as_ref().unwrap().base.clone() } else { self.slots[i].pair.as_ref().unwrap()[0].base.clone() };
 
         // 1. The picture, into the first texture of the pair.
         match &layer.source {
@@ -1185,7 +1285,7 @@ impl Compositor {
                 queue.write_buffer(&self.slots[i].trans_buf, 0, &floats(&vals));
                 let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf, &[&self.dummy_view, &self.dummy_view, &self.dummy_view]);
                 let mut pass = begin(enc, &first, Some(wgpu::Color::TRANSPARENT));
-                pass.set_pipeline(self.effects[&e.key].as_ref().unwrap());
+                pass.set_pipeline((*self.effects[&e.key]).as_ref().unwrap());
                 pass.set_bind_group(0, &bg, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -1195,6 +1295,24 @@ impl Compositor {
                 }
                 self.draw(device, queue, enc, &first, (n.width, n.height), &n.layers, n.seq_size, space, next);
             }
+        }
+        // 1b. Reduced: the whole picture's mip chain, then one trilinear
+        // pass down into the pair.
+        if reduce {
+            if self.slots[i].whole_mip_bg.is_empty() {
+                let bgs = self.mip_groups(device, self.slots[i].whole.as_ref().unwrap());
+                self.slots[i].whole_mip_bg = bgs;
+            }
+            if self.slots[i].reduce_bg.is_none() {
+                let bg = self.bind(device, &self.one_layout, &self.empty_buf, &[&self.slots[i].whole.as_ref().unwrap().all]);
+                self.slots[i].reduce_bg = Some(bg);
+            }
+            let s = &self.slots[i];
+            self.mip_passes(enc, s.whole.as_ref().unwrap(), &s.whole_mip_bg);
+            let mut pass = begin(enc, &s.pair.as_ref().unwrap()[0].base, Some(wgpu::Color::TRANSPARENT));
+            pass.set_pipeline(&self.reduce);
+            pass.set_bind_group(0, s.reduce_bg.as_ref(), &[]);
+            pass.draw(0..3, 0..1);
         }
         let mut cur = 0;
 
@@ -1209,7 +1327,10 @@ impl Compositor {
             }
             vals[256] = e.time;
             vals[258] = fx_scale;
-            self.layer_mips(device, enc, i, cur);
+            // Only a shader that reads below level 0 needs the chain built.
+            if e.mips {
+                self.layer_mips(device, enc, i, cur);
+            }
             let s = &mut self.slots[i];
             while s.effect_bufs.len() <= k {
                 s.effect_bufs.push(uniform_buf(device, EFFECT_BYTES));
@@ -1225,7 +1346,7 @@ impl Compositor {
             }
             let s = &self.slots[i];
             let nxt = cur ^ 1;
-            let pipe = self.effects[&e.key].as_ref().unwrap();
+            let pipe = (*self.effects[&e.key]).as_ref().unwrap();
             let mut pass = begin(enc, &s.pair.as_ref().unwrap()[nxt].base, Some(wgpu::Color::TRANSPARENT));
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, s.effect_bg[k][cur].as_ref(), &[]);

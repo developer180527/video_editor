@@ -222,6 +222,16 @@ pub struct EditorUi {
     pub view: View,
     dock: DockState<Tab>,
     compositor: Option<Compositor>,
+    /// Effect shaders compiled once for both monitors, warmed in the
+    /// background as the document gains effects (no freeze on first show).
+    pipelines: Option<std::sync::Arc<ve_render::EffectPipelines>>,
+    /// The document whose effects were last warmed.
+    warmed: usize,
+    /// What the Program monitor, the Source monitor and the scopes last
+    /// drew: they redraw only when that changes.
+    monitor_key: Option<PictureKey>,
+    source_key: Option<PictureKey>,
+    scope_key: Option<(PictureKey, ve_render::scopes::ScopeKind)>,
     /// The platform's importer for frames left in GPU memory, if any.
     importer: Option<std::sync::Arc<dyn ve_render::TextureImporter>>,
     /// The monitor shows a frame still being decoded: keep drawing.
@@ -353,6 +363,11 @@ impl EditorUi {
             },
             dock,
             compositor: None,
+            pipelines: None,
+            warmed: 0,
+            monitor_key: None,
+            source_key: None,
+            scope_key: None,
             importer: None,
             catching_up: false,
             meter_db: [-96.0; 2],
@@ -446,6 +461,17 @@ impl EditorUi {
         let playing = self.engine.is_playing();
         let level = if !playing && self.settings.paused_full { 0 } else { self.view.quality.min(2) };
         let quality = ve_render::Quality { scale: [1.0, 0.5, 0.25][level], use_proxies: self.view.proxies };
+        let pipes = self.pipelines.get_or_insert_with(|| ve_render::EffectPipelines::new(device)).clone();
+        // Compile the document's effect shaders before they are on screen.
+        let doc = std::sync::Arc::as_ptr(&self.st.snapshot) as usize;
+        if doc != self.warmed {
+            self.warmed = doc;
+            let wanted: Vec<_> = ve_engine::frame::effect_shaders(&self.st.snapshot, &self.st.plugins).into_iter().filter(|e| !pipes.has(&e.key)).collect();
+            if !wanted.is_empty() {
+                let pipes = pipes.clone();
+                let _ = std::thread::Builder::new().name("ve-shaders".into()).spawn(move || pipes.warm(&wanted));
+            }
+        }
         if self.gpu.is_none() {
             self.gpu = Some((device.clone(), queue.clone()));
         }
@@ -486,10 +512,16 @@ impl EditorUi {
         // The Source monitor's picture, while a Source panel shows it.
         self.source_catching_up = false;
         if std::mem::take(&mut self.source_wanted) {
-            if let Some(frame) = self.engine.frame_of(Viewer::Source, quality) {
+            if let Some(frame) = self.engine.frame_of(Viewer::Source, quality).filter(|f| {
+                let key = PictureKey::of(&self.st.snapshot, f);
+                let new = self.source_key.as_ref() != Some(&key) || self.source_view.is_none();
+                self.source_key = Some(key);
+                self.source_catching_up = !f.complete;
+                new
+            }) {
                 let importer = &self.importer;
                 let comp = self.source_comp.get_or_insert_with(|| {
-                    let mut c = Compositor::new(device);
+                    let mut c = Compositor::with_pipelines(device, pipes.clone());
                     c.set_importer(importer.clone());
                     c
                 });
@@ -507,9 +539,21 @@ impl EditorUi {
             }
         }
         let Some(frame) = self.engine.frame(quality) else { return };
+        // Nothing new to show (the UI redrew for something else): keep the
+        // picture already on screen.
+        let key = PictureKey::of(&self.st.snapshot, &frame);
+        self.catching_up = !frame.complete;
+        if self.monitor_key.as_ref() == Some(&key) && self.monitor_view.is_some() {
+            let scope_due = self.scopes_wanted && self.scope_key.as_ref() != Some(&(key.clone(), self.view.scope));
+            if !scope_due {
+                self.scopes_wanted = false;
+                return;
+            }
+        }
+        self.monitor_key = Some(key.clone());
         let importer = &self.importer;
         let comp = self.compositor.get_or_insert_with(|| {
-            let mut c = Compositor::new(device);
+            let mut c = Compositor::with_pipelines(device, pipes.clone());
             c.set_importer(importer.clone());
             c
         });
@@ -523,8 +567,11 @@ impl EditorUi {
                 None => self.monitor = Some(renderer.register_texture(&view)),
             }
             self.monitor_view = Some(view);
-            // Scopes measure what the monitor shows, when a panel shows them.
-            if std::mem::take(&mut self.scopes_wanted) {
+            // Scopes measure what the monitor shows, when a panel shows them
+            // and it changed.
+            let scope_key = (key, self.view.scope);
+            if std::mem::take(&mut self.scopes_wanted) && self.scope_key.as_ref() != Some(&scope_key) {
+                self.scope_key = Some(scope_key);
                 let scopes = self.scopes.get_or_insert_with(|| ve_render::scopes::Scopes::new(device));
                 scopes.render(device, queue, tex, self.view.scope);
                 if let Some(out) = scopes.output() {
@@ -539,15 +586,10 @@ impl EditorUi {
         }
     }
 
+    /// Whether the host must draw every display refresh. Never: what moves
+    /// on its own asks for its frames when they are due (`next_frame_in`).
     pub fn animating(&self) -> bool {
-        self.engine.is_playing()
-            || self.st.busy.is_some()
-            || self.catching_up
-            || self.source_catching_up
-            || self.meter_db.iter().any(|d| *d > -95.0)
-            || self.track_db.values().flatten().any(|d| *d > -95.0)
-            || self.export.as_ref().is_some_and(|e| e.result().is_none())
-            || !self.thumb_uploads.is_empty()
+        false
     }
 
     /// The thumbnail of `asset` near source time `t`, once made and uploaded.
@@ -987,6 +1029,48 @@ impl EditorUi {
             ui.drag_ghost();
             ui.show_toasts();
         }
+        if let Some(dt) = self.next_frame_in() {
+            ui.request_repaint_in(dt);
+        }
+    }
+
+    /// When this window's next frame is due while something moves on its
+    /// own, at the rate it moves — not every refresh of a 120 Hz display.
+    /// Playing: the next frame boundary of the picture (faster when
+    /// shuttling); meters falling, a frame still decoding, thumbnails
+    /// arriving, work in progress: 30 Hz. `None`: nothing moves.
+    pub fn next_frame_in(&self) -> Option<f32> {
+        const STEADY: f32 = 1.0 / 30.0;
+        let playing = match self.st.transport.state() {
+            ve_engine::State::Playing { rate } if rate != 0.0 => {
+                let (t, r, _) = self.active_position();
+                let per_sec = (r.as_f64() * rate.abs()).max(1.0);
+                let pos = t.as_seconds_f64() * per_sec;
+                let frac = pos - pos.floor();
+                let mut left = if rate > 0.0 { 1.0 - frac } else { frac };
+                // The playhead follows the audio clock, which moves in steps
+                // of a few milliseconds: woken at a boundary it can still
+                // read just short of it. A boundary that close is the one
+                // just drawn; aim for the next, or every frame draws twice.
+                if left < 0.25 {
+                    left += 1.0;
+                }
+                // Just past the boundary, so the new frame is the one shown.
+                Some(((left / per_sec) as f32 + 0.002).max(1.0 / 240.0))
+            }
+            _ => None,
+        };
+        let steady = (self.st.busy.is_some()
+            || self.catching_up
+            || self.source_catching_up
+            || self.meter_db.iter().any(|d| *d > -95.0)
+            || self.track_db.values().flatten().any(|d| *d > -95.0)
+            || self.export.as_ref().is_some_and(|e| e.result().is_none())
+            || !self.thumb_uploads.is_empty())
+        .then_some(STEADY);
+        // While playing, everything else (meters, late frames) rides along
+        // with the picture's frames rather than adding its own.
+        playing.or(steady)
     }
 
     /// Tell the editor whether the OS is in dark mode (for Theme: System).
@@ -1291,6 +1375,46 @@ fn upload_rgba(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui
     );
     let id = renderer.register_texture(&tex.create_view(&Default::default()));
     (tex, id)
+}
+
+/// What a monitor's picture is made of: the document, the time, the size
+/// and source, and which decoded pictures it used. Equal keys draw equal
+/// pictures, so the monitor need not be drawn again.
+#[derive(Clone, PartialEq)]
+struct PictureKey {
+    document: usize,
+    time: Time,
+    size: (u32, u32),
+    proxies: bool,
+    complete: bool,
+    pictures: Vec<usize>,
+}
+
+impl PictureKey {
+    fn of(snapshot: &ve_engine::Snapshot, f: &ve_engine::Frame) -> Self {
+        fn walk(layers: &[ve_render::RenderLayer], out: &mut Vec<usize>) {
+            for l in layers {
+                match &l.source {
+                    ve_render::LayerSource::Frame(p) => out.push(std::sync::Arc::as_ptr(p) as usize),
+                    ve_render::LayerSource::Nested(n) => walk(&n.layers, out),
+                    ve_render::LayerSource::Shader(_) => {}
+                }
+                if let Some(t) = l.transition.as_ref().and_then(|t| t.incoming.as_ref()) {
+                    walk(std::slice::from_ref(t), out);
+                }
+            }
+        }
+        let mut pictures = Vec::new();
+        walk(&f.layers, &mut pictures);
+        PictureKey {
+            document: std::sync::Arc::as_ptr(snapshot) as usize,
+            time: f.plan.time,
+            size: (f.plan.width, f.plan.height),
+            proxies: f.plan.proxies,
+            complete: f.complete,
+            pictures,
+        }
+    }
 }
 
 /// `t` turned `turn` degrees clockwise (0, 90, 180, 270).

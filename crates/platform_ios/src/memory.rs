@@ -14,6 +14,8 @@ static LAST: AtomicU64 = AtomicU64::new(0);
 extern "C" fn warned(_this: *mut AnyObject, _sel: Sel, _note: *mut AnyObject) {
     let ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
     LAST.store(ms + 1, Ordering::Relaxed);
+    // Caches that can be rebuilt let go now, or iOS ends the app.
+    ve_ports::memory_warning();
 }
 
 pub fn since_last_warning() -> Option<Duration> {

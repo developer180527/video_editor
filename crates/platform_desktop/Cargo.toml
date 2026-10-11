@@ -12,3 +12,6 @@ platform_headless.workspace = true
 audio_cpal.workspace = true
 libloading.workspace = true
 dirs.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
