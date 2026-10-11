@@ -261,6 +261,43 @@ impl DockHost for App {
 
 /// Run the editor: the engine on its own thread, the UI in the shell.
 /// `touch` picks the tablet arrangement. Never returns on iPadOS.
+/// Profiling hooks, read from the environment so a trace can be recorded
+/// without touching the app (Mac: `VE_PROFILE_PLAY=1 video-editor x.veproj`;
+/// iPad: `devicectl … launch --environment-variables`):
+///
+/// - `VE_PROFILE_MEDIA=<file>`: import it (a bare name is looked up in the
+///   app's Documents) and put it on V1/A1 from the start;
+/// - `VE_PROFILE_PLAY=1`: play, looping, from the start;
+/// - `VE_PROFILE_FPS=1`: print frames built and presented each second.
+pub fn profile_setup(engine: &mut Engine) {
+    if let Some(name) = std::env::var_os("VE_PROFILE_MEDIA") {
+        let p = std::path::PathBuf::from(&name);
+        // A bare name: here, else the app's Documents (iOS: HOME is the container).
+        let docs = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Documents").join(&p));
+        let p = if p.is_absolute() || p.exists() { p } else { docs.unwrap_or(p) };
+        match engine.import(&p.to_string_lossy()) {
+            Ok(asset) => {
+                let snap = engine.snapshot();
+                if let (Some(seq), Some(a)) = (snap.active().cloned(), snap.assets.get(&asset).cloned()) {
+                    let len = a.info.as_ref().map_or(ve_time::Time::from_seconds(10), |i| i.duration);
+                    let (adds, items) = ve_engine::clips_for_asset(engine.plugins(), &seq, &a, len, seq.tracks.front().map(|t| t.id), seq.tracks.iter().find(|t| t.kind == ve_model::TrackKind::Audio).map(|t| t.id));
+                    for c in adds {
+                        let _ = engine.execute(c);
+                    }
+                    if let Ok(cmd) = ve_engine::edit::overwrite(&engine.snapshot(), seq.id, ve_time::Time::ZERO, &items) {
+                        let _ = engine.execute(cmd);
+                    }
+                }
+            }
+            Err(e) => eprintln!("VE_PROFILE_MEDIA {}: {e}", p.display()),
+        }
+    }
+    if std::env::var_os("VE_PROFILE_PLAY").is_some() {
+        engine.set_looping(true);
+        engine.play(1.0);
+    }
+}
+
 pub fn run(engine: Engine, touch: bool) {
     let store = Store(engine.platform().storage.clone());
     let settings = store.read(SETTINGS_FILE).and_then(|t| ve_ui::Settings::from_toml(&t)).unwrap_or_default();

@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 ve_engine.workspace = true
 ve_model.workspace = true
+ve_time.workspace = true
 ve_ui.workspace = true
 ve_ports.workspace = true
 serde.workspace = true

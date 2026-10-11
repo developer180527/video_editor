@@ -17,3 +17,10 @@ ve_time.workspace = true
 ve_builtins.workspace = true
 media_ffmpeg.workspace = true
 platform_desktop.workspace = true
+ve_render.workspace = true
+gpu_import.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

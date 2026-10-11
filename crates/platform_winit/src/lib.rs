@@ -300,6 +300,8 @@ struct Win {
     /// The swapchain shows the latest build: nothing to present until the
     /// UI changes or the window is resized.
     presented: bool,
+    /// Frames built and presented this second (VE_PROFILE_FPS=1 prints them).
+    stats: (u32, u32, Instant),
 }
 
 struct Shell<A: ShellApp> {
@@ -488,6 +490,7 @@ impl<A: ShellApp> Shell<A> {
                 release: None,
                 wake: None,
                 presented: false,
+                stats: (0, 0, Instant::now()),
             }),
         );
         id
@@ -582,6 +585,7 @@ impl<A: ShellApp> Shell<A> {
         let dark = w.window.theme().map(|t| t == winit::window::Theme::Dark);
         let mut ctx = ShellCtx { chrome, geometry, dark, ..ShellCtx::default() };
         if w.rebuild || self.app.animating() || dock_wants || w.ui.needs_frame_for(&info, w.idle) {
+            w.stats.0 += 1;
             w.idle = 0.0;
             w.rebuild = false;
             self.app.prepare(&g.gpu, &mut w.renderer, w.dock_id);
@@ -636,6 +640,16 @@ impl<A: ShellApp> Shell<A> {
             w.window.pre_present_notify();
             g.gpu.queue.present(frame);
             w.presented = true;
+            w.stats.1 += 1;
+            if w.stats.2.elapsed().as_secs_f32() >= 1.0 {
+                if std::env::var_os("VE_PROFILE_FPS").is_some() {
+                    let secs = w.stats.2.elapsed().as_secs_f64();
+                    let cpu = cpu_seconds();
+                    let used = PROFILE_CPU.with(|c| cpu - c.replace(cpu));
+                    eprintln!("[fps] window {:?}: {} built, {} presented, process {:.0}% CPU", w.dock_id, w.stats.0, w.stats.1, used / secs * 100.0);
+                }
+                w.stats = (0, 0, Instant::now());
+            }
         }
         // An output from a frame that was only re-presented is ignored.
         w.platform.apply(&w.window, &platform);
@@ -1005,4 +1019,22 @@ pub fn run<A: ShellApp + 'static>(cfg: ShellConfig, make_app: impl FnOnce(Waker)
         exit: false,
     };
     el.run_app(&mut shell).expect("event loop");
+}
+
+thread_local! {
+    /// Process CPU seconds at the last profile line.
+    static PROFILE_CPU: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// CPU time the whole process has used (every thread), seconds.
+fn cpu_seconds() -> f64 {
+    #[cfg(unix)]
+    unsafe {
+        let mut u: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut u);
+        let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        tv(u.ru_utime) + tv(u.ru_stime)
+    }
+    #[cfg(not(unix))]
+    0.0
 }

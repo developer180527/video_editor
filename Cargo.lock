@@ -615,6 +615,7 @@ dependencies = [
  "ve_engine",
  "ve_model",
  "ve_ports",
+ "ve_time",
  "ve_ui",
 ]
 
@@ -622,12 +623,17 @@ dependencies = [
 name = "editor_cli"
 version = "0.1.0"
 dependencies = [
+ "gpu_import",
+ "libc",
  "media_ffmpeg",
  "platform_desktop",
+ "pollster 1.0.1",
  "ve_builtins",
  "ve_engine",
  "ve_model",
+ "ve_render",
  "ve_time",
+ "wgpu",
 ]
 
 [[package]]
@@ -1885,6 +1891,7 @@ name = "platform_winit"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "libc",
  "libgui",
  "libgui_keymap",
  "libgui_wgpu",

@@ -20,5 +20,6 @@ fn main() {
             eprintln!("{path}: {e}");
         }
     }
+    editor_app::profile_setup(&mut engine);
     editor_app::run(engine, false);
 }

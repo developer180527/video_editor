@@ -8,5 +8,6 @@ fn main() {
     let media = Arc::new(media_ffmpeg::Ffmpeg::new());
     let mut engine = Engine::new(platform_ios::platform(media, ve_builtins::linked()));
     engine.new_project("Untitled");
+    editor_app::profile_setup(&mut engine);
     editor_app::run(engine, true);
 }
