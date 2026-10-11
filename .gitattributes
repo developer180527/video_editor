@@ -9,3 +9,6 @@ third_party/PINS text eol=lf
 *.wgsl          text eol=lf
 *.c             text eol=lf
 *.h             text eol=lf
+# Documents that tests compare byte for byte (sdk/WGSL_CONTRACT.md holds the
+# WGSL prelude verbatim).
+*.md            text eol=lf

@@ -326,6 +326,9 @@ pub struct VideoDec {
     /// consumer can import them; see [`AvNative`].
     native: bool,
     pub hardware: bool,
+    /// Where the next frame starts (after the last one handed out, or the
+    /// last seek): where a fall-back to software resumes.
+    resume_at: Time,
 }
 
 // The FFmpeg objects are owned exclusively by this decoder.
@@ -366,7 +369,45 @@ impl VideoDec {
             backoff: Time::ZERO,
             native,
             hardware,
+            resume_at: Time::ZERO,
         })
+    }
+
+    /// A hardware decoder that opened but cannot decode this stream (a size,
+    /// profile or level the driver refuses: FFmpeg says "not implemented"
+    /// only once frames are sent) is replaced by the software decoder, at
+    /// the same place. Only once: software errors are real errors.
+    fn fall_back_to_software(&mut self, why: MediaError) -> Result<(), MediaError> {
+        let (codec, _) = Codec::open(&self.input, self.stream, false).map_err(|_| why)?;
+        self.codec = codec;
+        self.hardware = false;
+        self.native = false;
+        let at = self.resume_at;
+        self.codec.seek(&self.input, self.stream, at + self.origin)?;
+        self.skip_until = Some(at);
+        self.sought = at;
+        self.backoff = Time::from_seconds(1);
+        unsafe { sys::av_frame_unref(self.held) };
+        Ok(())
+    }
+
+    /// Hand out `f` (convert it), noting where the next frame starts. A
+    /// hardware frame that cannot be read back triggers the software path.
+    fn emit(&mut self, f: *mut sys::AVFrame, start: Time) -> Result<Option<Option<VideoFrame>>, MediaError> {
+        let out = self.convert(f);
+        unsafe { sys::av_frame_unref(f) };
+        match out {
+            Ok(v) => {
+                self.resume_at = start + self.frame_dur;
+                Ok(Some(Some(v)))
+            }
+            Err(e) if self.hardware => {
+                self.resume_at = start;
+                self.fall_back_to_software(e)?;
+                Ok(None) // decode on, in software
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Decoded frame `decoded` as NV12 or P010, copied out of FFmpeg.
@@ -562,6 +603,7 @@ impl VideoDecoder for VideoDec {
         self.codec.seek(&self.input, self.stream, t + self.origin)?;
         self.skip_until = Some(t);
         self.sought = t;
+        self.resume_at = t;
         self.backoff = Time::from_seconds(1);
         unsafe { sys::av_frame_unref(self.held) };
         Ok(())
@@ -573,15 +615,27 @@ impl VideoDecoder for VideoDec {
 
     fn next_frame(&mut self) -> Result<Option<VideoFrame>, MediaError> {
         loop {
-            if !self.codec.next(&self.input, self.stream)? {
+            let more = match self.codec.next(&self.input, self.stream) {
+                Ok(m) => m,
+                Err(e) if self.hardware => {
+                    self.fall_back_to_software(e)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if !more {
                 if self.retry()? {
                     continue;
                 }
                 // Sought past the end: the last frame there is.
                 if self.skip_until.take().is_some() && unsafe { !(*self.held).buf[0].is_null() } {
-                    let out = self.convert(self.held);
-                    unsafe { sys::av_frame_unref(self.held) };
-                    return out.map(Some);
+                    let held = self.held;
+                    let pts = unsafe { if (*held).best_effort_timestamp != NOPTS { (*held).best_effort_timestamp } else { (*held).pts } };
+                    let start = to_time(pts, self.tb) - self.origin;
+                    match self.emit(held, start)? {
+                        Some(out) => return Ok(out),
+                        None => continue,
+                    }
                 }
                 return Ok(None);
             }
@@ -598,9 +652,10 @@ impl VideoDecoder for VideoDec {
                 // Frames that end before the target are decoded but not
                 // returned — unless the lead-in is wanted (scrubbing back).
                 if start + self.frame_dur <= target && self.lead_in {
-                    let out = self.convert(f);
-                    unsafe { sys::av_frame_unref(f) };
-                    return out.map(Some);
+                    match self.emit(f, start)? {
+                        Some(out) => return Ok(out),
+                        None => continue,
+                    }
                 }
                 if start + self.frame_dur <= target {
                     unsafe {
@@ -612,9 +667,10 @@ impl VideoDecoder for VideoDec {
                 self.skip_until = None;
                 unsafe { sys::av_frame_unref(self.held) };
             }
-            let out = self.convert(f);
-            unsafe { sys::av_frame_unref(f) };
-            return out.map(Some);
+            match self.emit(f, start)? {
+                Some(out) => return Ok(out),
+                None => continue,
+            }
         }
     }
 }
