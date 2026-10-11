@@ -174,6 +174,8 @@ struct Run {
     late: u32,
     gpu_ms: Vec<f64>,
     frame_ms: Vec<f64>,
+    /// How far the picture shown was from the one wanted, in frames.
+    behind: Vec<f64>,
 }
 
 impl Run {
@@ -185,10 +187,10 @@ impl Run {
             v.sort_by(f64::total_cmp);
             v[((v.len() - 1) as f64 * p).round() as usize]
         };
-        let (mut g, mut f) = (self.gpu_ms.clone(), self.frame_ms.clone());
+        let (mut g, mut f, mut b) = (self.gpu_ms.clone(), self.frame_ms.clone(), self.behind.clone());
         let secs = self.wall.as_secs_f64();
         println!(
-            "{:<34} {:>6.2} cores  {:>5.1} fps drawn  {:>4} late  frame p50 {:>5.1} p95 {:>5.1} ms  gpu p50 {:>5.1} p95 {:>5.1} ms",
+            "{:<34} {:>6.2} cores  {:>5.1} fps drawn  {:>4} late  frame p50 {:>5.1} p95 {:>5.1} ms  gpu p50 {:>5.1} p95 {:>5.1} ms  off by p50 {:>4.0} p95 {:>4.0} frames",
             self.name,
             self.cpu.as_secs_f64() / secs,
             self.drawn as f64 / secs,
@@ -197,6 +199,8 @@ impl Run {
             pct(&mut f, 0.95),
             pct(&mut g, 0.5),
             pct(&mut g, 0.95),
+            pct(&mut b, 0.5),
+            pct(&mut b, 0.95),
         );
     }
 }
@@ -209,7 +213,7 @@ fn monitor(name: &str, client: &EngineClient, gpu: &(wgpu::Device, wgpu::Queue),
     c.set_importer(gpu_import::importer());
     let mut last: Option<(i64, bool)> = None;
     let rate = client.snapshot().active().map_or(ve_time::Rate::FPS_24, |s| s.format.rate);
-    let mut run = Run { name: name.into(), wall: Duration::ZERO, cpu: Duration::ZERO, drawn: 0, late: 0, gpu_ms: vec![], frame_ms: vec![] };
+    let mut run = Run { name: name.into(), wall: Duration::ZERO, cpu: Duration::ZERO, drawn: 0, late: 0, gpu_ms: vec![], frame_ms: vec![], behind: vec![] };
     let (t0, c0) = (Instant::now(), cpu_time());
     let tick = Duration::from_secs_f64(1.0 / 60.0);
     let mut n = 0;
@@ -231,6 +235,10 @@ fn monitor(name: &str, client: &EngineClient, gpu: &(wgpu::Device, wgpu::Queue),
                 if !f.complete {
                     run.late += 1;
                 }
+                if let (Some(ve_render::LayerSource::Frame(p)), Some(want)) = (f.layers.first().map(|l| &l.source), f.plan.layers.first()) {
+                    let d = (p.pts.as_seconds_f64() - want.source_time.as_seconds_f64()).abs();
+                    run.behind.push(d * rate.as_f64());
+                }
                 run.frame_ms.push(start.elapsed().as_secs_f64() * 1000.0);
             }
         }
@@ -248,7 +256,7 @@ fn monitor(name: &str, client: &EngineClient, gpu: &(wgpu::Device, wgpu::Queue),
 fn idle(name: &str, secs: f64) -> Run {
     let (t0, c0) = (Instant::now(), cpu_time());
     std::thread::sleep(Duration::from_secs_f64(secs));
-    Run { name: name.into(), wall: t0.elapsed(), cpu: cpu_time() - c0, drawn: 0, late: 0, gpu_ms: vec![], frame_ms: vec![] }
+    Run { name: name.into(), wall: t0.elapsed(), cpu: cpu_time() - c0, drawn: 0, late: 0, gpu_ms: vec![], frame_ms: vec![], behind: vec![] }
 }
 
 pub fn bench(args: &[String]) -> i32 {
@@ -300,6 +308,19 @@ pub fn bench(args: &[String]) -> i32 {
             }
         })
         .print();
+        // Dragging the playhead slowly, as a hand does: two frames a tick,
+        // forwards then backwards. Late = shown as a stand-in.
+        for (dir, name) in [(1i64, "  dragging forward at 1/2"), (-1, "  dragging backward at 1/2")] {
+            let start = Time::from_seconds(secs as i64 / 2);
+            client.seek(start);
+            std::thread::sleep(Duration::from_millis(300));
+            let rate = client.snapshot().active().map_or(ve_time::Rate::FPS_24, |s| s.format.rate);
+            let f0 = start.to_frame(rate);
+            monitor(name, &client, &g, Quality { scale: 0.5, use_proxies: false }, run_secs.min(4.0), |c, n| {
+                c.seek(rate.frame_to_time(f0 + dir * n as i64));
+            })
+            .print();
+        }
         // Export: as fast as it goes (ProRes: a software encoder everywhere).
         let out = dir.join("bench_export.mov");
         let (t0, c0) = (Instant::now(), cpu_time());

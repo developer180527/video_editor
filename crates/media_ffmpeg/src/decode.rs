@@ -313,6 +313,8 @@ pub struct VideoDec {
     sw: *mut sys::AVFrame,
     sws: *mut sys::SwsContext,
     skip_until: Option<Time>,
+    /// Return the frames before a seek's target too (see `keep_lead_in`).
+    lead_in: bool,
     /// The last frame skipped on the way to a seek target, kept so a seek
     /// past the end still yields a picture (the last one).
     held: *mut sys::AVFrame,
@@ -358,6 +360,7 @@ impl VideoDec {
             sw: unsafe { sys::av_frame_alloc() },
             sws: ptr::null_mut(),
             skip_until: None,
+            lead_in: false,
             held: unsafe { sys::av_frame_alloc() },
             sought: Time::ZERO,
             backoff: Time::ZERO,
@@ -564,6 +567,10 @@ impl VideoDecoder for VideoDec {
         Ok(())
     }
 
+    fn keep_lead_in(&mut self, on: bool) {
+        self.lead_in = on;
+    }
+
     fn next_frame(&mut self) -> Result<Option<VideoFrame>, MediaError> {
         loop {
             if !self.codec.next(&self.input, self.stream)? {
@@ -588,7 +595,13 @@ impl VideoDecoder for VideoDec {
                     unsafe { sys::av_frame_unref(f) };
                     continue;
                 }
-                // Frames that end before the target are decoded but not returned.
+                // Frames that end before the target are decoded but not
+                // returned — unless the lead-in is wanted (scrubbing back).
+                if start + self.frame_dur <= target && self.lead_in {
+                    let out = self.convert(f);
+                    unsafe { sys::av_frame_unref(f) };
+                    return out.map(Some);
+                }
                 if start + self.frame_dur <= target {
                     unsafe {
                         sys::av_frame_unref(self.held);

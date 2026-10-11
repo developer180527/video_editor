@@ -10,8 +10,10 @@ use crate::Waker;
 
 /// How far ahead of the wanted time a worker decodes.
 const AHEAD: Time = Time::from_seconds(1);
-/// How much behind it keeps (scrubbing backwards a little stays cached).
-const BEHIND: Time = Time::from_ticks(254_016_000_000 / 2);
+/// How much behind it keeps: about a key-frame interval, so scrubbing
+/// backwards finds the frames a backward seek decoded on its way (the
+/// budget still decides; the oldest go first).
+const BEHIND: Time = Time::from_seconds(5);
 /// A request this far beyond the decoder seeks instead of decoding through.
 const SEEK_GAP: Time = Time::from_seconds(2);
 /// How much of an upcoming clip is decoded before the playhead gets there.
@@ -60,6 +62,12 @@ struct State {
     /// The last ask got a stand-in (a nearby frame) or nothing: the asker is
     /// waiting, so the frame it wants arriving is news worth a wake.
     waiting: bool,
+    /// The cache was emptied under the decoder: it starts again from the
+    /// wanted time rather than decoding on from where it had got to.
+    restart: bool,
+    /// The wanted time last moved back (a drag backwards): keep what is
+    /// behind it, not ahead.
+    backward: bool,
     frames: BTreeMap<Time, Arc<VideoFrame>>,
     bytes: usize,
     /// Size of the last frame decoded: what one more frame will cost.
@@ -118,11 +126,13 @@ impl State {
         self.upcoming().is_some_and(|u| k >= u && k < u + PREFETCH)
     }
 
-    /// Bytes of frames still wanted: `[t, t + AHEAD]` and the upcoming window.
+    /// Bytes of frames still wanted: `[t, t + AHEAD]` (or, moving back,
+    /// `[t - BEHIND, t]`) and the upcoming window.
     fn wanted_bytes(&self, t: Time) -> usize {
+        let (from, to) = if self.backward { (t - BEHIND, t) } else { (t, t + AHEAD) };
         self.frames
             .iter()
-            .filter(|(k, f)| self.protected(**k) || (**k <= t + AHEAD && f.pts + f.duration > t))
+            .filter(|(k, f)| self.protected(**k) || (**k <= to && f.pts + f.duration > from))
             .map(|(_, f)| frame_bytes(f))
             .sum()
     }
@@ -148,12 +158,17 @@ impl State {
         for k in old {
             self.remove(k);
         }
-        // Over budget: frames already shown go first (oldest first), then
-        // the farthest ahead. The frame showing at `t` and frames kept for
-        // an upcoming clip are never dropped.
+        // Over budget. Moving forwards: frames already shown go first
+        // (oldest first), then the farthest ahead. Moving backwards (a
+        // drag back): the far end of the look-ahead first, then the frames
+        // farthest behind — the ones just behind `t` are the very ones a
+        // backward drag wants next. The frame showing at `t` and frames
+        // kept for an upcoming clip are never dropped.
         while self.bytes > budget {
-            let behind = self.frames.iter().find(|(k, f)| !self.protected(**k) && f.pts + f.duration <= t).map(|(k, _)| *k);
-            let victim = behind.or_else(|| self.frames.iter().rev().find(|(k, f)| **k > t && f.pts > t && !self.protected(**k)).map(|(k, _)| *k));
+            let showing = |k: &Time, f: &Arc<VideoFrame>| *k <= t && t < (*k).max(f.pts) + f.duration;
+            let ahead = || self.frames.iter().rev().find(|(k, f)| **k > t && !showing(k, f) && !self.protected(**k)).map(|(k, _)| *k);
+            let behind = || self.frames.iter().find(|(k, f)| !self.protected(**k) && f.pts + f.duration <= t).map(|(k, _)| *k);
+            let victim = if self.backward { ahead().or_else(behind) } else { behind().or_else(ahead) };
             match victim {
                 Some(k) => self.remove(k),
                 None => break,
@@ -230,6 +245,9 @@ impl VideoPool {
             return Lookup::Failed(e.clone());
         }
         if st.want != Some(t) {
+            if let Some(prev) = st.want {
+                st.backward = t < prev;
+            }
             st.want = Some(t);
             src.wake.notify_all();
         }
@@ -289,13 +307,29 @@ impl VideoPool {
         }
     }
 
-    /// Drop every cached frame (memory warning).
+    /// Let go of cached frames (memory warning): all but the one each
+    /// source is showing now, and wake the decoders, so anything still
+    /// wanted is decoded again. (Without the wake, a paused monitor — whose
+    /// wanted time no longer changes — asked for a frame nobody would
+    /// decode, and stayed blank.)
     pub fn purge(&self) {
         for s in self.sources.lock().unwrap().values() {
             let mut st = s.state.lock().unwrap();
+            // Under the key it was stored with (a seek can file a frame
+            // under its target), so it still covers the wanted time.
+            let keep = st.want.and_then(|t| {
+                st.frames.range(..=t).next_back().filter(|(k, f)| t < (**k).max(f.pts) + f.duration).map(|(k, f)| (*k, f.clone()))
+            });
             st.frames.clear();
             st.bytes = 0;
             st.end = None;
+            st.restart = true;
+            if let Some((k, f)) = keep {
+                st.bytes = frame_bytes(&f);
+                st.frames.insert(k, f);
+            }
+            drop(st);
+            s.wake.notify_all();
         }
     }
 
@@ -330,6 +364,8 @@ fn worker(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef) {
     let mut dec: Option<(Resolved, Box<dyn VideoDecoder>)> = None;
     // Where the decoder will continue from (the end of its last frame).
     let mut pos: Option<Time> = None;
+    // The last place a seek went to: a seek to before it is a step back.
+    let mut last_seek: Option<Time> = None;
     // A wanted time the decoder cannot reach by decoding on: before it, or far ahead.
     let must_seek = |t: Time, pos: Option<Time>| pos.is_none_or(|p| t < p || t > p + SEEK_GAP);
     loop {
@@ -338,6 +374,9 @@ fn worker(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef) {
             loop {
                 if st.closed {
                     return;
+                }
+                if std::mem::take(&mut st.restart) {
+                    pos = None;
                 }
                 if let Some(t) = st.want {
                     let missing = st.covering(t).is_none() && st.past_end(t).is_none();
@@ -391,6 +430,10 @@ fn worker(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef) {
         let (_, d) = dec.as_mut().unwrap();
         // A freshly opened decoder is at its start: position it.
         if seek || pos.is_none() {
+            // Going backwards: keep the frames decoded on the way to the
+            // target, which are the ones the next steps back will want.
+            d.keep_lead_in(last_seek.is_some_and(|l| target < l));
+            last_seek = Some(target);
             if let Err(e) = d.seek(target) {
                 return fail(e.to_string());
             }
@@ -557,6 +600,27 @@ mod tests {
         let n = decoded.load(Ordering::SeqCst);
         assert!(n <= 30, "decoded {n} frames for a one-second look-ahead");
         assert!(matches!(pool.frame(&m, RATE.frame_to_time(24)), Lookup::Exact(_)), "frame 24 is within the second ahead");
+    }
+
+    /// A memory warning while paused: the frame on show survives, and a
+    /// paused monitor asking the same time again is served — the purge
+    /// left the decoders awake, not waiting for a new time.
+    #[test]
+    fn a_memory_purge_keeps_a_paused_monitor_showing() {
+        let (pool, _) = pool(0, 10_000, 100);
+        let m = MediaRef("x".into());
+        let t = RATE.frame_to_time(10);
+        pool.frame_blocking(&m, t, WAIT).unwrap();
+        pool.purge();
+        assert!(matches!(pool.frame(&m, t), Lookup::Exact(_)), "the frame on show is kept");
+        // The look-ahead after it is gone, and comes back without the wanted
+        // time changing (as when paused).
+        let ahead = RATE.frame_to_time(12);
+        let start = std::time::Instant::now();
+        while !matches!(pool.frame(&m, t), Lookup::Exact(_)) || !pool.sources.lock().unwrap().values().any(|s| s.state.lock().unwrap().covering(ahead).is_some()) {
+            assert!(start.elapsed() < WAIT, "nothing decoded again after the purge");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

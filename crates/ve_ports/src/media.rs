@@ -123,6 +123,10 @@ pub trait VideoDecoder: Send {
     fn seek(&mut self, t: Time) -> Result<(), MediaError>;
     /// The next frame in presentation order, or `None` at the end.
     fn next_frame(&mut self) -> Result<Option<VideoFrame>, MediaError>;
+    /// After a seek, also return the frames decoded between the key frame
+    /// it lands on and its target, instead of discarding them. Scrubbing
+    /// backwards wants exactly those next. A decoder that cannot ignores it.
+    fn keep_lead_in(&mut self, _on: bool) {}
 }
 
 pub trait AudioDecoder: Send {
