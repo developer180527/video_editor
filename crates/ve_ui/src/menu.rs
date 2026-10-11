@@ -55,6 +55,11 @@ pub enum Action {
     /// Show a panel that is closed, or close one that is open.
     TogglePanel(Tab),
     ResetWorkspace,
+    /// A new track above the video tracks / below the audio tracks.
+    AddVideoTrack,
+    AddAudioTrack,
+    /// Delete a track (its clips with it; undoable).
+    DeleteTrack(ve_model::TrackId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,6 +171,9 @@ impl EditorUi {
             .on("Apply Video Transition", Action::VideoTransition, primary(Key::D))
             .on("Apply Audio Transition", Action::AudioTransition, Some(Chord::primary(Key::D).shift()))
             .sep()
+            .on("Add Video Track", Action::AddVideoTrack, None)
+            .on("Add Audio Track", Action::AddAudioTrack, None)
+            .sep()
             .check("Use Proxies", Action::ToggleProxies, self.view.proxies);
         let seqs: Vec<(SequenceId, String)> = snap.sequences.values().map(|s| (s.id, s.name.clone())).collect();
         if seqs.len() > 1 {
@@ -266,7 +274,43 @@ impl EditorUi {
             Action::SaveLayout => self.requests.push(HostRequest::SaveLayout),
             Action::TogglePanel(tab) => dock::toggle_tab(&mut self.dock, *tab),
             Action::ResetWorkspace => dock::reset(&mut self.dock, self.touch),
+            Action::AddVideoTrack => self.add_track(ve_model::TrackKind::Video),
+            Action::AddAudioTrack => self.add_track(ve_model::TrackKind::Audio),
+            Action::DeleteTrack(t) => self.delete_track(*t),
         }
+    }
+
+    /// A new, empty track: video above the others (V3 after V2), audio below
+    /// them (A3 after A2). It is targeted, so the next edit can land on it.
+    pub(crate) fn add_track(&mut self, kind: ve_model::TrackKind) {
+        // The engine's document, not this frame's copy: two adds before the
+        // next frame must not land in the same place.
+        let Some(seq) = self.engine.snapshot().active().cloned() else { return };
+        let of_kind = seq.tracks.iter().filter(|t| t.kind == kind).count();
+        let prefix = if kind == ve_model::TrackKind::Video { "V" } else { "A" };
+        // Video tracks come first (V1 at the bottom), then audio (A1 down).
+        let index = match kind {
+            ve_model::TrackKind::Video => seq.tracks.iter().rposition(|t| t.kind == kind).map_or(0, |i| i + 1),
+            ve_model::TrackKind::Audio => seq.tracks.len(),
+        };
+        let track = ve_model::Track::new(kind, format!("{prefix}{}", of_kind + 1));
+        self.view.targeted.retain(|t| seq.track(*t).is_some_and(|(_, x)| x.kind != kind));
+        self.view.targeted.insert(track.id);
+        self.run(ve_engine::Command::AddTrack { sequence: seq.id, index, track: std::sync::Arc::new(track) });
+    }
+
+    /// Delete `track` and what is on it. The last track of a kind stays: a
+    /// sequence keeps somewhere to put video and sound.
+    pub(crate) fn delete_track(&mut self, track: ve_model::TrackId) {
+        let Some(seq) = self.engine.snapshot().active().cloned() else { return };
+        let Some((_, t)) = seq.track(track) else { return };
+        if seq.tracks.iter().filter(|x| x.kind == t.kind).count() <= 1 {
+            self.errors.push(format!("{} is the only {} track.", t.name, if t.kind == ve_model::TrackKind::Video { "video" } else { "audio" }));
+            return;
+        }
+        self.view.targeted.remove(&track);
+        self.view.selection.retain(|c| !t.clips.iter().any(|x| x.id == *c));
+        self.run(ve_engine::Command::RemoveTrack { sequence: seq.id, track });
     }
 
     /// The menus drawn in the window, when the host has no system menu bar.

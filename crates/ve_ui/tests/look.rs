@@ -301,6 +301,57 @@ fn long_names_and_narrow_effect_controls() {
     });
 }
 
+/// Tracks are added and deleted (one undo step each); a right-click on a
+/// clip opens its menu, and Disable disables it.
+#[test]
+fn tracks_and_timeline_context_menus() {
+    let mut app = editor();
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    for _ in 0..4 {
+        frame(&mut ui, &mut app);
+    }
+    // Right-click DockAtitlan (V2, 3 s - 8 s; V2 lane at y ≈ 815, 78 px a second from x ≈ 831).
+    for _ in 0..3 {
+        frame(&mut ui, &mut app);
+    }
+    let at = |s: f32| 831.0 + s * 78.0;
+    let clip = clip_on(&app, 1, 0);
+    assert!(clip.enabled);
+    ui.push(InputEvent::PointerMoved { pos: Vec2::new(at(5.0), 815.0) });
+    frame(&mut ui, &mut app);
+    ui.push(InputEvent::PointerButton { button: PointerButton::Secondary, pressed: true });
+    frame(&mut ui, &mut app);
+    ui.push(InputEvent::PointerButton { button: PointerButton::Secondary, pressed: false });
+    frame(&mut ui, &mut app);
+    assert!(matches!(app.view.timeline_menu, Some((ve_ui::Hit::Clip { .. }, _))), "the clip's menu is open");
+    // The first item, "Disable", just below the pointer.
+    ui.push(InputEvent::PointerMoved { pos: Vec2::new(at(5.0) + 30.0, 815.0 + 14.0) });
+    frame(&mut ui, &mut app);
+    ui.push(InputEvent::PointerButton { button: PointerButton::Primary, pressed: true });
+    frame(&mut ui, &mut app);
+    ui.push(InputEvent::PointerButton { button: PointerButton::Primary, pressed: false });
+    frame(&mut ui, &mut app);
+    wait(&app.engine, |_| !clip_on(&app, 1, 0).enabled);
+
+    let kinds = |app: &EditorUi| -> Vec<(TrackKind, String)> {
+        app.engine.snapshot().active().unwrap().tracks.iter().map(|t| (t.kind, t.name.clone())).collect()
+    };
+    let before = kinds(&app);
+    app.perform(&ve_ui::Action::AddVideoTrack);
+    wait(&app.engine, |_| kinds(&app).len() == before.len() + 1);
+    app.perform(&ve_ui::Action::AddAudioTrack);
+    wait(&app.engine, |_| kinds(&app).len() == before.len() + 2);
+    let after = kinds(&app);
+    let names: Vec<&str> = after.iter().map(|(_, n)| n.as_str()).collect();
+    assert_eq!(names, ["V1", "V2", "V3", "A1", "A2", "A3"], "V3 above the video tracks, A3 below the audio");
+    let v3 = app.engine.snapshot().active().unwrap().tracks[2].id;
+    app.perform(&ve_ui::Action::DeleteTrack(v3));
+    wait(&app.engine, |_| kinds(&app).len() == before.len() + 1);
+    app.engine.undo();
+    wait(&app.engine, |_| kinds(&app).len() == before.len() + 2);
+
+}
+
 /// The title bar as the editor draws it: the window buttons it draws
 /// itself (Windows, Linux), and room left for the OS's (macOS).
 #[test]

@@ -133,6 +133,27 @@ fn toolbar(ui: &mut Ui, app: &mut EditorUi) {
         if marker.clicked {
             app.add_marker();
         }
+        // Tracks: a click opens a small menu (right-click or hold on a track
+        // header does the same, with Delete).
+        let add = icon_button(ui, "add-track", Icon::AddTrack, 22.0, false);
+        ui.tooltip(&add, "Add Track");
+        let menu = add.id.with("menu");
+        if add.clicked {
+            ui.open_popup(menu, add.rect);
+        }
+        let picked = ui.popup(menu, 160.0, |ui| {
+            if ui.menu_item("Add Video Track").clicked {
+                return Some(ve_model::TrackKind::Video);
+            }
+            if ui.menu_item("Add Audio Track").clicked {
+                return Some(ve_model::TrackKind::Audio);
+            }
+            None
+        });
+        if let Some(Some(kind)) = picked {
+            ui.close_popup(menu);
+            app.add_track(kind);
+        }
         ui.flex();
         let tool = TOOLS.iter().find(|(_, t, _)| *t == app.view.tool).map(|x| x.2).unwrap_or("");
         ui.text_with(tool, 11.0, ui.theme.palette.text_faint);
@@ -189,7 +210,7 @@ fn tools(ui: &mut Ui, app: &mut EditorUi) {
 
 /// What the pointer is over.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Hit {
+pub enum Hit {
     Ruler,
     HBar,
     VBar,
@@ -487,6 +508,36 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
             _ if app.view.tool == Tool::Hand => Some(Drag::Hand),
             hit => press_tool(app, &snap_proj, &seq, &g, hit, r.mouse_pos, shift, alt),
         };
+    }
+
+    // --- right-click (or touch and hold): a menu for what is under it -------
+    if r.secondary_pressed {
+        app.view.drag = None;
+        let at = g.time_at(r.mouse_pos.x).round_to_frame(seq.format.rate);
+        // What a menu item acts on is what was clicked: select it first.
+        match under {
+            Hit::Clip { clip, .. } if !app.view.selection.contains(&clip) => {
+                app.view.selection = if app.view.linked { edit::linked(&snap_proj, clip) } else { vec![clip] };
+            }
+            Hit::Transition { clip, edge } => {
+                app.view.selected_transition = Some((clip, edge));
+                app.view.selection.clear();
+            }
+            Hit::Marker(id) => app.view.selected_marker = Some(id),
+            _ => {}
+        }
+        app.view.timeline_menu = Some((under, at));
+    }
+    if let Some((target, at)) = app.view.timeline_menu {
+        let info = MenuInfo::of(&snap_proj, &seq, target, &app.view.selection, app.engine.source().is_some());
+        match ui.context_menu(&r, |ui| menu_items(ui, &info, target, at)) {
+            Some(Some(choice)) => {
+                app.view.timeline_menu = None;
+                choose(app, &snap_proj, &seq, choice, at);
+            }
+            Some(None) => {}
+            None => app.view.timeline_menu = None,
+        }
     }
 
     // --- double-click: edit a marker, open a nest -------------------------------
@@ -1331,3 +1382,171 @@ fn meters(ui: &mut Ui, levels: [f32; 2]) {
         }
     });
 }
+
+/// What a timeline menu needs to know about its target, read before it is
+/// drawn (the menu itself borrows nothing).
+struct MenuInfo {
+    clip_on: bool,
+    clip_audio: bool,
+    clip_linked: bool,
+    is_nest: bool,
+    track_name: String,
+    track_kind: Option<TrackKind>,
+    can_delete_track: bool,
+    has_source: bool,
+}
+
+impl MenuInfo {
+    fn of(p: &Project, seq: &Sequence, target: Hit, selection: &[ClipId], has_source: bool) -> Self {
+        let clip = match target {
+            Hit::Clip { clip, .. } => p.find_clip(clip).map(|(_, _, c)| c.clone()),
+            _ => None,
+        };
+        let track = match target {
+            Hit::Clip { track, .. } | Hit::Header(track, _) | Hit::Empty(track) => seq.track(track).map(|(_, t)| t.clone()),
+            _ => None,
+        };
+        let kind = track.as_ref().map(|t| t.kind);
+        MenuInfo {
+            clip_on: clip.as_ref().is_none_or(|c| c.enabled),
+            clip_audio: kind == Some(TrackKind::Audio),
+            clip_linked: selection.iter().any(|id| p.find_clip(*id).is_some_and(|(_, _, c)| c.link.is_some())),
+            is_nest: clip.as_ref().is_some_and(|c| matches!(c.source, ClipSource::Sequence { .. })),
+            track_name: track.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+            track_kind: kind,
+            can_delete_track: kind.is_some_and(|k| seq.tracks.iter().filter(|t| t.kind == k).count() > 1),
+            has_source,
+        }
+    }
+}
+
+/// A timeline menu's choice.
+enum Choice {
+    Do(crate::menu::Action),
+    Lift,
+    RippleDelete,
+    Enable(bool),
+    Unlink,
+    OpenNest(ClipId),
+    TransitionDuration,
+    RemoveTransition(ClipId, Edge),
+    RemoveMarker(MarkerId),
+    MarkInHere,
+    MarkOutHere,
+}
+
+/// The items for what was right-clicked (or held, on touch).
+fn menu_items(ui: &mut Ui, info: &MenuInfo, target: Hit, _at: Time) -> Option<Choice> {
+    use crate::menu::Action as A;
+    let mut out = None;
+    let mut item = |ui: &mut Ui, label: &str, enabled: bool, c: Choice| {
+        if ui.menu_item_ex(label, None, enabled).clicked {
+            out = Some(c);
+        }
+    };
+    match target {
+        Hit::Clip { clip, .. } => {
+            item(ui, if info.clip_on { "Disable" } else { "Enable" }, true, Choice::Enable(!info.clip_on));
+            item(ui, "Unlink", info.clip_linked, Choice::Unlink);
+            ui.menu_separator();
+            item(ui, "Speed/Duration…", true, Choice::Do(A::Speed));
+            item(ui, "Frame Hold", !info.clip_audio, Choice::Do(A::FrameHold));
+            item(ui, "Audio Channels…", info.clip_audio, Choice::Do(A::Channels));
+            ui.menu_separator();
+            item(ui, "Nest…", true, Choice::Do(A::Nest));
+            if info.is_nest {
+                item(ui, "Open Nested Sequence", true, Choice::OpenNest(clip));
+            }
+            item(ui, "Match Frame", true, Choice::Do(A::MatchFrame));
+            item(ui, "Add Edit at Playhead", true, Choice::Do(A::AddEdit));
+            ui.menu_separator();
+            item(ui, "Apply Video Transition", !info.clip_audio, Choice::Do(A::VideoTransition));
+            item(ui, "Apply Audio Transition", info.clip_audio, Choice::Do(A::AudioTransition));
+            ui.menu_separator();
+            item(ui, "Clear", true, Choice::Lift);
+            item(ui, "Ripple Delete", true, Choice::RippleDelete);
+        }
+        Hit::Transition { clip, edge } => {
+            item(ui, "Set Duration…", true, Choice::TransitionDuration);
+            item(ui, "Clear", true, Choice::RemoveTransition(clip, edge));
+        }
+        Hit::Marker(id) => {
+            item(ui, "Edit Marker…", true, Choice::Do(A::EditMarker));
+            item(ui, "Clear Marker", true, Choice::RemoveMarker(id));
+        }
+        Hit::Ruler => {
+            item(ui, "Mark In Here", true, Choice::MarkInHere);
+            item(ui, "Mark Out Here", true, Choice::MarkOutHere);
+            item(ui, "Clear In and Out", true, Choice::Do(A::ClearInOut));
+            ui.menu_separator();
+            item(ui, "Add Marker", true, Choice::Do(A::AddMarker));
+        }
+        Hit::Header(track, _) | Hit::Empty(track) => {
+            item(ui, "Add Video Track", true, Choice::Do(A::AddVideoTrack));
+            item(ui, "Add Audio Track", true, Choice::Do(A::AddAudioTrack));
+            ui.menu_separator();
+            let label = format!("Delete Track {}", info.track_name);
+            item(ui, &label, info.can_delete_track, Choice::Do(A::DeleteTrack(track)));
+            if info.has_source && info.track_kind.is_some() {
+                ui.menu_separator();
+                item(ui, "Insert from Source", true, Choice::Do(A::InsertFromSource));
+                item(ui, "Overwrite from Source", true, Choice::Do(A::OverwriteFromSource));
+            }
+        }
+        Hit::Cut { .. } | Hit::HBar | Hit::VBar | Hit::Nothing => {
+            item(ui, "Add Video Track", true, Choice::Do(A::AddVideoTrack));
+            item(ui, "Add Audio Track", true, Choice::Do(A::AddAudioTrack));
+        }
+    }
+    out
+}
+
+/// Carry out a timeline menu's choice.
+fn choose(app: &mut EditorUi, p: &Project, seq: &Sequence, c: Choice, at: Time) {
+    let sel = app.view.selection.clone();
+    match c {
+        Choice::Do(a) => app.perform(&a),
+        Choice::Lift => {
+            app.view.selection.clear();
+            let r = edit::lift(p, &sel, app.view.linked);
+            app.run_edit(r);
+        }
+        Choice::RippleDelete => {
+            app.view.selection.clear();
+            let r = edit::ripple_delete(p, &sel, app.view.linked);
+            app.run_edit(r);
+        }
+        Choice::Enable(on) => {
+            let r = edit::set_enabled(p, &sel, on);
+            app.run_edit(r);
+        }
+        Choice::Unlink => {
+            let r = edit::unlink(p, &sel);
+            app.run_edit(r);
+        }
+        Choice::OpenNest(clip) => {
+            if let Some(ClipSource::Sequence { sequence, .. }) = p.find_clip(clip).map(|(_, _, c)| c.source.clone()) {
+                app.open_sequence(sequence);
+            }
+        }
+        // Effect Controls shows a selected transition's duration.
+        Choice::TransitionDuration => match app.dock.find_tab(|t| *t == crate::Tab::EffectControls) {
+            Some(at) => {
+                app.dock.focus_tab(at);
+            }
+            None => crate::dock::toggle_tab(&mut app.dock, crate::Tab::EffectControls),
+        },
+        Choice::RemoveTransition(clip, edge) => app.remove_transition(clip, edge),
+        Choice::RemoveMarker(id) => app.put_marker(id, None),
+        Choice::MarkInHere | Choice::MarkOutHere => {
+            let mut marks = seq.marks.clone();
+            if matches!(c, Choice::MarkInHere) {
+                marks.in_point = Some(at);
+            } else {
+                marks.out_point = Some(at + seq.format.rate.frame_duration());
+            }
+            app.run(Command::SetMarks { owner: ve_engine::MarksOwner::Sequence(seq.id), marks });
+        }
+    }
+}
+

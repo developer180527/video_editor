@@ -41,6 +41,7 @@ use ve_time::{Rate, Time, Timecode};
 pub use dock::Tab;
 pub use features::Dialog;
 pub use menu::{Action, Entry, Menu, MenuItem};
+pub use timeline::Hit;
 pub use settings::{Settings, ThemeMode};
 pub use theme::{theme, theme_for, Appearance};
 
@@ -199,6 +200,8 @@ pub struct View {
     pub selected_marker: Option<MarkerId>,
     /// A transition's duration, in frames, while it is being dragged.
     pub transition_frames: Option<f32>,
+    /// The timeline's open context menu: what it was opened on, and where.
+    pub timeline_menu: Option<(timeline::Hit, Time)>,
     /// The undo step a drag of a transition's parameter is building.
     pub transition_gesture: Option<u64>,
     /// Effect parameters whose keyframe graph is open.
@@ -352,6 +355,7 @@ impl EditorUi {
                 selected_marker: None,
                 transition_frames: None,
                 transition_gesture: None,
+                timeline_menu: None,
                 graphs: HashSet::new(),
                 graph_key: None,
                 graph_drag: None,

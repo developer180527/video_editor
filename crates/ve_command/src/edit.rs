@@ -291,6 +291,44 @@ pub fn set_transition(p: &Project, clip: ClipId, edge: Edge, transition: Option<
     b.finish("Transition")
 }
 
+/// Turn `clips` on or off (an off clip is skipped in playback and export).
+/// One undo step for the lot.
+pub fn set_enabled(p: &Project, clips: &[ClipId], on: bool) -> Result<Command, CommandError> {
+    let mut b = Builder::new(p);
+    for &clip in clips {
+        let (_, _, old) = find(b.project(), clip)?;
+        if old.enabled != on {
+            let mut new = (*old).clone();
+            new.enabled = on;
+            b.push(Command::SetClip { clip: Arc::new(new) })?;
+        }
+    }
+    b.finish(if on { "Enable" } else { "Disable" })
+}
+
+/// Unlink `clips` from their linked partners (a picture and its sound),
+/// so each moves and trims on its own. One undo step.
+pub fn unlink(p: &Project, clips: &[ClipId]) -> Result<Command, CommandError> {
+    let mut b = Builder::new(p);
+    let mut all: Vec<ClipId> = Vec::new();
+    for &c in clips {
+        for l in linked(p, c) {
+            if !all.contains(&l) {
+                all.push(l);
+            }
+        }
+    }
+    for clip in all {
+        let (_, _, old) = find(b.project(), clip)?;
+        if old.link.is_some() {
+            let mut new = (*old).clone();
+            new.link = None;
+            b.push(Command::SetClip { clip: Arc::new(new) })?;
+        }
+    }
+    b.finish("Unlink")
+}
+
 /// Show multicam `angle` (a video track of the nested sequence) from this
 /// clip on; `None` shows the whole nest. Cut first to switch mid-clip.
 pub fn set_angle(p: &Project, clip: ClipId, angle: Option<u32>) -> Result<Command, CommandError> {
