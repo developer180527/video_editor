@@ -86,7 +86,16 @@ struct State {
 
 impl State {
     fn covering(&self, t: Time) -> Option<&Arc<VideoFrame>> {
-        self.frames.range(..=t).next_back().filter(|(k, f)| t < (**k).max(f.pts) + f.duration).map(|(_, f)| f)
+        let (k, f) = self.frames.range(..=t).next_back()?;
+        let end = (*k).max(f.pts) + f.duration;
+        if t < end {
+            return Some(f);
+        }
+        // Frames whose stored lengths are rounded (to the stream's time
+        // base, in decode order) leave slivers between them: a frame shows
+        // until the next one starts when that is within a sliver of its end.
+        let next = self.frames.range((std::ops::Bound::Excluded(t), std::ops::Bound::Unbounded)).next()?;
+        (*next.0 <= end + sliver(f)).then_some(f)
     }
 
     fn nearest(&self, t: Time) -> Option<&Arc<VideoFrame>> {
@@ -108,12 +117,16 @@ impl State {
     /// Frames decoded at or after `t`, up to `AHEAD`.
     fn ready_ahead(&self, t: Time) -> Time {
         let mut end = t;
-        for (pts, f) in self.frames.range(..=t + AHEAD) {
-            if *pts <= end && pts.ticks() + f.duration.ticks() > end.ticks() {
+        let from = self.frames.range(..=t).next_back().map_or(t, |(k, _)| *k);
+        for (pts, f) in self.frames.range(from..) {
+            if end >= t + AHEAD || *pts > end + sliver(f) {
+                break;
+            }
+            if pts.ticks() + f.duration.ticks() > end.ticks() {
                 end = *pts + f.duration;
             }
         }
-        end - t
+        (end - t).min(AHEAD)
     }
 
     /// The upcoming start, while its hint is fresh.
@@ -165,9 +178,10 @@ impl State {
         // backward drag wants next. The frame showing at `t` and frames
         // kept for an upcoming clip are never dropped.
         while self.bytes > budget {
-            let showing = |k: &Time, f: &Arc<VideoFrame>| *k <= t && t < (*k).max(f.pts) + f.duration;
+            let shown = self.covering(t).map(|f| f.pts);
+            let showing = |k: &Time, f: &Arc<VideoFrame>| (*k <= t && t < (*k).max(f.pts) + f.duration) || shown == Some(f.pts);
             let ahead = || self.frames.iter().rev().find(|(k, f)| **k > t && !showing(k, f) && !self.protected(**k)).map(|(k, _)| *k);
-            let behind = || self.frames.iter().find(|(k, f)| !self.protected(**k) && f.pts + f.duration <= t).map(|(k, _)| *k);
+            let behind = || self.frames.iter().find(|(k, f)| !self.protected(**k) && f.pts + f.duration <= t && !showing(k, f)).map(|(k, _)| *k);
             let victim = if self.backward { ahead().or_else(behind) } else { behind().or_else(ahead) };
             match victim {
                 Some(k) => self.remove(k),
@@ -350,6 +364,12 @@ impl Drop for VideoPool {
     }
 }
 
+/// The most two neighbouring frames may be apart and still count as
+/// back to back: a quarter of a frame.
+fn sliver(f: &VideoFrame) -> Time {
+    Time::from_ticks(f.duration.ticks() / 4)
+}
+
 fn worker(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef) {
     let fail = |msg: String| {
         src.state.lock().unwrap().error = Some(msg);
@@ -501,6 +521,8 @@ mod tests {
         count: i64,
         decoded: Arc<AtomicUsize>,
         alive: Arc<AtomicUsize>,
+        /// Ticks each frame's stored length falls short of the next frame.
+        trim: i64,
     }
 
     struct FakeDec {
@@ -509,6 +531,7 @@ mod tests {
         next: i64,
         end: i64,
         decoded: Arc<AtomicUsize>,
+        trim: i64,
     }
 
     impl Drop for FakeDec {
@@ -532,7 +555,7 @@ mod tests {
             self.next += 1;
             Ok(Some(VideoFrame {
                 pts,
-                duration: RATE.frame_duration(),
+                duration: RATE.frame_duration() - Time::from_ticks(self.trim),
                 width: 1,
                 height: 1,
                 format: PixelFormat::Nv12,
@@ -551,7 +574,7 @@ mod tests {
         }
         fn open_video(&self, _: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError> {
             self.alive.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(FakeDec { alive: self.alive.clone(), first: self.first, next: self.first, end: self.first + self.count, decoded: self.decoded.clone() }))
+            Ok(Box::new(FakeDec { alive: self.alive.clone(), first: self.first, next: self.first, end: self.first + self.count, decoded: self.decoded.clone(), trim: self.trim }))
         }
         fn open_audio(&self, _: &Resolved, _: usize, _: u32, _: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
             unimplemented!()
@@ -564,8 +587,12 @@ mod tests {
     use crate::fakes::AnyFile;
 
     fn pool(first: i64, count: i64, budget_frames: usize) -> (Arc<VideoPool>, Arc<AtomicUsize>) {
+        pool_trimmed(first, count, budget_frames, 0)
+    }
+
+    fn pool_trimmed(first: i64, count: i64, budget_frames: usize, trim: i64) -> (Arc<VideoPool>, Arc<AtomicUsize>) {
         let decoded = Arc::new(AtomicUsize::new(0));
-        let media = Arc::new(Fake { first, count, decoded: decoded.clone(), alive: Arc::new(AtomicUsize::new(0)) });
+        let media = Arc::new(Fake { first, count, decoded: decoded.clone(), alive: Arc::new(AtomicUsize::new(0)), trim });
         (VideoPool::new(Arc::new(AnyFile), media, budget_frames * FRAME), decoded)
     }
 
@@ -623,6 +650,24 @@ mod tests {
         }
     }
 
+    /// A file whose frames are stored a little shorter than the distance
+    /// between them (lengths rounded to a 1/90000 s time base, as in real
+    /// movies): a time in the sliver between two frames is the earlier
+    /// frame's. It used to be "not decoded yet", and the decoder ran on
+    /// through the rest of the file looking for it, stalling playback.
+    #[test]
+    fn a_sliver_between_frames_is_the_earlier_frame() {
+        let (pool, decoded) = pool_trimmed(0, 10_000, 100, 1000);
+        let m = MediaRef("x".into());
+        pool.frame_blocking(&m, Time::ZERO, WAIT).unwrap();
+        let gap = RATE.frame_to_time(5) - Time::from_ticks(500);
+        let f = pool.frame_blocking(&m, gap, WAIT).unwrap();
+        assert_eq!(f.pts, RATE.frame_to_time(4));
+        std::thread::sleep(Duration::from_millis(300));
+        let n = decoded.load(Ordering::SeqCst);
+        assert!(n <= 60, "decoded {n} frames: it ran on past the look-ahead");
+    }
+
     #[test]
     fn before_the_first_frame_shows_the_first_frame() {
         let (pool, _) = pool(3, 50, 100);
@@ -658,7 +703,7 @@ mod tests {
     #[test]
     fn idle_sources_close_their_decoders() {
         let alive = Arc::new(AtomicUsize::new(0));
-        let media = Arc::new(Fake { first: 0, count: 10_000, decoded: Arc::new(AtomicUsize::new(0)), alive: alive.clone() });
+        let media = Arc::new(Fake { first: 0, count: 10_000, decoded: Arc::new(AtomicUsize::new(0)), alive: alive.clone(), trim: 0 });
         let pool = VideoPool::new(Arc::new(AnyFile), media, 1000 * FRAME);
         let m = MediaRef("x".into());
         pool.frame_blocking(&m, Time::ZERO, WAIT).unwrap();
