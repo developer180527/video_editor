@@ -211,6 +211,7 @@ pub fn platform(media: Arc<dyn MediaBackend>, linked: Vec<fn() -> Box<dyn Native
         storage: Arc::new(storage()),
         media,
         audio: Arc::new(audio_cpal::CpalAudio),
+        audio_in: Arc::new(audio_cpal::CpalInput),
         libraries: Arc::new(DesktopLibraries { linked }),
         processes: Some(Arc::new(DesktopProcesses)),
     }

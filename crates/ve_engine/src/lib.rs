@@ -18,9 +18,10 @@ mod clips;
 pub mod export;
 pub mod frame;
 mod project_file;
+mod record;
 mod viewer;
 
-pub use client::{EngineClient, Published, Waker};
+pub use client::{EngineClient, Published, RecordingStatus, Waker};
 pub use clips::{clips_for_asset, default_value, make_clip, make_generator_clip, make_sequence_clip};
 pub use ve_command::edit;
 pub use ve_plugin_host::intrinsic;
@@ -368,6 +369,22 @@ impl Engine {
         let asset = Asset { id: AssetId::new(), name: storage.display_name(&media), media, info: Some(info), variants: Vec::new(), marks: Default::default() };
         let id = asset.id;
         self.execute(Command::AddAsset { asset: Arc::new(asset) })?;
+        Ok(id)
+    }
+
+    /// Import `picked` and lay its sound on `track` at `at` in the active
+    /// sequence, overwriting what is there (a finished voice-over).
+    pub fn import_placed(&mut self, picked: &str, track: TrackId, at: Time) -> Result<AssetId, EngineError> {
+        let id = self.import(picked)?;
+        let asset = self.project.assets.get(&id).cloned().ok_or(CommandError::NotFound("asset"))?;
+        let seq = self.project.active().cloned().ok_or(CommandError::NotFound("sequence"))?;
+        let duration = asset.info.as_ref().map_or(Time::ZERO, |i| i.duration);
+        if duration > Time::ZERO {
+            let (adds, items) = clips_for_asset(&self.plugins, &seq, &asset, duration, None, Some(track));
+            let edit = edit::overwrite(&self.project, seq.id, at, &items)?;
+            let cmd = if adds.is_empty() { edit } else { Command::Batch { label: edit.label(), commands: adds.into_iter().chain([edit]).collect() } };
+            self.execute(cmd)?;
+        }
         Ok(id)
     }
 

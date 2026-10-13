@@ -59,6 +59,8 @@ enum Request {
     Undo,
     Redo,
     Import(Vec<String>),
+    /// Import a file and lay it on `track` at `at` (a finished voice-over).
+    ImportPlaced { picked: String, track: ve_model::TrackId, at: Time },
     NewProject(String),
     SaveAs(MediaRef),
     Open(MediaRef),
@@ -82,6 +84,17 @@ pub struct EngineClient {
     shared: Arc<Mutex<Published>>,
     events: mpsc::Receiver<Event>,
     watch: Mutex<Watchdog>,
+    recording: Mutex<Option<crate::record::Recording>>,
+}
+
+/// A voice-over in progress, as the UI shows it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecordingStatus {
+    pub track: ve_model::TrackId,
+    pub start: Time,
+    pub elapsed: Time,
+    /// Loudest input since the last look (linear).
+    pub peak: f32,
 }
 
 /// Watches the playback clock while playing. The playhead follows the sound
@@ -202,6 +215,12 @@ impl Engine {
                                 }
                             }
                         }
+                        Request::ImportPlaced { picked, track, at } => {
+                            flush(&mut self, Some("Adding the voice-over".into()), adopted);
+                            if let Err(err) = self.import_placed(&picked, track, at) {
+                                let _ = etx.send(Event::Error(format!("{picked}: {err}")));
+                            }
+                        }
                         Request::NewProject(n) => self.new_project(&n),
                         Request::SaveAs(r) => {
                             if let Err(err) = self.save_as(r) {
@@ -243,7 +262,7 @@ impl Engine {
                 }
             })
             .expect("engine thread");
-        EngineClient { platform, video, stills, tx, shared, events, watch: Mutex::new(Watchdog::default()) }
+        EngineClient { platform, video, stills, tx, shared, events, watch: Mutex::new(Watchdog::default()), recording: Mutex::new(None) }
     }
 }
 
@@ -285,6 +304,46 @@ impl EngineClient {
 
     pub fn redo(&self) {
         self.send(Request::Redo);
+    }
+
+    /// Start recording a voice-over onto `track` from `at`: the microphone
+    /// opens and the sequence plays from there, so it can be spoken to.
+    pub fn start_recording(&self, track: ve_model::TrackId, at: Time) -> Result<(), String> {
+        let mut slot = self.recording.lock().unwrap();
+        if slot.is_some() {
+            return Ok(());
+        }
+        *slot = Some(crate::record::Recording::start(&self.platform, track, at)?);
+        drop(slot);
+        self.seek(at);
+        self.play(1.0);
+        Ok(())
+    }
+
+    /// Stop recording: playback stops, the take is finished, imported and
+    /// laid on its track where it began (one undo step).
+    pub fn stop_recording(&self) -> Result<(), String> {
+        let Some(rec) = self.recording.lock().unwrap().take() else { return Ok(()) };
+        self.stop();
+        let (track, at) = (rec.track, rec.start);
+        if let Some(path) = rec.finish()? {
+            self.send(Request::ImportPlaced { picked: path.to_string_lossy().into_owned(), track, at });
+        }
+        Ok(())
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recording.lock().unwrap().is_some()
+    }
+
+    /// The track a voice-over is being recorded onto.
+    pub fn recording_track(&self) -> Option<ve_model::TrackId> {
+        self.recording.lock().unwrap().as_ref().map(|r| r.track)
+    }
+
+    /// The take in progress. Reading it resets its peak meter.
+    pub fn recording(&self) -> Option<RecordingStatus> {
+        self.recording.lock().unwrap().as_ref().map(|r| RecordingStatus { track: r.track, start: r.start, elapsed: r.elapsed(), peak: r.take_peak() })
     }
 
     pub fn import(&self, paths: Vec<String>) {

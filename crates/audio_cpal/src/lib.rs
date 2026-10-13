@@ -143,3 +143,61 @@ impl AudioStream for CpalStream {
         self.config
     }
 }
+
+/// [`AudioInput`] on cpal: the default input device, at its own format.
+#[derive(Default)]
+pub struct CpalInput;
+
+pub struct CpalCapture {
+    /// Dropping it ends the stream's thread (and the stream).
+    _stop: mpsc::Sender<()>,
+    config: AudioConfig,
+}
+
+impl AudioInput for CpalInput {
+    fn preferred(&self) -> Option<AudioConfig> {
+        let device = cpal::default_host().default_input_device()?;
+        let c = device.default_input_config().ok()?;
+        Some(AudioConfig { sample_rate: c.sample_rate(), channels: c.channels(), buffer_frames: 512 })
+    }
+
+    fn open(&self, mut capture: CaptureCallback) -> Result<Box<dyn CaptureStream>, AudioError> {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<AudioConfig, AudioError>>();
+        std::thread::Builder::new()
+            .name("ve-capture".into())
+            .spawn(move || {
+                let open = || -> Result<(cpal::Stream, AudioConfig), AudioError> {
+                    let device = cpal::default_host().default_input_device().ok_or(AudioError::NoDevice)?;
+                    let c = device.default_input_config().map_err(|e| AudioError::Other(e.to_string()))?;
+                    let config = AudioConfig { sample_rate: c.sample_rate(), channels: c.channels(), buffer_frames: 512 };
+                    let sc = cpal::StreamConfig { channels: c.channels(), sample_rate: c.sample_rate(), buffer_size: cpal::BufferSize::Default };
+                    let stream = device
+                        .build_input_stream(sc, move |buf: &[f32], _| capture(buf), |e| eprintln!("audio input error: {e}"), None)
+                        .map_err(|e| AudioError::Other(e.to_string()))?;
+                    stream.play().map_err(|e| AudioError::Other(e.to_string()))?;
+                    Ok((stream, config))
+                };
+                match open() {
+                    Ok((stream, config)) => {
+                        let _ = ready_tx.send(Ok(config));
+                        // Until the `CpalCapture` is dropped.
+                        let _ = stopped.recv();
+                        drop(stream);
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                    }
+                }
+            })
+            .map_err(|e| AudioError::Other(e.to_string()))?;
+        let config = ready_rx.recv().map_err(|_| AudioError::Other("audio input thread died".into()))??;
+        Ok(Box::new(CpalCapture { _stop: stop, config }))
+    }
+}
+
+impl CaptureStream for CpalCapture {
+    fn config(&self) -> AudioConfig {
+        self.config
+    }
+}

@@ -58,6 +58,8 @@ pub enum Action {
     /// A new track above the video tracks / below the audio tracks.
     AddVideoTrack,
     AddAudioTrack,
+    /// Start (or stop) recording a voice-over on the targeted audio track.
+    RecordVoiceOver,
     /// Delete a track (its clips with it; undoable).
     DeleteTrack(ve_model::TrackId),
 }
@@ -174,6 +176,8 @@ impl EditorUi {
             .on("Add Video Track", Action::AddVideoTrack, None)
             .on("Add Audio Track", Action::AddAudioTrack, None)
             .sep()
+            .check("Record Voice-over", Action::RecordVoiceOver, self.engine.is_recording())
+            .sep()
             .check("Use Proxies", Action::ToggleProxies, self.view.proxies);
         let seqs: Vec<(SequenceId, String)> = snap.sequences.values().map(|s| (s.id, s.name.clone())).collect();
         if seqs.len() > 1 {
@@ -276,7 +280,27 @@ impl EditorUi {
             Action::ResetWorkspace => dock::reset(&mut self.dock, self.touch),
             Action::AddVideoTrack => self.add_track(ve_model::TrackKind::Video),
             Action::AddAudioTrack => self.add_track(ve_model::TrackKind::Audio),
+            Action::RecordVoiceOver => {
+                // The targeted audio track, else the first.
+                let seq = self.engine.snapshot().active().cloned();
+                let track = seq.and_then(|s| {
+                    let audio = || s.tracks.iter().filter(|t| t.kind == ve_model::TrackKind::Audio);
+                    audio().find(|t| self.view.targeted.contains(&t.id)).or_else(|| audio().next()).map(|t| t.id)
+                });
+                if let Some(t) = track {
+                    self.toggle_recording(t);
+                }
+            }
             Action::DeleteTrack(t) => self.delete_track(*t),
+        }
+    }
+
+    /// Record a voice-over on `track` from the playhead, or stop the one
+    /// in progress (on whichever track).
+    pub(crate) fn toggle_recording(&mut self, track: ve_model::TrackId) {
+        let r = if self.engine.is_recording() { self.engine.stop_recording() } else { self.engine.start_recording(track, self.playhead) };
+        if let Err(e) = r {
+            self.errors.push(e);
         }
     }
 

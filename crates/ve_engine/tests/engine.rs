@@ -382,3 +382,41 @@ fn the_source_monitor_has_its_own_playhead() {
     assert!(e.source().is_none());
     assert_eq!(e.viewer(), Viewer::Program);
 }
+
+/// A voice-over through the client: the (stand-in) microphone records a
+/// take into Documents/Recordings, which lands on the armed audio track
+/// where recording began, as long as it ran.
+#[test]
+fn voice_over_records_onto_the_armed_track() {
+    let dir = tmp("voice-over");
+    let mut e = Engine::new(platform_headless::platform(&dir, Arc::new(media_ffmpeg::Ffmpeg::new())));
+    e.new_project("Test");
+    let client = e.spawn(Arc::new(|| {}));
+    let a1 = client.snapshot().active().unwrap().tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap().id;
+    client.start_recording(a1, Time::from_seconds(1)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let status = client.recording().expect("recording");
+    assert_eq!(status.track, a1);
+    assert!(status.elapsed > Time::from_ticks(ve_time::TICKS_PER_SECOND / 5), "{:?}", status.elapsed);
+    assert!(status.peak > 0.2, "the input is metered: {}", status.peak);
+    client.stop_recording().unwrap();
+    assert!(client.recording().is_none());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let clip = loop {
+        let snap = client.snapshot();
+        let track = snap.active().unwrap().tracks.iter().find(|t| t.id == a1).unwrap().clone();
+        if let Some(c) = track.clips.front() {
+            break c.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "the take never reached the track");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(clip.timeline_start, Time::from_seconds(1));
+    let secs = clip.source_range.duration.as_seconds_f64();
+    assert!((0.25..1.0).contains(&secs), "the take is as long as it ran: {secs} s");
+    let asset = client.snapshot().assets.values().next().unwrap().clone();
+    assert_eq!(asset.name, "Voice-over 1.wav");
+    let info = asset.info.as_ref().unwrap();
+    assert_eq!(info.audio.len(), 1);
+    assert_eq!(info.audio[0].channels, 1);
+}

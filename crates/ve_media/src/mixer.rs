@@ -118,6 +118,8 @@ impl Window {
 struct Stream {
     source: Source,
     next: Option<i64>,
+    /// The clip's audio effects and their state.
+    fx: crate::audio_fx::Chain,
 }
 
 /// A track's fader (dB) and pan (-1..1) as heard right now, overriding the
@@ -307,7 +309,7 @@ impl Mixer {
         if !current {
             match self.open(project, clip, channels) {
                 Ok(source) => {
-                    self.streams.insert(clip.id, Stream { source, next: None });
+                    self.streams.insert(clip.id, Stream { source, next: None, fx: Default::default() });
                 }
                 Err(e) => {
                     self.streams.remove(&clip.id);
@@ -328,6 +330,9 @@ impl Mixer {
             let mut at = pos(0).round() as i64;
             if stream.next.is_some_and(|e| (e - at).abs() <= 1) {
                 at = stream.next.unwrap();
+            } else {
+                // A jump: effect tails and envelopes start clean.
+                stream.fx.reset();
             }
             read(&mut stream.source, project, at, n, rate, &mut frames_in);
             stream.next = Some(at + n as i64);
@@ -351,6 +356,7 @@ impl Mixer {
             }
             stream.next = None;
         }
+        let run_fx = crate::audio_fx::Chain::wanted(clip);
 
         // Gains at both ends of the span (volume, pan, transitions), ramped
         // per sample: stepped gains buzz audibly on fades.
@@ -371,11 +377,11 @@ impl Mixer {
             self.scratch = frames_in;
             return;
         }
+        // The clip's channels, as the track's layout.
+        let mut left = Vec::with_capacity(n);
+        let mut right = Vec::with_capacity(n);
         for k in 0..n {
-            let x = k as f32 / n as f32;
-            let (gl, gr) = (l0 + (l1 - l0) * x, r0 + (r1 - r0) * x);
             let frame = &frames_in[k * ch..k * ch + ch];
-            // The clip's channels, as the track's layout.
             let (l, r) = if mono {
                 let m = picked.iter().map(|&c| frame[c]).sum::<f32>() / picked.len() as f32;
                 (m, m)
@@ -384,8 +390,20 @@ impl Mixer {
             } else {
                 (frame[picked[0]], frame[picked[1]])
             };
-            out[(first + k) * 2] += l * gl;
-            out[(first + k) * 2 + 1] += r * gr;
+            left.push(l);
+            right.push(r);
+        }
+        // The clip's effects, then its Volume and Panner.
+        if run_fx {
+            if let Some(stream) = self.streams.get_mut(&clip.id) {
+                stream.fx.process(clip, clip_time(0), rate, &mut left, &mut right);
+            }
+        }
+        for k in 0..n {
+            let x = k as f32 / n as f32;
+            let (gl, gr) = (l0 + (l1 - l0) * x, r0 + (r1 - r0) * x);
+            out[(first + k) * 2] += left[k] * gl;
+            out[(first + k) * 2 + 1] += right[k] * gr;
         }
         self.scratch = frames_in;
     }
@@ -534,6 +552,30 @@ mod tests {
         assert!(worst < 0.002, "largest step between samples: {worst}");
         assert!(heard.windows(2).all(|w| w[1] >= w[0] - 1e-6), "fade never dips");
         assert!((heard.last().unwrap() - 1.0).abs() < 1e-3, "reaches full level");
+    }
+
+    /// A clip's audio effect runs before its Volume: Gain -6 dB, then the
+    /// Channels effect (polarity), on the constant 1.0 signal.
+    #[test]
+    fn clip_audio_effects_run_before_volume() {
+        let (p, mut seq) = one_clip(Param::Constant(Value::Float(0.0)));
+        let effect = |id: &str, k: &str, v: Value| {
+            let mut params = OrdMap::new();
+            params.insert(k.to_string(), Param::Constant(v));
+            Arc::new(Effect { id: EffectId::new(), plugin: PluginRef { api: PluginApi::Builtin, id: id.into(), major_version: 1 }, enabled: true, params })
+        };
+        let clip = Arc::make_mut(&mut Arc::make_mut(&mut seq.tracks[0]).clips[0]);
+        clip.effects.push_front(effect(crate::audio_fx::GAIN, "gain", Value::Float(-6.0206)));
+        clip.effects.push_front(effect(crate::audio_fx::CHANNELS, "mode", Value::Choice(3)));
+        let mut mixer = Mixer::new(Arc::new(crate::fakes::AnyFile), Arc::new(Counting::default()), 48_000);
+        let mut out = vec![0f32; 1024 * 2];
+        mixer.render(&p, &seq, Time::ZERO, &mut out);
+        assert!((out[100] + 0.5).abs() < 1e-3, "inverted and halved: {}", out[100]);
+        // Disabled: out of the chain.
+        let clip = Arc::make_mut(&mut Arc::make_mut(&mut seq.tracks[0]).clips[0]);
+        Arc::make_mut(&mut clip.effects[0]).enabled = false;
+        mixer.render(&p, &seq, Time::from_ticks(1024 * ve_time::TICKS_PER_SECOND / 48_000), &mut out);
+        assert!((out[100] - 0.5).abs() < 1e-3, "halved only: {}", out[100]);
     }
 
     #[test]

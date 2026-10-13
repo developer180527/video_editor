@@ -95,6 +95,15 @@ fn picture(ui: &mut Ui, app: &mut EditorUi) {
     let faint = ui.theme.palette.text_faint;
     let accent = ui.theme.palette.accent;
     let outline = bounds.filter(|_| selected || typing);
+    // A voice-over in progress: REC, its length, and the input level.
+    let rec = app.engine.recording().map(|s| {
+        let secs = s.elapsed.as_seconds_f64() as u64;
+        let label = ui.frame_text(&format!("REC  {}:{:02}", secs / 60, secs % 60));
+        // Held and falling (input arrives in bursts between frames).
+        let now = ((20.0 * s.peak.max(1e-6).log10() + 60.0) / 60.0).clamp(0.0, 1.0);
+        app.rec_level = now.max(app.rec_level - ui.input().dt * 0.8);
+        (label, app.rec_level)
+    });
     ui.add_leaf(id, Layout::leaf(Size::Grow(1.0), Size::Grow(1.0)), Vec2::ZERO, true, move |p, rect| {
         p.rect(rect, REEL.line, 0.0);
         let (f, scale) = place(rect);
@@ -114,10 +123,27 @@ fn picture(ui: &mut Ui, app: &mut EditorUi) {
         if catching_up {
             p.text_left(Rect::new(f.x + 10.0, f.bottom() - 22.0, f.w - 20.0, 16.0), 11.0, faint, note);
         }
+        if let Some((label, level)) = rec {
+            let b = Rect::new(f.x + 10.0, f.y + 10.0, 150.0, 34.0);
+            p.rect(b, Color::rgba(0.0, 0.0, 0.0, 0.6), 4.0);
+            p.rect(Rect::new(b.x + 10.0, b.y + 8.0, 10.0, 10.0), REEL.record, 5.0);
+            p.text_left(Rect::new(b.x + 28.0, b.y + 5.0, 110.0, 16.0), 12.0, Color::WHITE, label);
+            let m = Rect::new(b.x + 10.0, b.y + 24.0, b.w - 20.0, 4.0);
+            p.rect(m, Color::WHITE.with_alpha(0.15), 2.0);
+            let hot = if level > 0.95 { REEL.record } else { REEL.meter_mid };
+            p.rect(Rect::new(m.x, m.y, m.w * level, m.h), hot, 2.0);
+        }
     });
 }
 
 fn toggle_play(app: &mut EditorUi) {
+    // While recording a voice-over, stopping ends the take.
+    if app.engine.is_recording() {
+        if let Err(e) = app.engine.stop_recording() {
+            app.errors.push(e);
+        }
+        return;
+    }
     app.engine.set_viewer(ve_engine::Viewer::Program);
     if app.engine.is_playing() {
         app.engine.stop();

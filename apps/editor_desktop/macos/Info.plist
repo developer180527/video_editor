@@ -3,6 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key><string>org.ve.videoeditor.desktop</string>
+    <key>NSMicrophoneUsageDescription</key><string>Record voice-overs onto audio tracks.</string>
     <key>CFBundleName</key><string>Video Editor</string>
     <key>CFBundleDisplayName</key><string>Video Editor</string>
     <key>CFBundleExecutable</key><string>video-editor</string>

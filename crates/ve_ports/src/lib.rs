@@ -37,6 +37,8 @@ pub struct Platform {
     pub storage: Arc<dyn Storage>,
     pub media: Arc<dyn MediaBackend>,
     pub audio: Arc<dyn AudioOutput>,
+    /// The microphone, for recording voice-overs.
+    pub audio_in: Arc<dyn AudioInput>,
     pub libraries: Arc<dyn NativeLibraries>,
     /// `None` where the OS forbids child processes (iPadOS).
     pub processes: Option<Arc<dyn ProcessHost>>,

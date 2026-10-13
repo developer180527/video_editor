@@ -9,6 +9,7 @@
 //! - [`Playback`]: runs a `Mixer` ahead of the audio device on its own thread
 //!   and hands the samples to the real-time callback through a lock-free ring.
 
+pub mod audio_fx;
 mod loudness;
 mod mixer;
 mod playback;

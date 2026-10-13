@@ -281,6 +281,8 @@ pub struct EditorUi {
     gesture: u64,
     /// The gesture of the slider or wheel being dragged.
     pub(crate) drag_gesture: u64,
+    /// The voice-over input meter, held and falling (0–1).
+    pub(crate) rec_level: f32,
     /// Where the knob, fader or wheel being dragged was pressed.
     pub(crate) drag_start: Option<DragStart>,
     /// A grade effect added but maybe not in the snapshot yet.
@@ -405,6 +407,7 @@ impl EditorUi {
             loudness: ve_engine::Loudness::default(),
             gesture: 0,
             drag_gesture: 0,
+            rec_level: 0.0,
             drag_start: None,
             pending_grade: None,
             st,
@@ -970,6 +973,10 @@ impl EditorUi {
             self.shared.retain(|id, _| self.dock.surface(*id).is_some());
         }
         if surface == SurfaceId::MAIN {
+            // A take's clock and meter move even when playback has stopped.
+            if self.engine.is_recording() {
+                ui.request_repaint_in(0.1);
+            }
             self.st = self.engine.published();
             self.playhead = self.engine.playhead_of(Viewer::Program);
             self.source_playhead = self.engine.playhead_of(Viewer::Source);
@@ -1187,6 +1194,13 @@ impl EditorUi {
                 let r = ve_engine::edit::add_edit(self.snap(), seq.id, &targets, self.playhead);
                 self.run_edit(r);
             }
+        }
+        // Recording a voice-over: Space or Escape ends the take.
+        if self.engine.is_recording() && (key(ui, Key::Space) || key(ui, Key::Escape)) {
+            if let Err(e) = self.engine.stop_recording() {
+                self.errors.push(e);
+            }
+            return;
         }
         // Transport: on the active monitor (Source or Program).
         if key(ui, Key::Space) {

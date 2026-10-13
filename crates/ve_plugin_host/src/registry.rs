@@ -16,6 +16,8 @@ pub enum PluginError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectKind {
     Filter,
+    /// An effect on a clip's sound (run by the mixer).
+    AudioFilter,
     Transition,
     Generator,
 }
@@ -65,6 +67,8 @@ pub enum Implementation {
     ShaderOnly,
     /// Implemented by the engine itself (Motion, Opacity, Volume, Panner).
     Intrinsic,
+    /// Run by the mixer on a clip's sound (the built-in audio effects).
+    Mixer,
 }
 
 #[derive(Default)]

@@ -157,6 +157,7 @@ fn every_shader_compiles_and_renders_on_the_gpu() {
             EffectKind::Filter => with(busy(), fx),
             EffectKind::Transition => across(busy(), other(), fx, 0.4),
             EffectKind::Generator => RenderLayer { source: LayerSource::Shader(fx), ..layer(busy()) },
+            EffectKind::AudioFilter => unreachable!("the pack is all pictures"),
         };
         let img = g.render(&[l], &e.plugin.id);
         // Something was drawn (no effect at its defaults blanks the frame).
@@ -262,6 +263,7 @@ fn contact_sheet() {
         let l = match e.kind {
             EffectKind::Filter => RenderLayer { effects: vec![fx], ..base },
             EffectKind::Generator => RenderLayer { source: LayerSource::Shader(fx), ..base },
+            EffectKind::AudioFilter => unreachable!("the pack is all pictures"),
             EffectKind::Transition => RenderLayer {
                 transition: Some(Box::new(RenderTransition { effect: fx, progress: 0.35, incoming: Some(RenderLayer::of_frame(b.clone(), m, 1.0)), self_incoming: false })),
                 ..base

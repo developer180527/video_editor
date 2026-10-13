@@ -20,14 +20,31 @@ fn session() -> Option<*mut AnyObject> {
     (!s.is_null()).then_some(s)
 }
 
-/// Playback category, movie mode; then active.
+/// Whether a voice-over is being recorded (play-and-record) or not
+/// (playback). Read by `activate`, which runs again after interruptions.
+static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switch between playback and play-and-record (voice-over), and make the
+/// session active again.
+pub fn recording(on: bool) {
+    RECORDING.store(on, std::sync::atomic::Ordering::SeqCst);
+    activate();
+}
+
+/// Playback category, movie mode (or play-and-record while recording);
+/// then active.
 fn activate() {
     let Some(s) = session() else { return };
+    let recording = RECORDING.load(std::sync::atomic::Ordering::SeqCst);
     unsafe {
         let mut err: *mut AnyObject = std::ptr::null_mut();
-        let category = ns_string("AVAudioSessionCategoryPlayback");
-        let mode = ns_string("AVAudioSessionModeMoviePlayback");
-        let _: bool = msg_send![s, setCategory: category, mode: mode, options: 0usize, error: &mut err];
+        let (category, mode, options) = if recording {
+            // Speaker rather than the earpiece; Bluetooth and AirPods mics allowed.
+            ("AVAudioSessionCategoryPlayAndRecord", "AVAudioSessionModeVideoRecording", 0x8usize | 0x4)
+        } else {
+            ("AVAudioSessionCategoryPlayback", "AVAudioSessionModeMoviePlayback", 0)
+        };
+        let _: bool = msg_send![s, setCategory: ns_string(category), mode: ns_string(mode), options: options, error: &mut err];
         let mut err: *mut AnyObject = std::ptr::null_mut();
         let ok: bool = msg_send![s, setActive: true, error: &mut err];
         if !ok {

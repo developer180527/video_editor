@@ -102,3 +102,20 @@ pub trait AudioOutput: Send + Sync {
     }
     fn open(&self, want: AudioConfig, render: RenderCallback) -> Result<Box<dyn AudioStream>, AudioError>;
 }
+
+/// Receives captured audio, interleaved, at the stream's config. Runs on
+/// the real-time input thread: it must not block.
+pub type CaptureCallback = Box<dyn FnMut(&[f32]) + Send>;
+
+/// An open input stream; dropping it stops capture.
+pub trait CaptureStream: Send {
+    fn config(&self) -> AudioConfig;
+}
+
+/// The microphone (voice-over). `None` from [`AudioInput::preferred`] when
+/// there is no input device.
+pub trait AudioInput: Send + Sync {
+    fn preferred(&self) -> Option<AudioConfig>;
+    /// Capture at the device's own format ([`AudioInput::preferred`]).
+    fn open(&self, capture: CaptureCallback) -> Result<Box<dyn CaptureStream>, AudioError>;
+}

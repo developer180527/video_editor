@@ -351,7 +351,8 @@ pub fn effects_list(ui: &mut Ui, app: &mut EditorUi) {
     let audio_tr = of(&|e| e.kind == EffectKind::Transition && e.wgsl.is_none());
     let generators = of(&|e| e.kind == EffectKind::Generator);
     let filters = of(&|e| e.kind == EffectKind::Filter && !matches!(e.implementation, Implementation::Intrinsic));
-    if !q.is_empty() && video_tr.is_empty() && audio_tr.is_empty() && generators.is_empty() && filters.is_empty() {
+    let audio_fx = of(&|e| e.kind == EffectKind::AudioFilter);
+    if !q.is_empty() && video_tr.is_empty() && audio_tr.is_empty() && generators.is_empty() && filters.is_empty() && audio_fx.is_empty() {
         ui.space(6.0);
         ui.label_muted("Nothing matches.");
         return;
@@ -397,6 +398,24 @@ pub fn effects_list(ui: &mut Ui, app: &mut EditorUi) {
             pick = Some(Pick::Generator(e.plugin.clone()));
         }
     }
+    // Audio effects, grouped under one section by category.
+    if !audio_fx.is_empty() {
+        ui.section("Audio Effects");
+    }
+    let mut group = String::new();
+    for e in &audio_fx {
+        if e.category != group {
+            group = e.category.clone();
+            ui.text_with(&group, t.metrics.font_size_small, t.palette.text_faint);
+        }
+        let r = ui.selectable_keyed(&e.plugin.id, &e.name, false);
+        let (plugin, label) = (e.plugin.clone(), e.name.clone());
+        ui.drag_source_from(&r, move || Payload::new(EFFECT_PAYLOAD, plugin).with_label(label));
+        ui.tooltip(&r, "Drag onto an audio clip, or double-click to apply to the selected one");
+        if r.double_clicked {
+            pick = Some(Pick::Effect(e.plugin.clone()));
+        }
+    }
     let mut last = String::new();
     if filters.is_empty() && q.is_empty() {
         ui.section("Video Effects");
@@ -422,8 +441,15 @@ pub fn effects_list(ui: &mut Ui, app: &mut EditorUi) {
         Some(Pick::Transition(kind, plugin)) => app.apply_transition(kind, plugin),
         Some(Pick::Generator(plugin)) => app.new_generator(&plugin, app.playhead, None),
         Some(Pick::Effect(plugin)) => {
-            if let Some(&clip) = app.view.selection.first() {
-                add_effect(app, clip, &plugin);
+            // To the first selected clip it suits (a linked pair holds both).
+            let audio = app.st.plugins.find(&plugin).is_some_and(|i| i.kind == EffectKind::AudioFilter);
+            let suits = app.view.selection.iter().copied().find(|c| {
+                app.snap().find_clip(*c).is_some_and(|(s, ti, _)| (s.tracks[ti].kind == TrackKind::Audio) == audio)
+            });
+            match suits {
+                Some(clip) => add_effect(app, clip, &plugin),
+                None if app.view.selection.is_empty() => {}
+                None => app.errors.push(format!("Select {} clip to apply it to.", if audio { "an audio" } else { "a video" })),
             }
         }
         None => {}
@@ -433,7 +459,13 @@ pub fn effects_list(ui: &mut Ui, app: &mut EditorUi) {
 /// Append a new instance of `plugin` to `clip`'s effects, at defaults.
 pub fn add_effect(app: &mut EditorUi, clip: ClipId, plugin: &PluginRef) {
     let Some(info) = app.st.plugins.find(plugin) else { return };
-    let Some((_, _, c)) = app.snap().find_clip(clip) else { return };
+    let Some((s, ti, c)) = app.snap().find_clip(clip) else { return };
+    // Sound effects go on audio clips, picture effects on video clips.
+    let audio_track = s.tracks[ti].kind == TrackKind::Audio;
+    if (info.kind == EffectKind::AudioFilter) != audio_track {
+        app.errors.push(format!("{} is {} effect: drop it onto {} clip.", info.name, if audio_track { "a video" } else { "an audio" }, if audio_track { "a video" } else { "an audio" }));
+        return;
+    }
     let params = info.params.iter().map(|p| (p.id.clone(), Param::Constant(ve_engine::default_value(&p.kind, p.default)))).collect();
     let effect = Effect { id: EffectId::new(), plugin: plugin.clone(), enabled: true, params };
     let index = c.effects.len();

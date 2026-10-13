@@ -232,6 +232,50 @@ impl MediaBackend for NoMedia {
     }
 }
 
+/// A stand-in microphone: a 440 Hz tone at -12 dBFS, 48 kHz mono, in
+/// 10 ms blocks on a thread of its own, until the stream is dropped.
+#[derive(Default)]
+pub struct NullInput;
+
+struct NullCapture {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for NullCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl CaptureStream for NullCapture {
+    fn config(&self) -> AudioConfig {
+        AudioConfig { sample_rate: 48_000, channels: 1, buffer_frames: 480 }
+    }
+}
+
+impl AudioInput for NullInput {
+    fn preferred(&self) -> Option<AudioConfig> {
+        Some(AudioConfig { sample_rate: 48_000, channels: 1, buffer_frames: 480 })
+    }
+    fn open(&self, mut capture: CaptureCallback) -> Result<Box<dyn CaptureStream>, AudioError> {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            let mut block = vec![0f32; 480];
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                for s in block.iter_mut() {
+                    *s = (n as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.25;
+                    n += 1;
+                }
+                capture(&block);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        Ok(Box::new(NullCapture { stop }))
+    }
+}
+
 /// A complete headless platform with files under `root`, using `media` for
 /// decoding (pass [`NoMedia`] when none is needed).
 pub fn platform(root: impl AsRef<Path>, media: Arc<dyn MediaBackend>) -> Platform {
@@ -240,6 +284,7 @@ pub fn platform(root: impl AsRef<Path>, media: Arc<dyn MediaBackend>) -> Platfor
         storage: Arc::new(FileStorage::rooted(root)),
         media,
         audio: Arc::new(NullAudio::default()),
+        audio_in: Arc::new(NullInput),
         libraries: Arc::new(LinkedOnly::default()),
         processes: None,
     }

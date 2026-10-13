@@ -86,6 +86,44 @@ fn background_thread() {
     unsafe { pthread_set_qos_class_self_np(0x11, 0) };
 }
 
+/// The microphone: the session switches to play-and-record while a
+/// capture is open (iOS asks the user for the microphone the first time),
+/// and back to playback after.
+struct IosInput;
+
+struct IosCapture(Box<dyn CaptureStream>);
+
+impl CaptureStream for IosCapture {
+    fn config(&self) -> AudioConfig {
+        self.0.config()
+    }
+}
+
+impl Drop for IosCapture {
+    fn drop(&mut self) {
+        #[cfg(target_os = "ios")]
+        audio_session::recording(false);
+    }
+}
+
+impl AudioInput for IosInput {
+    fn preferred(&self) -> Option<AudioConfig> {
+        audio_cpal::CpalInput.preferred()
+    }
+    fn open(&self, capture: CaptureCallback) -> Result<Box<dyn CaptureStream>, AudioError> {
+        #[cfg(target_os = "ios")]
+        audio_session::recording(true);
+        match audio_cpal::CpalInput.open(capture) {
+            Ok(s) => Ok(Box::new(IosCapture(s))),
+            Err(e) => {
+                #[cfg(target_os = "ios")]
+                audio_session::recording(false);
+                Err(e)
+            }
+        }
+    }
+}
+
 pub fn platform(media: Arc<dyn MediaBackend>, linked: Vec<fn() -> Box<dyn NativeLibrary>>) -> Platform {
     #[cfg(target_os = "ios")]
     {
@@ -98,6 +136,7 @@ pub fn platform(media: Arc<dyn MediaBackend>, linked: Vec<fn() -> Box<dyn Native
         storage: Arc::new(storage()),
         media,
         audio: Arc::new(audio_cpal::CpalAudio),
+        audio_in: Arc::new(IosInput),
         libraries: Arc::new(LinkedOnly { make: linked }),
         processes: None,
     }

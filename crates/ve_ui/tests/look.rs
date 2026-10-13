@@ -207,6 +207,10 @@ fn effects_panel_and_transition_parameters() {
         show(app, ve_ui::Tab::Effects);
         app.view.effects_search = "iris".into();
     });
+    render(&mut app, 2000, 1129, "panel-effects-audio.png", |app| {
+        show(app, ve_ui::Tab::Effects);
+        app.view.effects_search = "compression".into();
+    });
     // A Clock Wipe on the cut, its direction set to counter-clockwise.
     let snap = app.engine.snapshot();
     let cut = snap.active().unwrap().tracks[0].clips[1].id;
@@ -416,6 +420,28 @@ fn rubber_band_keyframes_on_clips() {
     render(&mut app, 2000, 1129, "rubber-band.png", |_| {});
     app.engine.undo();
     wait(&app.engine, |a| matches!(op(a), Param::Animated(k) if k.len() == 1));
+}
+
+/// Record Voice-over (Sequence menu): the targeted audio track's record
+/// light, REC on the Program monitor; the same command ends the take.
+#[test]
+fn voice_over_recording_shows_and_stops() {
+    let mut app = editor();
+    let menu_checked = |app: &EditorUi| {
+        let seq = app.menus().into_iter().find(|m| m.title == "Sequence").unwrap();
+        seq.entries.iter().any(|e| matches!(e, ve_ui::Entry::Item(i) if i.label == "Record Voice-over" && i.checked == Some(true)))
+    };
+    assert!(!menu_checked(&app));
+    app.perform(&ve_ui::Action::RecordVoiceOver);
+    assert!(app.engine.is_recording(), "the stand-in microphone opened");
+    let a1 = app.engine.snapshot().active().unwrap().tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap().id;
+    assert_eq!(app.engine.recording_track(), Some(a1), "the targeted audio track");
+    assert!(menu_checked(&app));
+    std::thread::sleep(Duration::from_millis(1100));
+    render(&mut app, 2000, 1129, "voice-over.png", |_| {});
+    app.perform(&ve_ui::Action::RecordVoiceOver);
+    assert!(!app.engine.is_recording());
+    assert!(!app.engine.is_playing(), "the take's playback stopped with it");
 }
 
 /// The title bar as the editor draws it: the window buttons it draws

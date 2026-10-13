@@ -128,6 +128,10 @@ fn transition(id: &str, name: &str, category: &str, wgsl: Option<&str>) -> Effec
     }
 }
 
+fn audio(id: &str, name: &str, category: &str, params: Vec<ParamInfo>) -> EffectInfo {
+    EffectInfo { kind: EffectKind::AudioFilter, implementation: Implementation::Mixer, ..info(id, name, category, params) }
+}
+
 fn generator(id: &str, name: &str, params: Vec<ParamInfo>) -> EffectInfo {
     EffectInfo { kind: EffectKind::Generator, ..info(id, name, "Generators", params) }
 }
@@ -158,6 +162,50 @@ pub fn all() -> Vec<EffectInfo> {
         ]),
         info(VOLUME, "Volume", "Intrinsic", vec![p("level", "Level", Float, -96.0, 15.0, [0.0; 4])]),
         info(PANNER, "Panner", "Intrinsic", vec![p("balance", "Balance", Float, -100.0, 100.0, [0.0; 4])]),
+        // Audio effects, run by the mixer on a clip's sound before its Volume
+        // and Panner (ve_media::audio_fx; ids and parameters must agree).
+        audio("ve.audio.gain", "Gain", "Amplitude and Compression", vec![p("gain", "Gain (dB)", Float, -48.0, 24.0, [0.0; 4])]),
+        audio("ve.audio.compressor", "Dynamics Compressor", "Amplitude and Compression", vec![
+            p("threshold", "Threshold (dB)", Float, -60.0, 0.0, [-18.0, 0.0, 0.0, 0.0]),
+            p("ratio", "Ratio", Float, 1.0, 20.0, [4.0, 0.0, 0.0, 0.0]),
+            p("attack", "Attack (ms)", Float, 0.1, 200.0, [10.0, 0.0, 0.0, 0.0]),
+            p("release", "Release (ms)", Float, 10.0, 2000.0, [150.0, 0.0, 0.0, 0.0]),
+            p("makeup", "Makeup Gain (dB)", Float, 0.0, 24.0, [0.0; 4]),
+        ]),
+        audio("ve.audio.limiter", "Hard Limiter", "Amplitude and Compression", vec![
+            p("ceiling", "Ceiling (dB)", Float, -24.0, 0.0, [-1.0, 0.0, 0.0, 0.0]),
+            p("release", "Release (ms)", Float, 1.0, 1000.0, [50.0, 0.0, 0.0, 0.0]),
+        ]),
+        audio("ve.audio.gate", "Noise Gate", "Amplitude and Compression", vec![
+            p("threshold", "Threshold (dB)", Float, -80.0, 0.0, [-50.0, 0.0, 0.0, 0.0]),
+            p("attack", "Attack (ms)", Float, 0.1, 100.0, [1.0, 0.0, 0.0, 0.0]),
+            p("release", "Release (ms)", Float, 5.0, 2000.0, [100.0, 0.0, 0.0, 0.0]),
+        ]),
+        audio("ve.audio.eq", "Simple EQ", "Filter and EQ", vec![
+            p("low_freq", "Low Frequency (Hz)", Float, 20.0, 1000.0, [100.0, 0.0, 0.0, 0.0]),
+            p("low_gain", "Low Gain (dB)", Float, -24.0, 24.0, [0.0; 4]),
+            p("mid_freq", "Mid Frequency (Hz)", Float, 100.0, 10000.0, [1000.0, 0.0, 0.0, 0.0]),
+            p("mid_gain", "Mid Gain (dB)", Float, -24.0, 24.0, [0.0; 4]),
+            p("mid_q", "Mid Q", Float, 0.1, 10.0, [1.0, 0.0, 0.0, 0.0]),
+            p("high_freq", "High Frequency (Hz)", Float, 1000.0, 20000.0, [8000.0, 0.0, 0.0, 0.0]),
+            p("high_gain", "High Gain (dB)", Float, -24.0, 24.0, [0.0; 4]),
+        ]),
+        audio("ve.audio.highpass", "Highpass", "Filter and EQ", vec![p("cutoff", "Cutoff (Hz)", Float, 20.0, 5000.0, [80.0, 0.0, 0.0, 0.0])]),
+        audio("ve.audio.lowpass", "Lowpass", "Filter and EQ", vec![p("cutoff", "Cutoff (Hz)", Float, 200.0, 20000.0, [12000.0, 0.0, 0.0, 0.0])]),
+        audio("ve.audio.delay", "Delay", "Delay and Echo", vec![
+            p("time", "Delay (ms)", Float, 1.0, 2000.0, [250.0, 0.0, 0.0, 0.0]),
+            p("feedback", "Feedback (%)", Float, 0.0, 95.0, [30.0, 0.0, 0.0, 0.0]),
+            p("mix", "Mix (%)", Float, 0.0, 100.0, [25.0, 0.0, 0.0, 0.0]),
+        ]),
+        audio("ve.audio.reverb", "Reverb", "Reverb", vec![
+            p("size", "Room Size (%)", Float, 0.0, 100.0, [50.0, 0.0, 0.0, 0.0]),
+            p("damping", "Damping (%)", Float, 0.0, 100.0, [50.0, 0.0, 0.0, 0.0]),
+            p("mix", "Mix (%)", Float, 0.0, 100.0, [25.0, 0.0, 0.0, 0.0]),
+        ]),
+        audio("ve.audio.channels", "Channels", "Stereo Imagery", vec![ParamInfo {
+            animatable: false,
+            ..p("mode", "Mode", Choice(["Swap Channels", "Fill Left with Right", "Fill Right with Left", "Invert Polarity", "Mono (Sum)"].map(String::from).to_vec()), 0.0, 4.0, [0.0; 4])
+        }]),
         transition(DISSOLVE, "Cross Dissolve", "Dissolve", Some(DISSOLVE_WGSL)),
         transition(DIP_TO_BLACK, "Dip to Black", "Dissolve", Some(DIP_WGSL)),
         // Audio: equal power, done by the mixer.

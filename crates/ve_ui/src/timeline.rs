@@ -35,6 +35,8 @@ const STRIP_H: f32 = 15.0;
 const SNAP_PX: f32 = 8.0;
 /// Rows shorter than this hide clips' rubber bands.
 const BAND_MIN_H: f32 = 40.0;
+/// Where an audio header's second line (the record button) starts.
+const HEADER_LINE2: f32 = 28.0;
 
 const TOOLS: [(Icon, Tool, &str); 10] = [
     (Icon::Select, Tool::Select, "Selection (V)"),
@@ -600,7 +602,8 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
                 Some(Drag::Playhead)
             }
             Hit::Header(track, x) => {
-                header_click(app, &seq, track, x);
+                let y = rows.iter().find(|r| r.id == track).map_or(0.0, |row| r.mouse_pos.y - (g.tracks_y + row.top - g.scroll_y));
+                header_click(app, &seq, track, x, y);
                 None
             }
             Hit::Marker(id) => {
@@ -961,10 +964,20 @@ fn press_tool(app: &mut EditorUi, proj: &Project, seq: &Sequence, g: &Geo, hit: 
 }
 
 /// Header buttons: lock, target patch, eye / mute, solo, mono / stereo.
-fn header_click(app: &mut EditorUi, seq: &Sequence, track: TrackId, x: f32) {
+/// A click at (`x`, `y`) in `track`'s header (from its top left).
+fn header_click(app: &mut EditorUi, seq: &Sequence, track: TrackId, x: f32, y: f32) {
     let Some((_, t)) = seq.track(track) else { return };
     let mut st = ve_engine::TrackState::of(t);
     let video = t.kind == TrackKind::Video;
+    // The second line of an audio header: the voice-over record button.
+    if !video && y >= HEADER_LINE2 {
+        if (84.0..104.0).contains(&x) {
+            app.toggle_recording(track);
+        } else if (106.0..146.0).contains(&x) {
+            app.toggle_layout(track);
+        }
+        return;
+    }
     match x {
         x if (5.0..23.0).contains(&x) => st.locked = !st.locked,
         x if (28.0..48.0).contains(&x) => {
@@ -981,10 +994,6 @@ fn header_click(app: &mut EditorUi, seq: &Sequence, track: TrackId, x: f32) {
             }
         }
         x if (104.0..124.0).contains(&x) && !video => st.solo = !st.solo,
-        x if (126.0..144.0).contains(&x) && !video => {
-            app.toggle_layout(track);
-            return;
-        }
         _ => return,
     }
     app.run(Command::SetTrackState { sequence: seq.id, track, state: st });
@@ -1019,6 +1028,7 @@ struct Shot {
     faint: Color,
     accent: Color,
     size: f32,
+    solo_label: FrameText,
 }
 
 struct RowShot {
@@ -1029,6 +1039,7 @@ struct RowShot {
     locked: bool,
     on: bool,
     solo: bool,
+    recording: bool,
     targeted: bool,
     /// Audio tracks: "S" or "M".
     layout: Option<FrameText>,
@@ -1109,8 +1120,9 @@ impl Shot {
                 locked: tr.locked,
                 on: if row.kind == TrackKind::Video { tr.enabled } else { !tr.muted },
                 solo: tr.solo,
+                recording: app.engine.recording_track() == Some(row.id),
                 targeted: app.view.targeted.contains(&row.id),
-                layout: (row.kind == TrackKind::Audio).then(|| ui.frame_text(if tr.layout == ChannelLayout::Mono { "M" } else { "S" })),
+                layout: (row.kind == TrackKind::Audio).then(|| ui.frame_text(if tr.layout == ChannelLayout::Mono { "Mono" } else { "Stereo" })),
             });
             for (clip, edge, a, b) in transition_spans(tr) {
                 let name = tr
@@ -1140,7 +1152,7 @@ impl Shot {
                     _ => c.name.clone(),
                 };
                 let fx = c.effects.iter().any(|e| {
-                    !e.plugin.id.starts_with("ve.") || e.params.values().any(|p| matches!(p, Param::Animated(_)))
+                    !e.plugin.id.starts_with("ve.") || e.plugin.id.starts_with("ve.audio.") || e.params.values().any(|p| matches!(p, Param::Animated(_)))
                 });
                 let asset = match &c.source {
                     ClipSource::Asset { asset, .. } => proj.assets.get(asset).cloned(),
@@ -1236,6 +1248,7 @@ impl Shot {
             faint: t.palette.text_faint,
             accent: t.palette.accent,
             size: t.metrics.font_size,
+            solo_label: ui.frame_text("S"),
         }
     }
 
@@ -1421,12 +1434,24 @@ impl Shot {
                 icon(p, 86.0, Icon::Eye, tr.on);
             } else {
                 icon(p, 86.0, Icon::Speaker, tr.on);
-                icon(p, 106.0, Icon::Mic, tr.solo);
-                if let Some(l) = tr.layout {
-                    let b = Rect::new(r.x + 127.0, mid, 16.0, 16.0);
-                    p.rect(b, REEL.raised, 2.0);
-                    p.text_centered(b, self.size - 1.0, REEL.text_soft, l);
+                let s = Rect::new(r.x + 106.0, mid, 16.0, 16.0);
+                p.rect(s, if tr.solo { REEL.solo } else { REEL.raised }, 2.0);
+                p.text_centered(s, self.size - 1.0, if tr.solo { Color::BLACK } else { REEL.text_soft }, self.solo_label);
+                // Voice-over: on a second line, when the track is tall enough.
+                if tr.height >= HEADER_LINE2 + 17.0 {
+                    let b = Rect::new(r.x + 86.0, r.y + HEADER_LINE2, 16.0, 16.0);
+                    if tr.recording {
+                        p.rect(b, REEL.record, 8.0);
+                    }
+                    draw_icon(p, b.shrink(3.0, 3.0, 3.0, 3.0), Icon::Mic, if tr.recording { Color::WHITE } else { REEL.label });
+                    // The track's channel layout, beside it (click to switch).
+                    if let Some(l) = tr.layout {
+                        let b = Rect::new(r.x + 108.0, r.y + HEADER_LINE2, 36.0, 16.0);
+                        p.rect(b, REEL.raised, 2.0);
+                        p.text_centered(b, self.size - 2.0, REEL.text_soft, l);
+                    }
                 }
+
             }
             if tr.locked {
                 // Locked tracks wear diagonal hatching, as NLEs show them.
