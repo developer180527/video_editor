@@ -13,7 +13,9 @@ mod dock;
 mod editing;
 mod effects;
 mod features;
+mod bands;
 mod graph;
+mod keys;
 mod graphics;
 mod icon_shapes;
 mod icons;
@@ -176,6 +178,8 @@ pub struct View {
     pub scroll_x: f32,
     pub scroll_y: f32,
     pub drag: Option<timeline::Drag>,
+    /// The rubber band's level when its drag began.
+    pub(crate) band_orig: Option<Param>,
     pub snap: bool,
     pub linked: bool,
     /// Tracks targeted for edits (the highlighted V1 / A1 patches).
@@ -209,6 +213,8 @@ pub struct View {
     /// The selected key in a graph, and what a graph drag holds.
     pub(crate) graph_key: Option<graph::GraphKey>,
     pub(crate) graph_drag: Option<graph::Grab>,
+    /// The key a lane drag holds: effect, parameter, index.
+    pub(crate) key_drag: Option<(EffectId, String, usize)>,
     /// The graph's value scale, held while dragging.
     pub(crate) graph_scale: Option<(f64, f64)>,
     /// Essential Graphics: 0 Browse, 1 Edit; the selected template.
@@ -337,6 +343,7 @@ impl EditorUi {
                 scroll_x: 0.0,
                 scroll_y: 0.0,
                 drag: None,
+                band_orig: None,
                 snap: true,
                 linked: true,
                 targeted: HashSet::new(),
@@ -359,6 +366,7 @@ impl EditorUi {
                 graphs: HashSet::new(),
                 graph_key: None,
                 graph_drag: None,
+                key_drag: None,
                 graph_scale: None,
                 graphics_tab: 0,
                 template: 0,

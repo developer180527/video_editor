@@ -352,6 +352,72 @@ fn tracks_and_timeline_context_menus() {
 
 }
 
+/// The rubber band on a timeline clip: drag the Opacity line down, add a
+/// key with the Pen tool, drag the key, delete it from its menu.
+#[test]
+fn rubber_band_keyframes_on_clips() {
+    let mut app = editor();
+    let mut ui = Ui::new(ve_ui::theme(), FONT).expect("font");
+    for _ in 0..6 {
+        frame(&mut ui, &mut app);
+    }
+    let at = |s: f32| 831.0 + s * 78.0;
+    let op = |c: &EngineClient| -> Param {
+        let clip = c.snapshot().active().unwrap().tracks[1].clips[0].clone();
+        let e = clip.effects.iter().find(|e| e.plugin.id == "ve.opacity").unwrap();
+        e.params.get("opacity").unwrap().clone()
+    };
+    let opacity = |app: &EditorUi| op(&app.engine);
+    let click = |ui: &mut Ui, app: &mut EditorUi, pos: Vec2, to: Option<Vec2>| {
+        ui.push(InputEvent::PointerMoved { pos });
+        frame(ui, app);
+        ui.push(InputEvent::PointerButton { button: PointerButton::Primary, pressed: true });
+        frame(ui, app);
+        let grabbed = format!("{:?}", app.view.drag);
+        if let Some(to) = to {
+            for k in 1..=6 {
+                ui.push(InputEvent::PointerMoved { pos: pos + (to - pos) * (k as f32 / 6.0) });
+                frame(ui, app);
+            }
+        }
+        ui.push(InputEvent::PointerButton { button: PointerButton::Primary, pressed: false });
+        frame(ui, app);
+        grabbed
+    };
+    // Find the line on DockAtitlan (V2, 3 s - 8 s): at 100 % it runs along
+    // the top of the clip's body.
+    let x = at(5.0);
+    let y = (760..880).map(|y| y as f32).find(|y| click(&mut ui, &mut app, Vec2::new(x, *y), None).starts_with("Some(Band {")).expect("the band's line is under the pointer somewhere");
+    assert_eq!(opacity(&app), Param::Constant(Value::Float(100.0)), "a click is not a drag");
+    // Down by a few pixels: a lower constant level, one undo step.
+    click(&mut ui, &mut app, Vec2::new(x, y), Some(Vec2::new(x, y + 8.0)));
+    wait(&app.engine, |a| matches!(op(a), Param::Constant(Value::Float(v)) if v < 100.0));
+    let Param::Constant(Value::Float(lowered)) = opacity(&app) else { panic!() };
+    // Pen: a click on the line adds a key there.
+    app.view.tool = ve_ui::Tool::Pen;
+    let line_y = y + 8.0;
+    click(&mut ui, &mut app, Vec2::new(at(4.0), line_y), None);
+    wait(&app.engine, |a| matches!(op(a), Param::Animated(_)));
+    let Param::Animated(keys) = opacity(&app) else { panic!() };
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].value, Value::Float(lowered), "the key holds the level that was there");
+    // A second key, then drag it up to the top: the line now ramps.
+    click(&mut ui, &mut app, Vec2::new(at(7.0), line_y), Some(Vec2::new(at(7.0), line_y - 60.0)));
+    wait(&app.engine, |a| matches!(op(a), Param::Animated(k) if k.len() == 2 && k[1].value == Value::Float(100.0)));
+    // Right-click the first key: its menu; Delete Keyframe is the last item.
+    app.view.tool = ve_ui::Tool::Select;
+    ui.push(InputEvent::PointerMoved { pos: Vec2::new(at(4.0), line_y) });
+    frame(&mut ui, &mut app);
+    ui.push(InputEvent::PointerButton { button: PointerButton::Secondary, pressed: true });
+    frame(&mut ui, &mut app);
+    ui.push(InputEvent::PointerButton { button: PointerButton::Secondary, pressed: false });
+    frame(&mut ui, &mut app);
+    assert!(matches!(app.view.timeline_menu, Some((ve_ui::Hit::BandKey { index: 0, .. }, _))), "the key's menu: {:?}", app.view.timeline_menu);
+    render(&mut app, 2000, 1129, "rubber-band.png", |_| {});
+    app.engine.undo();
+    wait(&app.engine, |a| matches!(op(a), Param::Animated(k) if k.len() == 1));
+}
+
 /// The title bar as the editor draws it: the window buttons it draws
 /// itself (Windows, Linux), and room left for the OS's (macOS).
 #[test]

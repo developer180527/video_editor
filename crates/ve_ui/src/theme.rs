@@ -50,6 +50,8 @@ pub struct Reel {
     pub track_head: Color,
     pub grid: Color,
     pub playhead: Color,
+    /// A clip's rubber band (Opacity / Volume keyframes).
+    pub band: Color,
     pub in_out: Color,
     pub in_out_range: Color,
     pub timecode: Color,
@@ -142,6 +144,7 @@ fn parse(src: &str) -> Result<(Theme, Reel), String> {
         track_head: c("track_head")?,
         grid: c("grid")?,
         playhead: c("playhead")?,
+        band: c("band")?,
         in_out: c("in_out")?,
         in_out_range: c("in_out_range")?,
         timecode: c("timecode")?,
@@ -166,7 +169,7 @@ fn parse(src: &str) -> Result<(Theme, Reel), String> {
     };
     let known = [
         "line", "inset", "chrome_deep", "chrome", "panel", "raised", "raised_hi", "tick", "label", "text_soft", "bright", "icon", "ruler_bg", "track_bg", "track_bg_alt",
-        "track_head", "grid", "playhead", "in_out", "in_out_range", "timecode", "selected", "video_fill", "video_head", "audio_fill", "audio_head", "title_fill",
+        "track_head", "grid", "playhead", "band", "in_out", "in_out_range", "timecode", "selected", "video_fill", "video_head", "audio_fill", "audio_head", "title_fill",
         "title_head", "nest_fill", "nest_head", "wave", "clip_text", "clip_border", "transition", "transition_text", "badge", "meter_lo", "meter_mid", "meter_hi",
     ];
     if let Some(k) = reel.keys().find(|k| !known.contains(&k.as_str())) {

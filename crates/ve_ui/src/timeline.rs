@@ -15,6 +15,7 @@ use ve_engine::{edit, Command, CommandError, Edge, Snapshot};
 use ve_model::*;
 use ve_time::{Time, Timecode};
 
+use crate::bands;
 use crate::features::{marker_color, GENERATOR_PAYLOAD, TRANSITION_PAYLOAD};
 use crate::project::{add_effect, EFFECT_PAYLOAD};
 use crate::theme::REEL;
@@ -32,6 +33,8 @@ const MARKER_PX: f32 = 5.0;
 const STRIP_H: f32 = 15.0;
 /// How close, in px, an edge must come to another to snap.
 const SNAP_PX: f32 = 8.0;
+/// Rows shorter than this hide clips' rubber bands.
+const BAND_MIN_H: f32 = 40.0;
 
 const TOOLS: [(Icon, Tool, &str); 10] = [
     (Icon::Select, Tool::Select, "Selection (V)"),
@@ -58,6 +61,11 @@ pub enum Drag {
     Trim { clip: ClipId, edge: Edge, ripple: bool, anchor: Time },
     Roll { left: ClipId, right: ClipId, anchor: Time },
     Slip { clip: ClipId, anchor: Time },
+    /// The rubber band's line, grabbed at clip time `at` and height `y`
+    /// (the level before the drag is in `View::band_orig`).
+    Band { clip: ClipId, at: Time, y: f32 },
+    /// A key on the rubber band.
+    BandKey { clip: ClipId, index: usize },
 }
 
 /// One track's row on screen.
@@ -220,6 +228,9 @@ pub enum Hit {
     /// A transition: the clip that owns it, and which edge.
     Transition { clip: ClipId, edge: Edge },
     Clip { clip: ClipId, track: TrackId, edge: Option<Edge> },
+    /// A clip's rubber band (Opacity / Volume line), or a key on it.
+    Band { clip: ClipId, track: TrackId },
+    BandKey { clip: ClipId, track: TrackId, index: usize },
     /// Between two adjacent clips.
     Cut { left: ClipId, right: ClipId },
     Empty(TrackId),
@@ -252,7 +263,9 @@ impl Geo {
     }
 }
 
-fn hit(g: &Geo, rows: &[Row], seq: &Sequence, pos: Vec2) -> Hit {
+/// `reach` scales how near the pointer must be to the thin targets (more
+/// for a finger).
+fn hit(g: &Geo, rows: &[Row], seq: &Sequence, pos: Vec2, reach: f32) -> Hit {
     let r = g.rect;
     if pos.y >= r.bottom() - BAR {
         return Hit::HBar;
@@ -306,9 +319,108 @@ fn hit(g: &Geo, rows: &[Row], seq: &Sequence, pos: Vec2) -> Hit {
         }
     }
     match track.clip_at(t) {
-        Some(c) => Hit::Clip { clip: c.id, track: row.id, edge: None },
+        Some(c) => {
+            // The rubber band, where the body is tall enough to hold it.
+            if in_body && row.height >= BAND_MIN_H {
+                if let Some(tg) = bands::target(c, track.kind) {
+                    if let Some(p) = bands::stored(c, tg) {
+                        let y = g.tracks_y + row.top - g.scroll_y;
+                        let area = bands::area(Rect::new(0.0, y, 1.0, row.height - 1.0), STRIP_H);
+                        let x_of = |at: Time| g.x_of(c.timeline_start + at);
+                        let t_of = |x: f32| (g.time_at(x) - c.timeline_start).clamp_to(Time::ZERO, c.source_range.duration);
+                        match bands::over(p, tg.audio, area, x_of, t_of, pos, reach) {
+                            Some(bands::Over::Key(index)) => return Hit::BandKey { clip: c.id, track: row.id, index },
+                            Some(bands::Over::Line) => return Hit::Band { clip: c.id, track: row.id },
+                            None => {}
+                        }
+                    }
+                }
+            }
+            Hit::Clip { clip: c.id, track: row.id, edge: None }
+        }
         None => Hit::Empty(row.id),
     }
+}
+
+/// The band is for the Selection and Pen tools; to the others it is the clip.
+fn for_tool(tool: Tool, hit: Hit) -> Hit {
+    match (tool, hit) {
+        (Tool::Select | Tool::Pen, h) => h,
+        (_, Hit::Band { clip, track } | Hit::BandKey { clip, track, .. }) => Hit::Clip { clip, track, edge: None },
+        (_, h) => h,
+    }
+}
+
+/// Where a band drag puts things, applied live (one undo step per drag).
+fn band_drag(app: &mut EditorUi, snap_proj: &Project, seq: &Sequence, rows: &[Row], g: &Geo, drag: Drag, pos: Vec2) {
+    let (clip_id, index) = match drag {
+        Drag::Band { clip, .. } => (clip, None),
+        Drag::BandKey { clip, index } => (clip, Some(index)),
+        _ => return,
+    };
+    let Some((s, ti, c)) = snap_proj.find_clip(clip_id) else { return };
+    let track = &s.tracks[ti];
+    let (Some(tg), Some(row)) = (bands::target(c, track.kind), rows.iter().find(|r| r.id == track.id)) else { return };
+    let Some(orig) = app.view.band_orig.clone() else { return };
+    let y = g.tracks_y + row.top - g.scroll_y;
+    let area = bands::area(Rect::new(0.0, y, 1.0, row.height - 1.0), STRIP_H);
+    let next = match (drag, index, &orig) {
+        (Drag::Band { at, y: y0, .. }, _, _) => bands::lift(&orig, at, (y0 - pos.y) / area.h, tg.audio),
+        (_, Some(i), Param::Animated(keys)) if i < keys.len() => {
+            let to = g.time_at(pos.x) - c.timeline_start;
+            let f = (area.bottom() - pos.y) / area.h;
+            let next = bands::drag_key(keys, i, to, f, tg.audio, seq.format.rate, c.source_range.duration);
+            app.seek(c.timeline_start + next[i].time);
+            Param::Animated(next)
+        }
+        _ => return,
+    };
+    if bands::stored(c, tg) != Some(&next) {
+        let cmd = Command::SetEffectParam { clip: c.id, effect: tg.effect, param: tg.param.into(), value: Some(next) };
+        app.engine.execute_merging(cmd, app.drag_gesture);
+    }
+}
+
+/// A press on a clip's band: grab the line or a key; the Pen tool (or
+/// Cmd/Ctrl with Selection) adds a key on the line first.
+fn band_press(app: &mut EditorUi, snap_proj: &Project, seq: &Sequence, g: &Geo, hit: Hit, pos: Vec2, add: bool) -> Option<Drag> {
+    let (clip_id, key) = match hit {
+        Hit::Band { clip, .. } => (clip, None),
+        Hit::BandKey { clip, index, .. } => (clip, Some(index)),
+        _ => return None,
+    };
+    let (s, ti, c) = snap_proj.find_clip(clip_id)?;
+    let tg = bands::target(c, s.tracks[ti].kind)?;
+    let p = bands::stored(c, tg)?.clone();
+    app.view.selection = if app.view.linked { edit::linked(snap_proj, clip_id) } else { vec![clip_id] };
+    if let Some(i) = app.view.selection.iter().position(|x| *x == clip_id) {
+        app.view.selection.swap(0, i);
+    }
+    app.drag_gesture = app.next_gesture();
+    let at = (g.time_at(pos.x) - c.timeline_start).clamp_to(Time::ZERO, c.source_range.duration);
+    let index = match key {
+        Some(i) => i,
+        None if add => {
+            let (keys, i) = bands::add_key(&p, at, seq.format.rate);
+            let cmd = Command::SetEffectParam { clip: c.id, effect: tg.effect, param: tg.param.into(), value: Some(Param::Animated(keys.clone())) };
+            app.engine.execute_merging(cmd, app.drag_gesture);
+            app.view.band_orig = Some(Param::Animated(keys));
+            app.view.graph_key = Some(crate::graph::GraphKey { effect: tg.effect, param: tg.param.into(), index: i });
+            return Some(Drag::BandKey { clip: clip_id, index: i });
+        }
+        None => {
+            app.view.band_orig = Some(p);
+            return Some(Drag::Band { clip: clip_id, at, y: pos.y });
+        }
+    };
+    app.view.band_orig = Some(p.clone());
+    app.view.graph_key = Some(crate::graph::GraphKey { effect: tg.effect, param: tg.param.into(), index });
+    if let Param::Animated(k) = &p {
+        if let Some(k) = k.get(index) {
+            app.seek(c.timeline_start + k.time);
+        }
+    }
+    Some(Drag::BandKey { clip: clip_id, index })
 }
 
 /// Every transition on `track` that plays: its owner, edge, and the
@@ -466,7 +578,8 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
         g.scroll_y = app.view.scroll_y;
     }
 
-    let under = hit(&g, &rows, &seq, r.mouse_pos);
+    let reach = if ui.input().pointer_kind == PointerKind::Touch { 2.5 } else { 1.0 };
+    let under = for_tool(app.view.tool, hit(&g, &rows, &seq, r.mouse_pos, reach));
     let shift = r.modifiers.shift;
     let alt = r.modifiers.alt;
 
@@ -506,6 +619,12 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
                 None
             }
             _ if app.view.tool == Tool::Hand => Some(Drag::Hand),
+            Hit::Band { .. } | Hit::BandKey { .. } => {
+                app.engine.stop();
+                let _ = crate::drag_from(&mut app.drag_start, &r, [0.0, 0.0]);
+                let add = app.view.tool == Tool::Pen || r.modifiers.logo || r.modifiers.ctrl;
+                band_press(app, &snap_proj, &seq, &g, under, r.mouse_pos, add)
+            }
             hit => press_tool(app, &snap_proj, &seq, &g, hit, r.mouse_pos, shift, alt),
         };
     }
@@ -524,11 +643,73 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
                 app.view.selection.clear();
             }
             Hit::Marker(id) => app.view.selected_marker = Some(id),
+            Hit::BandKey { clip, index, .. } => {
+                app.view.selection = vec![clip];
+                if let Some(tg) = snap_proj.find_clip(clip).and_then(|(s, ti, c)| bands::target(c, s.tracks[ti].kind)) {
+                    app.view.graph_key = Some(crate::graph::GraphKey { effect: tg.effect, param: tg.param.into(), index });
+                }
+            }
+            Hit::Band { clip, .. } if !app.view.selection.contains(&clip) => {
+                app.view.selection = if app.view.linked { edit::linked(&snap_proj, clip) } else { vec![clip] };
+            }
             _ => {}
         }
+        let under = match under {
+            Hit::Band { clip, track } => Hit::Clip { clip, track, edge: None },
+            h => h,
+        };
         app.view.timeline_menu = Some((under, at));
     }
-    if let Some((target, at)) = app.view.timeline_menu {
+    if let Some((Hit::BandKey { clip, index, .. }, _)) = app.view.timeline_menu {
+        let found = snap_proj.find_clip(clip).and_then(|(s, ti, c)| {
+            let tg = bands::target(c, s.tracks[ti].kind)?;
+            match bands::stored(c, tg)? {
+                Param::Animated(k) if index < k.len() => Some((tg, k.clone())),
+                _ => None,
+            }
+        });
+        match found {
+            Some((tg, keys)) => {
+                let choice = ui.context_menu(&r, |ui| {
+                    let mut c = None;
+                    for (label, interp) in crate::keys::INTERPS {
+                        if ui.menu_item_ex(label, None, index + 1 < keys.len() || interp == Interp::Hold).clicked {
+                            c = Some(Some(interp));
+                        }
+                    }
+                    ui.menu_separator();
+                    if ui.menu_item("Delete Keyframe").clicked {
+                        c = Some(None);
+                    }
+                    c
+                });
+                match choice {
+                    Some(Some(c)) => {
+                        app.view.timeline_menu = None;
+                        let next = match c {
+                            Some(interp) => {
+                                let mut k = keys;
+                                k[index].interp = interp;
+                                Param::Animated(k)
+                            }
+                            // The last key gone: the level it held, constant.
+                            None if keys.len() == 1 => Param::Constant(keys[0].value.clone()),
+                            None => {
+                                let mut k = keys;
+                                k.remove(index);
+                                Param::Animated(k)
+                            }
+                        };
+                        app.view.graph_key = None;
+                        app.run(Command::SetEffectParam { clip, effect: tg.effect, param: tg.param.into(), value: Some(next) });
+                    }
+                    Some(None) => {}
+                    None => app.view.timeline_menu = None,
+                }
+            }
+            None => app.view.timeline_menu = None,
+        }
+    } else if let Some((target, at)) = app.view.timeline_menu {
         let info = MenuInfo::of(&snap_proj, &seq, target, &app.view.selection, app.engine.source().is_some());
         match ui.context_menu(&r, |ui| menu_items(ui, &info, target, at)) {
             Some(Some(choice)) => {
@@ -575,6 +756,10 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
                     app.view.scroll_x = (app.view.scroll_x - r.drag_delta.x).clamp(0.0, max_x);
                     app.view.scroll_y = (app.view.scroll_y - r.drag_delta.y).clamp(0.0, max_y);
                 }
+                // Past the dead zone only: a click is not a drag.
+                Drag::Band { .. } | Drag::BandKey { .. } if crate::drag_from(&mut app.drag_start, &r, [0.0, 0.0]).is_some() => {
+                    band_drag(app, &snap_proj, &seq, &rows, &g, drag, r.mouse_pos);
+                }
                 _ => {}
             }
         }
@@ -601,6 +786,9 @@ fn surface(ui: &mut Ui, app: &mut EditorUi) {
         ui.cursor = match (app.view.tool, under) {
             (_, Hit::Ruler) => Cursor::ResizeHorizontal,
             (Tool::Hand, _) => Cursor::Grab,
+            (Tool::Pen, Hit::Band { .. }) => Cursor::Crosshair,
+            (_, Hit::Band { .. }) => Cursor::ResizeVertical,
+            (_, Hit::BandKey { .. }) => Cursor::Pointer,
             (Tool::Razor, Hit::Clip { .. }) => Cursor::Crosshair,
             (Tool::Slip, Hit::Clip { .. }) => Cursor::ResizeHorizontal,
             (Tool::Select | Tool::Ripple, Hit::Clip { edge: Some(_), .. }) => Cursor::ResizeHorizontal,
@@ -871,6 +1059,15 @@ struct ClipShot {
     /// once it exists.
     cells: Vec<(f32, Option<TextureId>)>,
     peaks: Option<std::sync::Arc<Vec<f32>>>,
+    band: Option<BandShot>,
+}
+
+/// A clip's rubber band: the line (seconds from the clip's start, height
+/// 0–1) and its keys, the selected one lit.
+struct BandShot {
+    line: Vec<(f32, f32)>,
+    keys: Vec<(f32, f32)>,
+    selected: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -983,6 +1180,16 @@ impl Shot {
                 if let Some(b) = speed_badge(&c.retime) {
                     label = format!("{label} [{b}]");
                 }
+                let band = (row.height >= BAND_MIN_H)
+                    .then(|| bands::target(c, row.kind))
+                    .flatten()
+                    .and_then(|tg| {
+                        let p = bands::stored(c, tg)?;
+                        let samples = ((len * g.pps) / 6.0).clamp(2.0, 240.0) as usize;
+                        let (line, keys) = bands::shape(p, len as f64, tg.audio, samples);
+                        let selected = app.view.graph_key.as_ref().filter(|k| k.effect == tg.effect && k.param == tg.param).map(|k| k.index);
+                        Some(BandShot { line, keys, selected })
+                    });
                 clips.push(ClipShot {
                     name: ui.frame_text(&label),
                     row: ri,
@@ -996,6 +1203,7 @@ impl Shot {
                     src_start,
                     cells,
                     peaks,
+                    band,
                 });
             }
         }
@@ -1164,6 +1372,22 @@ impl Shot {
                 ClipKind::Title => p.rect(body.shrink(4.0, 3.0, 4.0, 3.0), Color::WHITE.with_alpha(0.10), 2.0),
                 ClipKind::Nest => nest_body(p, body),
                 ClipKind::Video => filmstrip(p, body, c.tint, &c.cells),
+            }
+        }
+        if let Some(b) = &c.band {
+            let area = bands::area(r, STRIP_H);
+            let pt = |(t, f): (f32, f32)| Vec2::new(r.x + t * self.pps, area.bottom() - f * area.h);
+            let color = REEL.band;
+            for w in b.line.windows(2) {
+                p.line(pt(w[0]), pt(w[1]), 1.0, color);
+            }
+            for (i, k) in b.keys.iter().enumerate() {
+                let q = pt(*k);
+                let on = b.selected == Some(i) && c.selected;
+                let s = if on { 4.5 } else { 3.5 };
+                let fill = if on { self.accent } else { color };
+                p.draw.triangle(Vec2::new(q.x - s, q.y), Vec2::new(q.x, q.y - s), Vec2::new(q.x + s, q.y), 0b011, fill);
+                p.draw.triangle(Vec2::new(q.x - s, q.y), Vec2::new(q.x + s, q.y), Vec2::new(q.x, q.y + s), 0b110, fill);
             }
         }
         let border = if c.selected { REEL.selected } else { REEL.clip_border };
@@ -1466,6 +1690,8 @@ fn menu_items(ui: &mut Ui, info: &MenuInfo, target: Hit, _at: Time) -> Option<Ch
             item(ui, "Clear", true, Choice::Lift);
             item(ui, "Ripple Delete", true, Choice::RippleDelete);
         }
+        // (A band key has its own menu; the band's line is the clip's.)
+        Hit::Band { .. } | Hit::BandKey { .. } => {}
         Hit::Transition { clip, edge } => {
             item(ui, "Set Duration…", true, Choice::TransitionDuration);
             item(ui, "Clear", true, Choice::RemoveTransition(clip, edge));

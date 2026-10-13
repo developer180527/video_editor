@@ -109,7 +109,7 @@ fn sample(param: &Param, clip_start: f64, t: f64) -> f64 {
 impl EditorUi {
     /// Replace the parameter's keys, as part of drag `gesture` (one undo
     /// step per drag) or on their own.
-    fn set_keys(&mut self, clip: ClipId, effect: EffectId, param: &str, keys: Vec<Keyframe>, gesture: Option<u64>) {
+    pub(crate) fn set_keys(&mut self, clip: ClipId, effect: EffectId, param: &str, keys: Vec<Keyframe>, gesture: Option<u64>) {
         let cmd = Command::SetEffectParam { clip, effect, param: param.into(), value: Some(Param::Animated(keys)) };
         match gesture {
             Some(g) => self.engine.execute_merging(cmd, g),

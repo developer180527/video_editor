@@ -15,7 +15,7 @@ use ve_engine::{EffectInfo, Implementation, ParamInfo, ParamKind};
 use ve_time::{Time, Timecode};
 
 use crate::theme::REEL;
-use crate::widgets::{draw_icon, icon_button, prop_row, value, Icon, Prop};
+use crate::widgets::{draw_icon, icon_button, prop_row, value, Icon, KeyNav, NavClick, Prop};
 use crate::{EditorUi, ParamEdit};
 
 /// The clip's slice of the timeline the lanes show.
@@ -556,6 +556,11 @@ fn param_row(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>,
     if p.animatable {
         prop = prop.stopwatch(animated);
     }
+    let rate = app.rate();
+    if let Param::Animated(k) = &stored {
+        let (prev, next) = crate::keys::neighbours(k, t, rate);
+        prop = prop.nav(KeyNav { prev: prev.is_some(), on_key: crate::keys::key_at(k, t, rate).is_some(), next: next.is_some() });
+    }
     let key = (e.id, p.id.as_str());
     let (resp, seek) = row(
         ui,
@@ -646,7 +651,7 @@ fn param_row(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>,
                 }
             })
         },
-        |ui| lane(ui, span, Some(&keys)),
+        |ui| if animated { crate::keys::lane(ui, app, clip, e, &p.id, &stored, span) } else { lane(ui, span, Some(&keys)) },
     );
     if cancel_preview {
         app.view.param_edit = None;
@@ -666,6 +671,20 @@ fn param_row(ui: &mut Ui, app: &mut EditorUi, clip: &Arc<Clip>, e: &Arc<Effect>,
             Param::Animated(_) => Param::Constant(stored.value_at(t)),
         };
         app.run(set(next));
+    }
+    let mut seek = seek;
+    if let (Some(nav), Param::Animated(k)) = (resp.nav, &stored) {
+        let (prev, next) = crate::keys::neighbours(k, t, rate);
+        match nav {
+            NavClick::Prev => seek = prev.map(|p| clip.timeline_start + p),
+            NavClick::Next => seek = next.map(|n| clip.timeline_start + n),
+            NavClick::Toggle => {
+                if let Some(keys) = crate::keys::toggle(&stored, t, rate) {
+                    app.view.graph_key = None;
+                    app.run(set(Param::Animated(keys)));
+                }
+            }
+        }
     }
     if resp.reset_clicked {
         let d = default_for(app, clip, p);

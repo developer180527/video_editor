@@ -63,6 +63,10 @@ pub enum Icon {
     Sort,
     Effects,
     AddTrack,
+    KeyPrev,
+    KeyNext,
+    Keyframe,
+    KeyframeOn,
 }
 
 impl Icon {
@@ -119,6 +123,10 @@ impl Icon {
         Icon::Sort,
         Icon::Effects,
         Icon::AddTrack,
+        Icon::KeyPrev,
+        Icon::KeyNext,
+        Icon::Keyframe,
+        Icon::KeyframeOn,
     ];
 }
 
@@ -235,11 +243,31 @@ pub struct Prop<'a> {
     pub reset: bool,
     /// Greyed out, the way a value governed by another one is.
     pub dim: bool,
+    /// The keyframe navigator (◀ ◆ ▶) of an animated value.
+    pub nav: Option<KeyNav>,
+}
+
+/// What the keyframe navigator shows: whether there are keys either side of
+/// the playhead, and whether the playhead is on one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyNav {
+    pub prev: bool,
+    pub on_key: bool,
+    pub next: bool,
+}
+
+/// What the keyframe navigator was asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavClick {
+    Prev,
+    /// Add a key at the playhead, or remove the one there.
+    Toggle,
+    Next,
 }
 
 impl<'a> Prop<'a> {
     pub fn new(label: &'a str) -> Self {
-        Self { depth: 1, label, twirl: None, stopwatch: None, reset: true, dim: false }
+        Self { depth: 1, label, twirl: None, stopwatch: None, reset: true, dim: false, nav: None }
     }
 
     pub fn twirl(mut self, open: &'a mut bool) -> Self {
@@ -249,6 +277,11 @@ impl<'a> Prop<'a> {
 
     pub fn stopwatch(mut self, animated: bool) -> Self {
         self.stopwatch = Some(animated);
+        self
+    }
+
+    pub fn nav(mut self, nav: KeyNav) -> Self {
+        self.nav = Some(nav);
         self
     }
 
@@ -266,6 +299,7 @@ impl<'a> Prop<'a> {
 pub struct PropResponse<R> {
     pub stopwatch_clicked: bool,
     pub reset_clicked: bool,
+    pub nav: Option<NavClick>,
     pub out: R,
 }
 
@@ -289,6 +323,7 @@ pub fn prop_row<R>(ui: &mut Ui, key: impl std::hash::Hash + Copy, prop: Prop<'_>
             None => ui.space(14.0),
         }
         let mut stopwatch_clicked = false;
+        let animatable = prop.stopwatch.is_some();
         match prop.stopwatch {
             Some(animated) => {
                 let r = icon_button(ui, (key, "sw"), Icon::Stopwatch, 16.0, animated);
@@ -302,6 +337,28 @@ pub fn prop_row<R>(ui: &mut Ui, key: impl std::hash::Hash + Copy, prop: Prop<'_>
         ui.flex();
         let out = right(ui);
         ui.space(2.0);
+        let mut nav = None;
+        if prop.nav.is_none() && animatable {
+            // Values line up whether or not their row is animated.
+            ui.space(3.0 * 14.0 + 2.0 * 4.0);
+        }
+        if let Some(n) = prop.nav {
+            let r = icon_button(ui, (key, "kp"), Icon::KeyPrev, 14.0, false);
+            ui.tooltip(&r, "Go to Previous Keyframe");
+            if r.clicked && n.prev {
+                nav = Some(NavClick::Prev);
+            }
+            let r = icon_button(ui, (key, "kt"), if n.on_key { Icon::KeyframeOn } else { Icon::Keyframe }, 14.0, n.on_key);
+            ui.tooltip(&r, if n.on_key { "Remove Keyframe" } else { "Add Keyframe" });
+            if r.clicked {
+                nav = Some(NavClick::Toggle);
+            }
+            let r = icon_button(ui, (key, "kn"), Icon::KeyNext, 14.0, false);
+            ui.tooltip(&r, "Go to Next Keyframe");
+            if r.clicked && n.next {
+                nav = Some(NavClick::Next);
+            }
+        }
         let reset_clicked = if prop.reset {
             let r = icon_button(ui, (key, "rst"), Icon::Reset, 16.0, false);
             ui.tooltip(&r, "Reset to default");
@@ -310,6 +367,6 @@ pub fn prop_row<R>(ui: &mut Ui, key: impl std::hash::Hash + Copy, prop: Prop<'_>
             ui.space(14.0);
             false
         };
-        PropResponse { stopwatch_clicked, reset_clicked, out }
+        PropResponse { stopwatch_clicked, reset_clicked, nav, out }
     })
 }
