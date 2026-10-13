@@ -208,7 +208,7 @@ fn autosave_writes_unsaved_changes_only() {
 #[test]
 fn every_audio_stream_gets_a_track_and_a_clip() {
     let mut e = engine(&tmp("streams"));
-    let stream = |layout: &str, channels| AudioStreamInfo { sample_rate: 48_000, channels, codec: "pcm_s24le".into(), layout: layout.into() };
+    let stream = |layout: &str, channels| AudioStreamInfo { sample_rate: 48_000, channels, codec: "pcm_s24le".into(), layout: layout.into(), decodable: true };
     let asset = Asset {
         id: AssetId::new(),
         name: "cam.mxf".into(),
@@ -257,7 +257,7 @@ fn clips_must_name_an_existing_stream() {
         id: AssetId::new(),
         name: "a.wav".into(),
         media: MediaRef("file:a.wav".into()),
-        info: Some(MediaInfo { duration: Time::from_seconds(1), video: None, audio: vec![AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: "pcm".into(), layout: "stereo".into() }] }),
+        info: Some(MediaInfo { duration: Time::from_seconds(1), video: None, audio: vec![AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: "pcm".into(), layout: "stereo".into(), decodable: true }] }),
         variants: Vec::new(),
         marks: Default::default(),
     };
@@ -342,7 +342,7 @@ fn a_sequence_cannot_contain_itself() {
 #[test]
 fn the_source_monitor_has_its_own_playhead() {
     let mut e = engine(&tmp("source-monitor"));
-    let stream = AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: "pcm".into(), layout: "stereo".into() };
+    let stream = AudioStreamInfo { sample_rate: 48_000, channels: 2, codec: "pcm".into(), layout: "stereo".into(), decodable: true };
     let asset = Asset {
         id: AssetId::new(),
         name: "cam.mov".into(),

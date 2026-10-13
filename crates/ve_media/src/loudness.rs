@@ -100,12 +100,23 @@ pub struct LoudnessMeter {
     sub_count: usize,
     /// The last 30 sub-blocks' energies (3 s), newest last.
     subs: VecDeque<f64>,
-    /// Every 400 ms block's energy since the reset, for integrated loudness.
-    blocks: Vec<f64>,
+    /// Every 400 ms block's energy so far, as a histogram of its loudness
+    /// in 0.1 LU steps from -70 LUFS (each bin: blocks, summed energy).
+    /// Gating then costs the same after an hour as after a second; a list
+    /// of every block, rescanned on each read, did not.
+    hist: Vec<(u32, f64)>,
     tp: [[f32; TP_TAPS]; 4],
     history: [[f32; TP_TAPS]; 2],
     head: usize,
     peak: f32,
+}
+
+const HIST_BINS: usize = 900; // -70 .. +20 LUFS
+
+/// The histogram bin of a block of `energy`; `None` below -70 LUFS.
+fn bin(energy: f64) -> Option<usize> {
+    let l = lufs(energy);
+    (l > -70.0).then(|| (((l + 70.0) * 10.0) as usize).min(HIST_BINS - 1))
 }
 
 fn lufs(energy: f64) -> f32 {
@@ -125,7 +136,7 @@ impl LoudnessMeter {
             sub_energy: 0.0,
             sub_count: 0,
             subs: VecDeque::with_capacity(30),
-            blocks: Vec::new(),
+            hist: vec![(0, 0.0); HIST_BINS],
             tp: true_peak_filter(),
             history: [[0.0; TP_TAPS]; 2],
             head: 0,
@@ -175,7 +186,10 @@ impl LoudnessMeter {
         self.sub_count = 0;
         if self.subs.len() >= 4 {
             let block = self.subs.iter().rev().take(4).sum::<f64>() / 4.0;
-            self.blocks.push(block);
+            if let Some(i) = bin(block) {
+                self.hist[i].0 += 1;
+                self.hist[i].1 += block;
+            }
         }
     }
 
@@ -188,14 +202,14 @@ impl LoudnessMeter {
         // Short-term over what there is until 3 s have passed.
         let short_term = self.mean_of_last(self.subs.len().clamp(4, 30)).map_or(f32::NEG_INFINITY, lufs);
         // Gated: absolute at -70 LUFS, then relative at -10 LU.
-        let gate = |threshold: f64| {
-            let kept: Vec<f64> = self.blocks.iter().copied().filter(|&e| e > threshold).collect();
-            (!kept.is_empty()).then(|| kept.iter().sum::<f64>() / kept.len() as f64)
+        // Mean energy of the blocks louder than `from` LUFS (to the bin).
+        let gate = |from: f32| {
+            let first = (((from + 70.0) * 10.0).floor().max(0.0) as usize).min(HIST_BINS);
+            let (n, e) = self.hist[first..].iter().fold((0u64, 0f64), |(n, e), (c, s)| (n + *c as u64, e + s));
+            (n > 0).then(|| e / n as f64)
         };
-        let to_energy = |l: f64| 10f64.powf((l + 0.691) / 10.0);
-        let integrated = gate(to_energy(-70.0))
-            .and_then(|mean| gate(to_energy(lufs(mean) as f64 - 10.0)))
-            .map_or(f32::NEG_INFINITY, lufs);
+        // Absolute gate (-70 LUFS: the histogram starts there), then relative (-10 LU).
+        let integrated = gate(-70.0).and_then(|mean| gate(lufs(mean) - 10.0)).map_or(f32::NEG_INFINITY, lufs);
         let true_peak = if self.peak > 0.0 { 20.0 * self.peak.log10() } else { f32::NEG_INFINITY };
         Loudness { momentary, short_term, integrated, true_peak }
     }

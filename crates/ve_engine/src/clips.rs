@@ -119,7 +119,9 @@ pub fn clips_for_asset(
     first_audio: Option<TrackId>,
 ) -> (Vec<crate::Command>, Vec<(TrackId, Arc<Clip>)>) {
     let Some(info) = &asset.info else { return (vec![], vec![]) };
-    let streams = info.audio.len();
+    // The audio streams that can be heard (by their index in the file).
+    let heard: Vec<usize> = (0..info.audio.len()).filter(|&k| info.audio[k].decodable).collect();
+    let streams = heard.len();
     let link = (info.video.is_some() as usize + streams > 1).then(LinkId::new);
     let mut items = Vec::new();
     if let (Some(_), Some(t)) = (&info.video, video_track.or_else(|| seq.tracks.iter().find(|t| t.kind == TrackKind::Video).map(|t| t.id))) {
@@ -136,11 +138,11 @@ pub fn clips_for_asset(
         tracks.push(track.id);
         adds.push(crate::Command::AddTrack { sequence: seq.id, index: seq.tracks.len() + adds.len(), track: Arc::new(track) });
     }
-    for (k, t) in tracks.into_iter().enumerate() {
+    for (n, (k, t)) in heard.into_iter().zip(tracks).enumerate() {
         let mut clip = make_clip(registry, &seq.format, asset, TrackKind::Audio, duration, link);
         clip.source = ClipSource::Asset { asset: asset.id, audio_stream: k as u32 };
         if streams > 1 {
-            clip.name = format!("{} [A{}]", asset.name, k + 1);
+            clip.name = format!("{} [A{}]", asset.name, n + 1);
         }
         items.push((t, Arc::new(clip)));
     }

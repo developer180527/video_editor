@@ -47,6 +47,9 @@ struct State {
     thumb_bytes: usize,
     peaks: HashMap<(AssetId, usize), Arc<Vec<f32>>>,
     failed: HashSet<AssetId>,
+    /// Sound that could not be read (an audio track no decoder here reads):
+    /// not asked for again, or every frame would ask and fail.
+    failed_peaks: HashSet<(AssetId, usize)>,
     version: u64,
 }
 
@@ -110,7 +113,7 @@ impl Stills {
         match st.peaks.get(&(asset, stream)) {
             Some(p) => Some(p.clone()),
             None => {
-                if !st.failed.contains(&asset) {
+                if !st.failed_peaks.contains(&(asset, stream)) {
                     self.ask(&mut st, Job::Peaks(asset, media.clone(), stream));
                 }
                 None
@@ -189,6 +192,25 @@ impl State {
     }
 }
 
+/// Where `media`'s peaks for audio `stream` are cached: named by the file's
+/// reference, size and modification time, so an edited file is redone.
+fn cache_ref(storage: &dyn Storage, media: &MediaRef, stream: usize, r: &ve_ports::Resolved) -> Option<MediaRef> {
+    let meta = std::fs::metadata(r.path.as_ref()?).ok()?;
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    // FNV-1a: stable across runs and versions (std's hasher is not promised to be).
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in media.0.bytes().chain(meta.len().to_le_bytes()).chain(modified.to_le_bytes()).chain((stream as u64).to_le_bytes()).chain(PEAKS_PER_SECOND.to_le_bytes()) {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    storage.location(ve_ports::Location::Cache, &format!("Waveforms/{h:016x}.peaks")).ok()
+}
+
+fn read_peaks(storage: &dyn Storage, r: &MediaRef) -> Option<Vec<f32>> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut storage.open_read(r).ok()?, &mut bytes).ok()?;
+    (!bytes.is_empty() && bytes.len() % 4 == 0).then(|| bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
+}
+
 fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>) {
     // The last asset's decoder stays open: thumbnails come in runs along a
     // clip, and opening a file costs far more than seeking it.
@@ -238,7 +260,12 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
             Job::Peaks(asset, m, stream) => {
                 let rate = 8_000u32;
                 let per = (rate / PEAKS_PER_SECOND) as usize;
-                let peaks = storage.resolve(m).ok().and_then(|r| media.open_audio(&r, *stream, rate, 1).ok()).map(|mut d| {
+                // Made once per file and kept on disk: decoding a feature's
+                // whole soundtrack again on every launch cost seconds of a core.
+                let cache = storage.resolve(m).ok().and_then(|r| cache_ref(&*storage, m, *stream, &r));
+                let cached = cache.as_ref().and_then(|c| read_peaks(&*storage, c));
+                let fresh = cached.is_none();
+                let peaks = cached.or_else(|| storage.resolve(m).ok().and_then(|r| media.open_audio(&r, *stream, rate, 1).ok()).map(|mut d| {
                     let mut out = Vec::new();
                     let (mut acc, mut n) = (0f32, 0usize);
                     while let Ok(Some(b)) = d.next_block() {
@@ -253,7 +280,11 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
                         }
                     }
                     out
-                });
+                }));
+                if let (true, Some(c), Some(p)) = (fresh, &cache, &peaks) {
+                    let bytes: Vec<u8> = p.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = storage.write_atomic(c, &bytes);
+                }
                 match peaks {
                     Some(p) => {
                         if let Some(stills) = s.upgrade() {
@@ -269,9 +300,14 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
         };
         if let Some(stills) = s.upgrade() {
             if let Err(asset) = result {
-                // Audio-only files have no picture, video-only no sound: not errors.
-                if matches!(job, Job::Thumb(..)) {
-                    stills.state.lock().unwrap().failed.insert(asset);
+                let mut st = stills.state.lock().unwrap();
+                match &job {
+                    Job::Thumb(..) => {
+                        st.failed.insert(asset);
+                    }
+                    Job::Peaks(_, _, stream) => {
+                        st.failed_peaks.insert((asset, *stream));
+                    }
                 }
             }
             stills.state.lock().unwrap().queued.remove(&job);

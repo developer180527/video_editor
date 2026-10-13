@@ -728,7 +728,7 @@ mod tests {
     }
 
     fn signal_asset(p: &mut Project, name: &str, channels: u16) -> AssetId {
-        let stream = AudioStreamInfo { sample_rate: 48_000, channels, codec: "pcm".into(), layout: String::new() };
+        let stream = AudioStreamInfo { sample_rate: 48_000, channels, codec: "pcm".into(), layout: String::new(), decodable: true };
         let a = Asset::new(name, MediaRef(name.into()), Some(MediaInfo { duration: Time::from_seconds(100), video: None, audio: vec![stream] }));
         let id = a.id;
         p.assets.insert(id, Arc::new(a));

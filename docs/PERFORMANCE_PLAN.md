@@ -186,3 +186,47 @@ app's Documents.
 | UHD HEVC 10-bit, playing | **121** | **62–75 %** (about twice the Mac's 36 %) |
 
 The same story as the Mac, at twice the cost: WO-1 and WO-2 matter most here.
+
+## Second round (2026-10-13): the newer features, and real files
+
+Measured on the same MacBook Pro (M4 Pro): the app (`top`: CPU % of one
+core and macOS energy impact, mean over 12 s after settling) and
+`ve bench --secs 8`.
+
+| State | Before | After |
+|---|---|---|
+| Idle · project open, paused | 0.4 % · 0.4 % | — |
+| Playing 1080p · UHD H.264 · UHD HEVC 10-bit | 14.3 · 17.4 · 17.5 % | — |
+| UHD HEVC + blur, grade, glow, title, dissolve | 29.4 % | — |
+| 1080p + built-in audio chain (HPF, EQ, comp, limiter, reverb) | 14.5 % (+0.01 cores in the bench) | — |
+| 1080p + two CLAP effects | 16.9 % (+0.04 cores) | — |
+| 2 h H.264 movie playing | 14.7 % | — |
+| **iPhone HDR clip (VFR, with an APAC track), paused** | **33.9 %, forever** | **0.4 %** |
+| **iPhone HDR clip playing (60 fps)** | **44.5 %** | **15.0 %** |
+| **Opening the 2 h movie again (first 15 s)** | **44 % (peaks 105 %)** | **13.8 %** |
+| Startup with CLAP plugins installed | 0.06 s (0.05 without) | — |
+
+What was found and fixed:
+
+- **A waveform that cannot be made was asked for on every frame.** iPhones
+  record a second audio track in Apple's APAC, which no decoder here reads;
+  its waveform failed, the failure was not remembered, the UI was woken,
+  asked again… 121 UI rebuilds a second while paused. Failures are now
+  remembered, and audio tracks that cannot be decoded get no clips
+  (`AudioStreamInfo::decodable`).
+- **Integrated loudness rescanned the whole playback on every mixer block**
+  (allocating), so the meter cost grew with time: 21 % of the mixer after
+  10 s, linear after that. Now a histogram of block loudness (0.1 LU bins):
+  constant cost.
+- **Waveforms were decoded again on every launch** (a feature's soundtrack:
+  a core for ~15 s). They are cached in Caches/VideoEditor/Waveforms, keyed
+  by file, size and modification time.
+
+Where 1080p playback's ~17 % of a core goes (Time Profiler, 10 s): main
+thread 37 % (compositor encoding 17 %, the UI 20 %), Metal submission on
+system threads ~25 %, the mixer 10 % (resampling 23 % of it, the loudness
+meter 21 % before the fix), decoding 5 %, thumbnails 3 %.
+
+Left as is: scrubbing that jumps 15 times a second across a file (the
+bench's synthetic case) shows stand-ins 100+ frames away — real drags (the
+"dragging" rows) stay within 0–2 frames forwards, 11 backwards at p95.

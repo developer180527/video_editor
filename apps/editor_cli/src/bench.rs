@@ -101,6 +101,11 @@ enum Kind {
     /// The clip with a blur, the grade and a glow; a title over it; a
     /// dissolve into a second copy half-way.
     Effects,
+    /// The plain clip with the built-in audio effects a dialogue clean-up
+    /// uses: high-pass, EQ, compressor, limiter, reverb.
+    AudioFx,
+    /// The plain clip with CLAP effects (the first two installed).
+    Clap,
 }
 
 fn project(path: &Path, kind: Kind, secs: u32) -> Result<Engine, String> {
@@ -123,6 +128,24 @@ fn project(path: &Path, kind: Kind, secs: u32) -> Result<Engine, String> {
             (a1, Arc::new(make_clip(e.plugins(), &seq.format, &a, TrackKind::Audio, d, Some(link)))),
         ];
         e.execute(edit::overwrite(&snap, seq.id, at, &items).map_err(|x| x.to_string())?).map_err(|x| x.to_string())?;
+    }
+    if matches!(kind, Kind::AudioFx | Kind::Clap) {
+        let reg = e.plugins().clone();
+        let clip = e.snapshot().active().unwrap().tracks[2].clips[0].id;
+        let chosen: Vec<ve_engine::EffectInfo> = if kind == Kind::AudioFx {
+            ["ve.audio.highpass", "ve.audio.eq", "ve.audio.compressor", "ve.audio.limiter", "ve.audio.reverb"].iter().filter_map(|id| reg.find_id(PluginApi::Builtin, id).cloned()).collect()
+        } else {
+            reg.effects().iter().filter(|e| e.plugin.api == PluginApi::Clap).take(2).cloned().collect()
+        };
+        if chosen.is_empty() {
+            return Err("no such audio effects installed".into());
+        }
+        for info in chosen {
+            let params: OrdMap<String, Param> = info.params.iter().map(|p| (p.id.clone(), Param::Constant(ve_engine::default_value(&p.kind, p.default)))).collect();
+            let effect = Effect { id: EffectId::new(), plugin: info.plugin.clone(), enabled: true, params };
+            let index = e.snapshot().find_clip(clip).unwrap().2.effects.len();
+            e.execute(Cmd::AddEffect { clip, index, effect: Arc::new(effect) }).map_err(|x| x.to_string())?;
+        }
     }
     if kind == Kind::Effects {
         let reg = e.plugins().clone();
@@ -274,7 +297,7 @@ pub fn bench(args: &[String]) -> i32 {
         return 1;
     };
     println!("ve bench — {} s per scenario; cores = CPU time / wall time (all threads)", run_secs);
-    let cases = [("1080p H.264", &m.hd, Kind::Plain), ("UHD H.264", &m.uhd_h264, Kind::Plain), ("UHD HEVC 10-bit", &m.uhd_hevc, Kind::Plain), ("UHD HEVC + effects", &m.uhd_hevc, Kind::Effects)];
+    let cases = [("1080p H.264", &m.hd, Kind::Plain), ("UHD H.264", &m.uhd_h264, Kind::Plain), ("UHD HEVC 10-bit", &m.uhd_hevc, Kind::Plain), ("UHD HEVC + effects", &m.uhd_hevc, Kind::Effects), ("1080p + audio effects", &m.hd, Kind::AudioFx), ("1080p + CLAP effects", &m.hd, Kind::Clap)];
     for (label, path, kind) in cases {
         if only.as_ref().is_some_and(|o| !label.to_lowercase().contains(&o.to_lowercase())) {
             continue;

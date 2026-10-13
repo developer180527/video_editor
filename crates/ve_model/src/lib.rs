@@ -252,6 +252,14 @@ pub struct AudioStreamInfo {
     /// "7.1"; or "N channels" when the file does not say.
     #[serde(default)]
     pub layout: String,
+    /// Whether this machine can decode it. Phones add tracks no decoder
+    /// here reads (Apple's spatial-audio APAC); they get no clips.
+    #[serde(default = "yes")]
+    pub decodable: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The format a sequence renders at.

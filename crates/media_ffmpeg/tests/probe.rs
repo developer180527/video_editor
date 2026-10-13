@@ -367,3 +367,16 @@ fn variable_frame_rate_frames_meet_end_to_end() {
     let f = dec.next_frame().unwrap().unwrap();
     assert!(f.pts <= t && t < f.pts + f.duration, "{:?} + {:?} covers {:?}", f.pts, f.duration, t);
 }
+
+#[test]
+#[ignore]
+fn debug_open_audio_of_a_given_file() {
+    let Ok(p) = std::env::var("VE_DEBUG_FILE") else { return };
+    let r = Resolved { path: Some(p.into()), guard: Box::new(()) };
+    let ff = Ffmpeg::new();
+    println!("{:?}", ff.probe(&r).map(|i| i.audio));
+    match ff.open_audio(&r, 0, 8000, 1) {
+        Ok(mut d) => println!("opened; first block {:?}", d.next_block().map(|b| b.map(|b| b.samples.len()))),
+        Err(e) => println!("open_audio failed: {e}"),
+    }
+}

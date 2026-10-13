@@ -160,6 +160,7 @@ impl MediaBackend for Ffmpeg {
                         channels: par.ch_layout.nb_channels as u16,
                         codec: codec_name(par.codec_id),
                         layout,
+                        decodable: !unsafe { sys::avcodec_find_decoder(par.codec_id) }.is_null(),
                     });
                 }
                 _ => {}
