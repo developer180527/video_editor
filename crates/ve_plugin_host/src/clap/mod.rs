@@ -417,7 +417,8 @@ impl ClapHost {
                             fp = unsafe { fp.add(1) };
                         }
                         if !features.iter().any(|f| f == FEATURE_AUDIO_EFFECT) {
-                            return None; // instruments, analyzers, note effects
+                            // Instruments, analyzers, note effects: said, not silently dropped.
+                            return Some(Err(format!("{}: not an audio effect ({})", cstr(d.name), features.join(", "))));
                         }
                         let (id, name, vendor) = (cstr(d.id), cstr(d.name), cstr(d.vendor));
                         let cid = CString::new(id.clone()).ok()?;
