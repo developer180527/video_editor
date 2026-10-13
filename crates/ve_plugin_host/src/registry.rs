@@ -74,6 +74,8 @@ pub enum Implementation {
 #[derive(Default)]
 pub struct Registry {
     effects: Vec<EffectInfo>,
+    /// Instances of the audio effects that come from plugins (CLAP).
+    audio: Option<std::sync::Arc<dyn ve_ports::AudioPlugins>>,
 }
 
 impl Registry {
@@ -82,6 +84,15 @@ impl Registry {
         // earlier: a user-installed plugin overrides a bundled one.
         self.effects.retain(|x| x.plugin != e.plugin);
         self.effects.push(e);
+    }
+
+    /// Where the mixer gets plugin audio effects from.
+    pub fn set_audio_plugins(&mut self, p: std::sync::Arc<dyn ve_ports::AudioPlugins>) {
+        self.audio = Some(p);
+    }
+
+    pub fn audio_plugins(&self) -> Option<std::sync::Arc<dyn ve_ports::AudioPlugins>> {
+        self.audio.clone()
     }
 
     pub fn effects(&self) -> &[EffectInfo] {

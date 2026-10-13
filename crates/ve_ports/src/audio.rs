@@ -119,3 +119,19 @@ pub trait AudioInput: Send + Sync {
     /// Capture at the device's own format ([`AudioInput::preferred`]).
     fn open(&self, capture: CaptureCallback) -> Result<Box<dyn CaptureStream>, AudioError>;
 }
+
+/// An instance of a third-party audio effect (a CLAP plugin), run by the
+/// mixer on a clip's sound. Created and destroyed off the audio thread by
+/// its host; `process` and `reset` are called on the mixer's thread.
+pub trait AudioProcessor: Send {
+    /// Process a block of stereo audio in place. `params` are the effect's
+    /// parameter values (by parameter id) at the block's start.
+    fn process(&mut self, params: &[(&str, f64)], left: &mut [f32], right: &mut [f32]);
+    /// Forget tails and history: the clip jumped.
+    fn reset(&mut self);
+}
+
+/// Makes [`AudioProcessor`]s for effects that are not built in.
+pub trait AudioPlugins: Send + Sync {
+    fn instantiate(&self, plugin: &ve_model::PluginRef, sample_rate: u32) -> Result<Box<dyn AudioProcessor>, String>;
+}

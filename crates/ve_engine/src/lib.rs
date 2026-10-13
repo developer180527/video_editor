@@ -171,6 +171,16 @@ impl Engine {
                 Err(e) => self.events.push(Event::Error(e.to_string())),
             }
         }
+        // CLAP audio effects, where plugin files may be loaded. Kept loaded
+        // for the app's life; the mixers make instances through the registry.
+        if self.capabilities().dynamic_libraries {
+            let clap = ve_plugin_host::clap::ClapHost::scan(&*libs);
+            for (path, why) in &clap.problems {
+                eprintln!("CLAP {path}: {why}");
+            }
+            clap.effects().iter().cloned().for_each(|e| registry.add(e));
+            registry.set_audio_plugins(Arc::new(clap));
+        }
         self.plugins = Arc::new(registry);
         self.events.push(Event::PluginsChanged);
     }
@@ -492,7 +502,10 @@ impl Engine {
             return;
         }
         let cfg = self.platform.audio.preferred().unwrap_or(AudioConfig { sample_rate: MIX_RATE, channels: 2, buffer_frames: 512 });
-        let mixer = ve_media::Mixer::new(self.platform.storage.clone(), self.platform.media.clone(), cfg.sample_rate);
+        let mut mixer = ve_media::Mixer::new(self.platform.storage.clone(), self.platform.media.clone(), cfg.sample_rate);
+        if let Some(p) = self.plugins.audio_plugins() {
+            mixer.set_plugins(p);
+        }
         let (playback, callback) = ve_media::Playback::new(mixer, cfg.channels);
         match self.platform.audio.open(cfg, callback) {
             Ok(mut s) => {

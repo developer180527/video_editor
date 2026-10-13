@@ -15,3 +15,9 @@ naga = { version = "30", default-features = false, features = ["wgsl-in"] }
 
 [dev-dependencies]
 ve_builtins.workspace = true
+platform_desktop.workspace = true
+platform_headless.workspace = true
+ve_media.workspace = true
+ve_time.workspace = true
+# Built for its .dylib/.so/.dll, which tests/clap_host.rs loads.
+clap_test_gain = { path = "../clap_test_gain" }

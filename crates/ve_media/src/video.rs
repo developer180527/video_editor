@@ -612,8 +612,11 @@ mod tests {
             let f = pool.frame_blocking(&m, RATE.frame_to_time(i), WAIT).unwrap();
             assert_eq!(f.pts, RATE.frame_to_time(i));
         }
+        // 60 shown, the 10-frame look-ahead, and a few more the decoder may
+        // start while the test thread races it (the old bound of 75 failed
+        // ~1 run in 8 on a busy machine). Decoding the file would be 10 000.
         let n = decoded.load(Ordering::SeqCst);
-        assert!(n <= 75, "decoded {n} frames to play 60");
+        assert!(n <= 85, "decoded {n} frames to play 60");
     }
 
     #[test]

@@ -92,6 +92,23 @@ fn plugin_extension(kind: &str) -> &'static str {
     }
 }
 
+/// The code inside a macOS bundle (`Name.clap/Contents/MacOS/Name`): the
+/// executable its Info.plist names, else the only file there. `None` for a
+/// plain file.
+fn bundle_binary(path: &std::path::Path) -> Option<PathBuf> {
+    if !path.is_dir() {
+        return None;
+    }
+    let macos = path.join("Contents").join("MacOS");
+    let plist = std::fs::read_to_string(path.join("Contents").join("Info.plist")).unwrap_or_default();
+    let named = plist.split("<key>CFBundleExecutable</key>").nth(1).and_then(|rest| {
+        let start = rest.find("<string>")? + "<string>".len();
+        let end = rest[start..].find("</string>")?;
+        Some(macos.join(rest[start..start + end].trim()))
+    });
+    named.filter(|p| p.is_file()).or_else(|| std::fs::read_dir(&macos).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.is_file()))
+}
+
 pub struct DesktopLibraries {
     /// Built-in plugins linked into the app.
     pub linked: Vec<fn() -> Box<dyn NativeLibrary>>,
@@ -134,7 +151,8 @@ impl NativeLibraries for DesktopLibraries {
     }
 
     fn load(&self, path: &str) -> Result<Box<dyn NativeLibrary>, LibraryError> {
-        let lib = unsafe { libloading::Library::new(path) }.map_err(|e| LibraryError::Other(e.to_string()))?;
+        let file = bundle_binary(std::path::Path::new(path)).unwrap_or_else(|| path.into());
+        let lib = unsafe { libloading::Library::new(&file) }.map_err(|e| LibraryError::Other(e.to_string()))?;
         Ok(Box::new(Dylib { name: path.into(), lib }))
     }
 }

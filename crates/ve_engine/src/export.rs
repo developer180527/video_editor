@@ -176,6 +176,9 @@ fn run(
     // bits, 8-bit ones are rounded from the full picture, not the monitor's.
     comp.set_deep_output(true);
     let mut mixer = Mixer::new(platform.storage.clone(), platform.media.clone(), SAMPLE_RATE);
+    if let Some(p) = registry.audio_plugins() {
+        mixer.set_plugins(p);
+    }
     let samples_at = |t: Time| (t.ticks() as i128 * SAMPLE_RATE as i128 / ve_time::TICKS_PER_SECOND as i128) as usize;
     let mut audio = Vec::new();
     let frame_duration = f.rate.frame_duration();

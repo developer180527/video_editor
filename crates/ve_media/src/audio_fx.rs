@@ -13,7 +13,8 @@
 
 use std::f32::consts::PI;
 
-use ve_model::{Clip, Effect, EffectId, Value};
+use ve_model::{Clip, Effect, EffectId, PluginApi, Value};
+use ve_ports::{AudioPlugins, AudioProcessor};
 use ve_time::Time;
 
 pub const GAIN: &str = "ve.audio.gain";
@@ -32,6 +33,11 @@ pub const ALL: [&str; 10] = [GAIN, EQ, HIGH_PASS, LOW_PASS, COMPRESSOR, LIMITER,
 
 pub fn is_audio_effect(id: &str) -> bool {
     ALL.contains(&id)
+}
+
+/// Whether the mixer runs `e`: a built-in audio effect or a CLAP plugin.
+fn runs(e: &Effect) -> bool {
+    e.enabled && (e.plugin.api == PluginApi::Clap || is_audio_effect(&e.plugin.id))
 }
 
 fn db(x: f32) -> f32 {
@@ -194,6 +200,8 @@ enum Fx {
     Delay { buf: [Vec<f32>; 2], i: usize },
     Reverb(Box<Reverb>),
     Channels,
+    /// A plugin instance (`None`: it could not be made; the sound passes).
+    Plugin(Option<Box<dyn AudioProcessor>>),
 }
 
 impl Fx {
@@ -216,6 +224,24 @@ impl Fx {
     fn run(&mut self, e: &Effect, t: Time, rate: f32, l: &mut [f32], r: &mut [f32]) {
         let p = |name: &str, d: f32| get(e, name, t, d);
         match self {
+            Fx::Plugin(Some(fx)) => {
+                let params: Vec<(&str, f64)> = e
+                    .params
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let x = match v.value_at(t) {
+                            Value::Float(f) => f,
+                            Value::Int(i) => i as f64,
+                            Value::Choice(c) => c as f64,
+                            Value::Bool(b) => b as u8 as f64,
+                            _ => return None,
+                        };
+                        Some((k.as_str(), x))
+                    })
+                    .collect();
+                fx.process(&params, l, r);
+            }
+            Fx::Plugin(None) => {}
             Fx::Gain => {
                 let g = db(p("gain", 0.0));
                 l.iter_mut().chain(r.iter_mut()).for_each(|x| *x *= g);
@@ -328,23 +354,39 @@ pub(crate) struct Chain {
 impl Chain {
     /// Whether `clip` has any audio effect to run.
     pub(crate) fn wanted(clip: &Clip) -> bool {
-        clip.effects.iter().any(|e| e.enabled && is_audio_effect(&e.plugin.id))
+        clip.effects.iter().any(|e| runs(e))
     }
 
-    /// Forget all state: the clip jumped.
+    /// Forget all state: the clip jumped. Plugin instances are kept (making
+    /// one is slow) and told to reset.
     pub(crate) fn reset(&mut self) {
-        self.slots.clear();
+        self.slots.retain_mut(|(_, _, fx)| match fx {
+            Fx::Plugin(Some(p)) => {
+                p.reset();
+                true
+            }
+            _ => false,
+        });
     }
 
     /// Run `clip`'s enabled audio effects, in order, over a block starting
     /// at clip time `t`.
-    pub(crate) fn process(&mut self, clip: &Clip, t: Time, rate: u32, l: &mut [f32], r: &mut [f32]) {
+    pub(crate) fn process(&mut self, clip: &Clip, t: Time, rate: u32, plugins: Option<&dyn AudioPlugins>, l: &mut [f32], r: &mut [f32]) {
+        let sample_rate = rate;
         let rate = rate as f32;
         let mut slots = std::mem::take(&mut self.slots);
-        for e in clip.effects.iter().filter(|e| e.enabled && is_audio_effect(&e.plugin.id)) {
+        for e in clip.effects.iter().filter(|e| runs(e)) {
             // State follows the effect, wherever it moves in the stack.
             let fx = match slots.iter().position(|(id, kind, _)| *id == e.id && *kind == e.plugin.id) {
                 Some(i) => slots.swap_remove(i).2,
+                None if e.plugin.api == PluginApi::Clap => Fx::Plugin(match plugins.map(|p| p.instantiate(&e.plugin, sample_rate)) {
+                    Some(Ok(fx)) => Some(fx),
+                    Some(Err(err)) => {
+                        eprintln!("audio plugin {}: {err}", e.plugin.id);
+                        None
+                    }
+                    None => None,
+                }),
                 None => match Fx::new(&e.plugin.id, rate) {
                     Some(fx) => fx,
                     None => continue,
@@ -401,7 +443,7 @@ mod tests {
         let mut chain = Chain::default();
         let (mut l, mut r) = (sine(freq, RATE as usize / 2, amp), sine(freq, RATE as usize / 2, amp));
         for (a, b) in l.chunks_mut(512).zip(r.chunks_mut(512)) {
-            chain.process(&clip, Time::ZERO, RATE, a, b);
+            chain.process(&clip, Time::ZERO, RATE, None, a, b);
         }
         rms(&l[l.len() / 2..])
     }
@@ -437,7 +479,7 @@ mod tests {
         let mut clip = test_clip();
         clip.effects = vec![std::sync::Arc::new(lim)].into();
         let (mut l, mut r) = (sine(440.0, 4800, 1.0), sine(440.0, 4800, 1.0));
-        Chain::default().process(&clip, Time::ZERO, RATE, &mut l, &mut r);
+        Chain::default().process(&clip, Time::ZERO, RATE, None, &mut l, &mut r);
         let peak = l.iter().fold(0f32, |m, x| m.max(x.abs()));
         assert!(peak <= db(-6.0) + 1e-4, "{peak}");
         let comp = effect(COMPRESSOR, &[("threshold", -20.0), ("ratio", 4.0), ("attack", 1.0), ("release", 50.0)]);
@@ -460,7 +502,7 @@ mod tests {
             l[0] = 1.0;
             r[0] = 1.0;
             for (a, b) in l.chunks_mut(512).zip(r.chunks_mut(512)) {
-                chain.process(&clip, Time::ZERO, RATE, a, b);
+                chain.process(&clip, Time::ZERO, RATE, None, a, b);
             }
             assert!(rms(&l[6000..12_000]) > 1e-4, "{}: it rings on after the click", clip.effects[0].plugin.id);
         }
@@ -473,7 +515,7 @@ mod tests {
         fx.params.insert("mode".into(), Param::Constant(Value::Choice(0)));
         clip.effects = vec![std::sync::Arc::new(fx)].into();
         let (mut l, mut r) = (vec![1.0; 4], vec![2.0; 4]);
-        Chain::default().process(&clip, Time::ZERO, RATE, &mut l, &mut r);
+        Chain::default().process(&clip, Time::ZERO, RATE, None, &mut l, &mut r);
         assert_eq!((l[0], r[0]), (2.0, 1.0));
     }
 }

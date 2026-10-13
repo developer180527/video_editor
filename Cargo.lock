@@ -359,6 +359,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_test_gain"
+version = "0.1.0"
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2761,12 +2765,17 @@ dependencies = [
 name = "ve_plugin_host"
 version = "0.1.0"
 dependencies = [
+ "clap_test_gain",
  "naga",
+ "platform_desktop",
+ "platform_headless",
  "thiserror 2.0.21",
  "ve_builtins",
+ "ve_media",
  "ve_model",
  "ve_plugin_abi",
  "ve_ports",
+ "ve_time",
 ]
 
 [[package]]

@@ -1,0 +1,11 @@
+[package]
+name = "clap_test_gain"
+description = "A tiny CLAP audio effect (gain and polarity) the plugin host's tests load as a real .clap file."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]

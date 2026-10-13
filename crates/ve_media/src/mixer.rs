@@ -148,6 +148,8 @@ pub struct Mixer {
     overrides: TrackMix,
     loudness: LoudnessMeter,
     levels: Levels,
+    /// Makes instances of plugin audio effects (CLAP), where there are any.
+    plugins: Option<Arc<dyn ve_ports::AudioPlugins>>,
 }
 
 /// A track's fader and pan as left/right gains. The track is already
@@ -193,7 +195,13 @@ impl Mixer {
             overrides: TrackMix::default(),
             loudness: LoudnessMeter::new(rate),
             levels: Levels::default(),
+            plugins: None,
         }
+    }
+
+    /// Where plugin audio effects come from.
+    pub fn set_plugins(&mut self, plugins: Arc<dyn ve_ports::AudioPlugins>) {
+        self.plugins = Some(plugins);
     }
 
     /// Faders and pans to hear in place of the project's (live dragging).
@@ -396,7 +404,7 @@ impl Mixer {
         // The clip's effects, then its Volume and Panner.
         if run_fx {
             if let Some(stream) = self.streams.get_mut(&clip.id) {
-                stream.fx.process(clip, clip_time(0), rate, &mut left, &mut right);
+                stream.fx.process(clip, clip_time(0), rate, self.plugins.as_deref(), &mut left, &mut right);
             }
         }
         for k in 0..n {
@@ -437,7 +445,9 @@ impl Mixer {
                 })
             }
             ClipSource::Sequence { sequence, .. } => {
-                Ok(Source::Nested { sequence: *sequence, mixer: Box::new(Mixer::new(self.storage.clone(), self.media.clone(), self.rate)) })
+                let mut mixer = Mixer::new(self.storage.clone(), self.media.clone(), self.rate);
+                mixer.plugins = self.plugins.clone();
+                Ok(Source::Nested { sequence: *sequence, mixer: Box::new(mixer) })
             }
             ClipSource::Generator { .. } => Err("generators make no sound".into()),
         }
