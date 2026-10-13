@@ -157,7 +157,7 @@ fn project(path: &Path, kind: Kind, secs: u32) -> Result<Engine, String> {
     Ok(e)
 }
 
-fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+pub(crate) fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
     let features = adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;

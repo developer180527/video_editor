@@ -250,6 +250,8 @@ pub struct EditorUi {
     /// The GPU, kept for exports.
     gpu: Option<(wgpu::Device, wgpu::Queue)>,
     pub(crate) export: Option<std::sync::Arc<ve_engine::ExportState>>,
+    /// Create Proxies, while it runs.
+    pub(crate) proxies_job: Option<std::sync::Arc<ve_engine::ProxyJob>>,
     pub(crate) export_preset: usize,
     pub(crate) show_export: bool,
     /// Thumbnail textures, by (asset, second).
@@ -387,6 +389,7 @@ impl EditorUi {
             meter_db: [-96.0; 2],
             gpu: None,
             export: None,
+            proxies_job: None,
             export_preset: 0,
             show_export: false,
             thumbs: HashMap::new(),
@@ -633,6 +636,39 @@ impl EditorUi {
     /// The host's answer to [`HostRequest::RelinkMedia`].
     pub fn relink(&mut self, asset: AssetId, path: &std::path::Path) {
         self.engine.relink(asset, path.to_string_lossy().into_owned());
+    }
+
+    /// Make proxies of `assets` in the background, as tall as Settings says.
+    pub(crate) fn create_proxies(&mut self, assets: Vec<AssetId>) {
+        if self.proxies_job.is_some() {
+            return;
+        }
+        if assets.is_empty() {
+            self.errors.push("Every video clip already has a proxy.".into());
+            return;
+        }
+        let Some(gpu) = self.gpu.clone() else {
+            self.errors.push("Proxies need the GPU, which is not ready yet.".into());
+            return;
+        };
+        self.proxies_job = Some(self.engine.create_proxies(gpu, assets, self.settings.proxy_height, self.importer.clone()));
+    }
+
+    /// The end of a Create Proxies: say how it went.
+    fn proxies_ui(&mut self, ui: &mut Ui) {
+        let Some(job) = &self.proxies_job else { return };
+        let Some(results) = job.result() else { return };
+        let made = results.iter().filter(|r| r.is_ok()).count();
+        let failed: Vec<String> = results.iter().zip(&job.names).filter_map(|(r, n)| r.as_ref().err().map(|e| format!("{n}: {e}"))).collect();
+        if job.cancelled() {
+            ui.toast(Toast::info(format!("Proxies cancelled ({made} made)")));
+        } else if failed.is_empty() {
+            let hint = if self.view.proxies { "" } else { " — turn on Use Proxies (Program monitor) to play them" };
+            ui.toast(Toast::success(format!("{made} prox{} ready{hint}", if made == 1 { "y" } else { "ies" })));
+        } else {
+            ui.toast(Toast::error(format!("{} proxy(ies) failed: {}", failed.len(), failed.join("; "))));
+        }
+        self.proxies_job = None;
     }
 
     /// Export to `path` with the chosen preset (after the host's save dialog).
@@ -1039,6 +1075,7 @@ impl EditorUi {
         }
         if surface == SurfaceId::MAIN {
             self.export_ui(ui);
+            self.proxies_ui(ui);
             self.dialogs(ui);
         }
         // Keys go to the focused window, so every window takes shortcuts
@@ -1085,6 +1122,7 @@ impl EditorUi {
             || self.meter_db.iter().any(|d| *d > -95.0)
             || self.track_db.values().flatten().any(|d| *d > -95.0)
             || self.export.as_ref().is_some_and(|e| e.result().is_none())
+            || self.proxies_job.as_ref().is_some_and(|j| j.result().is_none())
             || !self.thumb_uploads.is_empty())
         .then_some(STEADY);
         // While playing, everything else (meters, late frames) rides along

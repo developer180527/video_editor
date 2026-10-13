@@ -10,6 +10,8 @@
 //!   ve bench [--only NAME] [--secs N] [--clip-secs N] [--media DIR]
 //!                              playback, scrubbing and export, measured
 //!   ve clap [FILE.clap...]     load CLAP effects and test each one
+//!   ve proxy [--height N] <media>...
+//!                              make proxies as Create Proxies does, timed
 
 mod bench;
 mod clap;
@@ -42,6 +44,7 @@ fn main() {
         Some("assemble") if args.len() > 2 => assemble(&args[1], &args[2..]),
         Some("bench") => bench::bench(&args[1..]),
         Some("clap") => clap::clap(&args[1..]),
+        Some("proxy") if args.len() > 1 => proxy(&args[1..]),
         _ => {
             eprintln!("usage: ve probe <media>... | new <project> | info <project> | plugins | caps | assemble <project> <media>...");
             2
@@ -163,4 +166,46 @@ fn plugins() -> i32 {
 fn caps() -> i32 {
     println!("{:#?}", engine().capabilities());
     0
+}
+
+fn proxy(args: &[String]) -> i32 {
+    let (height, files) = match args {
+        [flag, h, rest @ ..] if flag == "--height" => (h.parse().unwrap_or(540), rest),
+        _ => (540, args),
+    };
+    let Some(gpu) = bench::gpu() else {
+        eprintln!("no GPU");
+        return 1;
+    };
+    let mut e = engine();
+    let mut assets = Vec::new();
+    for f in files {
+        match e.import(&std::path::absolute(f).unwrap().display().to_string()) {
+            Ok(a) => assets.push(a),
+            Err(err) => eprintln!("{f}: {err}"),
+        }
+    }
+    let durations: f64 = assets.iter().filter_map(|a| e.snapshot().assets.get(a).and_then(|a| a.info.as_ref()).map(|i| i.duration.as_seconds_f64())).sum();
+    let client = e.spawn(Arc::new(|| {}));
+    let t = std::time::Instant::now();
+    let job = client.create_proxies(gpu, assets, height, gpu_import::importer());
+    let results = loop {
+        if let Some(r) = job.result() {
+            break r;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let secs = t.elapsed().as_secs_f64();
+    let mut failed = false;
+    for (name, r) in job.names.iter().zip(&results) {
+        match r {
+            Ok(p) => println!("{name} -> {p}"),
+            Err(err) => {
+                failed = true;
+                println!("{name}: {err}");
+            }
+        }
+    }
+    println!("{durations:.1} s of media in {secs:.1} s: {:.1}x real time", durations / secs.max(1e-6));
+    i32::from(failed)
 }

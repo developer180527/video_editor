@@ -284,3 +284,52 @@ fn prores_export_keeps_ten_bits() {
     eprintln!("{} distinct 10-bit luma levels across the exported gradient", levels.len());
     assert!(levels.len() > 600, "{} distinct luma levels across the gradient (8-bit export gives ~220)", levels.len());
 }
+
+/// Create Proxies on a 1280x720 clip: a 540p H.264 file appears under
+/// Documents/Proxies, is attached to the asset as its proxy, matches the
+/// original's length and rate, and shows the same picture.
+#[test]
+fn create_proxies_makes_and_attaches_a_small_copy() {
+    use ve_ports::{MediaBackend, Resolved};
+    let Some(src) = generated("proxy_src.mov", &["-f", "lavfi", "-i", "smptebars=size=1280x720:rate=25:duration=2", "-c:v", "mpeg4", "-q:v", "2"]) else {
+        return eprintln!("skipped: no ffmpeg CLI");
+    };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("skipped: no GPU") };
+    let gpu = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("proxies");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut e = Engine::new(platform_headless::platform(&dir, Arc::new(media_ffmpeg::Ffmpeg::new())));
+    e.new_project("t");
+    let asset = e.import(src.to_str().unwrap()).unwrap();
+    let client = e.spawn(Arc::new(|| {}));
+    let job = client.create_proxies(gpu, vec![asset], 540, None);
+    assert_eq!(job.names, vec!["proxy_src.mov".to_string()]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let results = loop {
+        if let Some(r) = job.result() {
+            break r;
+        }
+        assert!(std::time::Instant::now() < deadline, "proxies hung at {:.0}%", job.progress().2 * 100.0);
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let path = results[0].clone().expect("proxy made");
+    assert!(path.ends_with("Proxies/proxy_src Proxy.mp4"), "{path}");
+    // Attached, once the engine has probed it.
+    let proxy = loop {
+        let snap = client.snapshot();
+        if let Some(v) = snap.assets[&asset].variants.iter().find(|v| v.kind == VariantKind::Proxy) {
+            break v.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "the proxy was never attached");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!((proxy.width, proxy.height), (960, 540));
+    let info = media_ffmpeg::Ffmpeg::new().probe(&Resolved { path: Some(path.clone().into()), guard: Box::new(()) }).unwrap();
+    let v = info.video.unwrap();
+    assert_eq!((v.width, v.height, v.codec.as_str()), (960, 540, "h264"));
+    assert_eq!(v.rate, ve_time::Rate::FPS_25);
+    let secs = info.duration.as_seconds_f64();
+    assert!((secs - 2.0).abs() < 0.1, "as long as the original: {secs}");
+}

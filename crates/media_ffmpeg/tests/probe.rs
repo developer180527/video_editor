@@ -329,3 +329,41 @@ fn every_audio_stream_is_listed_and_playable() {
     assert!(peak(0) > 0.01 && peak(1) > 0.01, "5.1 downmix: L {} R {}", peak(0), peak(1));
     assert!(ff.open_audio(&r, 3, 48_000, 2).is_err(), "no fourth stream");
 }
+
+/// Variable frame rate, as phones record: 60 fps for a second, then 30.
+/// The rate is the base one (60, not the 45 average), and every frame
+/// lasts exactly until the next starts — through the switch, and after a
+/// seek into the 30 fps part.
+#[test]
+fn variable_frame_rate_frames_meet_end_to_end() {
+    let clip = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("vfr_test.mp4");
+    let made = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=60:duration=2"])
+        .args(["-vf", "select='lt(t\\,1)+not(mod(n\\,2))'", "-fps_mode", "vfr", "-c:v", "libx264", "-g", "30"])
+        .arg(&clip)
+        .status();
+    if !matches!(made, Ok(s) if s.success()) {
+        return eprintln!("skipped: no ffmpeg CLI to make a test clip");
+    }
+    let media = Resolved { path: Some(clip), guard: Box::new(()) };
+    let ff = Ffmpeg::new();
+    let info = ff.probe(&media).unwrap();
+    assert_eq!(info.video.unwrap().rate, Rate::FPS_60, "the base rate, not the average");
+    let mut dec = ff.open_video(&media).unwrap();
+    let mut frames = Vec::new();
+    while let Some(f) = dec.next_frame().unwrap() {
+        frames.push((f.pts, f.duration));
+    }
+    assert_eq!(frames.len(), 90, "60 in the first second, 30 in the next");
+    for w in frames.windows(2) {
+        assert_eq!(w[0].0 + w[0].1, w[1].0, "a frame ends where the next starts");
+    }
+    let tick = |n: i64, fps: i64| Time::from_ticks(ve_time::TICKS_PER_SECOND * n / fps);
+    assert_eq!(frames[10].1, tick(1, 60));
+    assert_eq!(frames[70].1, tick(1, 30));
+    // Into the 30 fps part: the frame covering 1.52 s starts at 1.5 s and lasts 1/30 s.
+    let t = tick(152, 100);
+    dec.seek(t).unwrap();
+    let f = dec.next_frame().unwrap().unwrap();
+    assert!(f.pts <= t && t < f.pts + f.duration, "{:?} + {:?} covers {:?}", f.pts, f.duration, t);
+}

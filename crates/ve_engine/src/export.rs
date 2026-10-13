@@ -23,6 +23,8 @@ pub enum ExportPreset {
     H264Mp4,
     HevcMp4,
     ProResMov,
+    /// A proxy: small H.264 for smooth previews (not offered as an export).
+    Proxy,
 }
 
 impl ExportPreset {
@@ -33,6 +35,7 @@ impl ExportPreset {
             ExportPreset::H264Mp4 => "H.264 (MP4)",
             ExportPreset::HevcMp4 => "HEVC (MP4)",
             ExportPreset::ProResMov => "Apple ProRes 422 HQ (MOV)",
+            ExportPreset::Proxy => "Proxy (H.264)",
         }
     }
 
@@ -45,7 +48,7 @@ impl ExportPreset {
 
     fn codec(self) -> &'static str {
         match self {
-            ExportPreset::H264Mp4 => "h264",
+            ExportPreset::H264Mp4 | ExportPreset::Proxy => "h264",
             ExportPreset::HevcMp4 => "hevc",
             ExportPreset::ProResMov => "prores",
         }
@@ -165,7 +168,8 @@ fn run(
         rate: f.rate,
         sample_rate: SAMPLE_RATE,
         channels: 2,
-        video_bitrate: None,
+        // Proxies: about 0.12 bits a pixel — light to decode, fine to cut with.
+        video_bitrate: (preset == ExportPreset::Proxy).then(|| (f.width as f64 * f.height as f64 * f.rate.as_f64() * 0.12) as u64),
         prefer_hardware: true,
     };
     let target = platform.storage.resolve_new(out).map_err(|e| e.to_string())?;

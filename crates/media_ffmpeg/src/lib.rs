@@ -118,7 +118,7 @@ impl MediaBackend for Ffmpeg {
             let par = unsafe { &*s.codecpar };
             match par.codec_type {
                 sys::AVMediaType::AVMEDIA_TYPE_VIDEO if info.video.is_none() => {
-                    let r = if s.avg_frame_rate.num > 0 { s.avg_frame_rate } else { s.r_frame_rate };
+                    let r = nominal_rate(s.avg_frame_rate, s.r_frame_rate);
                     // A display matrix says how to turn the picture upright
                     // (FFmpeg's angle is counter-clockwise; ours clockwise).
                     let side = unsafe { sys::av_packet_side_data_get(par.coded_side_data, par.nb_coded_side_data, sys::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX) };
@@ -215,4 +215,22 @@ pub(crate) fn shared_device(t: sys::AVHWDeviceType) -> Option<*mut sys::AVBuffer
     });
     // A new reference for the caller.
     dev.map(|d| unsafe { sys::av_buffer_ref(d as *mut sys::AVBufferRef) }).filter(|r| !r.is_null())
+}
+
+/// A stream's frame rate as an editor names it. The average is right for
+/// most files (and exact where the base rate is not: 29.97 stored as
+/// 30000/1001); but variable-rate video (a phone switching between 60, 30
+/// and 24 fps) averages to nothing in particular, 35.69 say, while its base
+/// rate (60) is what it was shot as.
+fn nominal_rate(avg: sys::AVRational, base: sys::AVRational) -> sys::AVRational {
+    let f = |r: sys::AVRational| if r.num > 0 && r.den > 0 { r.num as f64 / r.den as f64 } else { 0.0 };
+    let common = [24000.0 / 1001.0, 24.0, 25.0, 30000.0 / 1001.0, 30.0, 48.0, 50.0, 60000.0 / 1001.0, 60.0, 120.0, 240.0];
+    let near_common = |x: f64| common.iter().any(|c| ((c - x) / c).abs() < 0.001);
+    if f(avg) > 0.0 && (near_common(f(avg)) || !near_common(f(base))) {
+        avg
+    } else if f(base) > 0.0 {
+        base
+    } else {
+        avg
+    }
 }

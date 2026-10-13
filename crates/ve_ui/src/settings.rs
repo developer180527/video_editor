@@ -17,6 +17,9 @@ pub struct Settings {
     pub preview_quality: usize,
     /// Play proxies at startup, where assets have them.
     pub use_proxies: bool,
+    /// How tall Create Proxies makes them: 540, 720 or 1080.
+    #[serde(default = "proxy_540")]
+    pub proxy_height: u32,
     /// Draw a paused frame at full resolution, whatever the playback
     /// quality (Premiere's "paused resolution").
     #[serde(default = "yes")]
@@ -64,11 +67,16 @@ impl ThemeMode {
     }
 }
 
+fn proxy_540() -> u32 {
+    540
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             preview_quality: 1,
             use_proxies: false,
+            proxy_height: 540,
             paused_full: true,
             snap: true,
             linked_selection: true,
@@ -137,6 +145,11 @@ pub(crate) fn panel(ui: &mut Ui, app: &mut EditorUi) {
     row(ui, "Playback quality", |ui| ui.combo_keyed("set-quality", &mut s.preview_quality, &["Full", "1/2", "1/4"]));
     commit |= s.preview_quality != app.settings.preview_quality;
     commit |= row(ui, "Play proxies", |ui| ui.checkbox_keyed("set-proxies", "", &mut s.use_proxies).clicked);
+    let heights = [540, 720, 1080];
+    let mut size = heights.iter().position(|h| *h == s.proxy_height).unwrap_or(0);
+    row(ui, "Proxy size", |ui| ui.combo_keyed("set-proxy-size", &mut size, &["540p", "720p", "1080p"]));
+    commit |= heights[size] != s.proxy_height;
+    s.proxy_height = heights[size];
     commit |= row(ui, "Full quality when paused", |ui| ui.checkbox_keyed("set-paused-full", "", &mut s.paused_full).clicked);
     ui.space(10.0);
 

@@ -49,6 +49,16 @@ pub fn bar(ui: &mut Ui, app: &mut EditorUi) {
                 job.cancel();
             }
         }
+        if let Some(job) = app.proxies_job.clone() {
+            let (i, n, frac) = job.progress();
+            ui.text_with(&format!("Proxies {}/{n} — {:.0}%", (i + 1).min(n), frac * 100.0), 11.0, ui.theme.palette.text_muted);
+            ui.container(Layout::row().width(Size::Fixed(120.0)).height(Size::Fixed(20.0)).align(Align::Start, Align::Center), Frame::none(), |ui| {
+                ui.progress("proxies", Some(frac));
+            });
+            if ui.button_keyed("cancel-proxies", "Cancel").clicked {
+                job.cancel();
+            }
+        }
         let save = icon_button(ui, "save", Icon::Panel, 24.0, false);
         ui.tooltip(&save, "Save Project As…");
         if save.clicked {

@@ -18,6 +18,8 @@ pub enum Action {
     Save,
     SaveAs,
     AttachProxy,
+    /// Make proxies: of the selected bin item, or of every video clip without one.
+    CreateProxies,
     RemoveProxy,
     LinkMedia,
     Export,
@@ -136,6 +138,7 @@ impl EditorUi {
             .on("Save As…", Action::SaveAs, Some(Chord::primary(Key::S).shift()))
             .sep()
             // The selected bin item's media (also on its context menu).
+            .item("Create Proxies", Action::CreateProxies, None, self.proxies_job.is_none())
             .item("Attach Proxy…", Action::AttachProxy, None, asset.is_some())
             .item("Remove Proxy", Action::RemoveProxy, None, has_proxy)
             .item("Link Media…", Action::LinkMedia, None, asset.is_some())
@@ -221,6 +224,16 @@ impl EditorUi {
             },
             Action::SaveAs => self.requests.push(HostRequest::SaveProjectAs),
             Action::AttachProxy => self.requests.extend(self.view.selected_asset.map(HostRequest::AttachProxy)),
+            Action::CreateProxies => {
+                let snap = self.engine.snapshot();
+                let picture = |a: &ve_model::Asset| a.info.as_ref().is_some_and(|i| i.video.is_some());
+                let chosen: Vec<_> = match self.view.selected_asset.and_then(|id| snap.assets.get(&id)).filter(|a| picture(a)) {
+                    Some(a) => vec![a.id],
+                    // Nothing (or no picture) selected: every clip that has none yet.
+                    None => snap.assets.values().filter(|a| picture(a) && !a.variants.iter().any(|v| v.kind == VariantKind::Proxy)).map(|a| a.id).collect(),
+                };
+                self.create_proxies(chosen);
+            }
             Action::RemoveProxy => {
                 if let Some(a) = self.view.selected_asset {
                     self.remove_proxy(a);

@@ -18,6 +18,7 @@ mod clips;
 pub mod export;
 pub mod frame;
 mod project_file;
+mod proxy;
 mod record;
 mod viewer;
 
@@ -38,6 +39,7 @@ pub use ve_render::{FramePlan, Quality, TextureImporter};
 pub use frame::Frame;
 pub use viewer::{SourceView, Viewer};
 pub use export::{ExportPreset, ExportState};
+pub use proxy::{proxy_size, ProxyJob};
 pub use ve_media::{Levels, Loudness, Meters, Stills, Thumb, PEAKS_PER_SECOND};
 
 use std::sync::Arc;

@@ -553,6 +553,23 @@ impl EngineClient {
         crate::export::start(p.snapshot, self.platform.clone(), p.plugins, gpu, preset, out, importer)
     }
 
+    /// Make proxies of `assets`, `height` pixels tall, in the background;
+    /// each is attached to its asset as it finishes.
+    pub fn create_proxies(
+        &self,
+        gpu: (wgpu::Device, wgpu::Queue),
+        assets: Vec<ve_model::AssetId>,
+        height: u32,
+        importer: Option<Arc<dyn ve_render::TextureImporter>>,
+    ) -> Arc<crate::ProxyJob> {
+        let p = self.published();
+        let tx = Mutex::new(self.tx.clone());
+        let attach = move |asset, path| {
+            let _ = tx.lock().unwrap().send(Request::AttachProxy(asset, path));
+        };
+        crate::proxy::start(p.snapshot, self.platform.clone(), p.plugins, gpu, assets, height, importer, attach)
+    }
+
     pub fn drain_events(&self) -> Vec<Event> {
         self.events.try_iter().collect()
     }

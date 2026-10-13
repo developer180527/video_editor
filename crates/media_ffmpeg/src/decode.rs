@@ -326,6 +326,9 @@ pub struct VideoDec {
     /// consumer can import them; see [`AvNative`].
     native: bool,
     pub hardware: bool,
+    /// The newest decoded frame, held back until the next one says how
+    /// long it lasts (see `next_frame`).
+    pending: Option<VideoFrame>,
     /// Where the next frame starts (after the last one handed out, or the
     /// last seek): where a fall-back to software resumes.
     resume_at: Time,
@@ -370,6 +373,7 @@ impl VideoDec {
             native,
             hardware,
             resume_at: Time::ZERO,
+            pending: None,
         })
     }
 
@@ -605,6 +609,7 @@ impl VideoDecoder for VideoDec {
         self.sought = t;
         self.resume_at = t;
         self.backoff = Time::from_seconds(1);
+        self.pending = None;
         unsafe { sys::av_frame_unref(self.held) };
         Ok(())
     }
@@ -613,7 +618,32 @@ impl VideoDecoder for VideoDec {
         self.lead_in = on;
     }
 
+    /// Frames last until the next one starts. A stream's frame lengths are
+    /// a poor guide: variable-rate video (phones switch between 60, 30 and
+    /// 24 fps as the light changes) has no one length, and stored lengths
+    /// are rounded to the time base, leaving slivers between frames. So a
+    /// frame is handed out only once the one after it is decoded; the last
+    /// keeps its stored length.
     fn next_frame(&mut self) -> Result<Option<VideoFrame>, MediaError> {
+        loop {
+            let Some(next) = self.next_decoded()? else { return Ok(self.pending.take()) };
+            let start = next.pts;
+            match self.pending.replace(next) {
+                Some(mut f) => {
+                    if start > f.pts {
+                        f.duration = start - f.pts;
+                    }
+                    return Ok(Some(f));
+                }
+                None => continue,
+            }
+        }
+    }
+}
+
+impl VideoDec {
+    /// The next frame as decoded, with its stored length.
+    fn next_decoded(&mut self) -> Result<Option<VideoFrame>, MediaError> {
         loop {
             let more = match self.codec.next(&self.input, self.stream) {
                 Ok(m) => m,
