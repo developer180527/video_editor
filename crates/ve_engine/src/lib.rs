@@ -25,6 +25,8 @@ pub use client::{EngineClient, Published, RecordingStatus, Waker};
 pub use clips::{clips_for_asset, default_value, make_clip, make_generator_clip, make_sequence_clip};
 pub use ve_command::edit;
 pub use ve_plugin_host::intrinsic;
+pub use ve_plugin_host::clap::ClapHost;
+pub use ve_ports::{AudioPlugins, AudioProcessor};
 
 pub use project_file::{ProjectFileError, FILE_FORMAT};
 pub use ve_command::{Command, CommandError, Edge, MarksOwner, TrackState};

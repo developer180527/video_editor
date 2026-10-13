@@ -92,6 +92,32 @@ fn plugin_extension(kind: &str) -> &'static str {
     }
 }
 
+/// Whether macOS has marked `path` as downloaded and unchecked (the
+/// quarantine flag): loading it would be refused unless it is notarized.
+#[cfg(target_os = "macos")]
+fn quarantined(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    let name = c"com.apple.quarantine";
+    let n = unsafe { libc::getxattr(c.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    if n < 0 {
+        return false;
+    }
+    // Notarized code passes despite the flag; ask the policy (quick, and
+    // only for flagged files).
+    std::process::Command::new("/usr/sbin/spctl")
+        .args(["--assess", "--type", "open", "--context", "context:primary-signature"])
+        .arg(path)
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn quarantined(_: &std::path::Path) -> bool {
+    false
+}
+
 /// The code inside a macOS bundle (`Name.clap/Contents/MacOS/Name`): the
 /// executable its Info.plist names, else the only file there. `None` for a
 /// plain file.
@@ -152,7 +178,18 @@ impl NativeLibraries for DesktopLibraries {
 
     fn load(&self, path: &str) -> Result<Box<dyn NativeLibrary>, LibraryError> {
         let file = bundle_binary(std::path::Path::new(path)).unwrap_or_else(|| path.into());
-        let lib = unsafe { libloading::Library::new(&file) }.map_err(|e| LibraryError::Other(e.to_string()))?;
+        // A plugin downloaded from the web and not notarized: macOS refuses
+        // it, after seconds of checking. Say so at once, and how to allow it.
+        if quarantined(std::path::Path::new(path)) {
+            return Err(LibraryError::Other(format!(
+                "macOS blocks this download (quarantined and not notarized). If you trust it, allow it with: xattr -dr com.apple.quarantine \"{path}\""
+            )));
+        }
+        let lib = unsafe { libloading::Library::new(&file) }.map_err(|e| {
+            // libloading puts dyld's reason in the error's source.
+            let why = std::error::Error::source(&e).map(|s| s.to_string()).unwrap_or_default();
+            LibraryError::Other(if why.is_empty() { e.to_string() } else { format!("{e}: {why}") })
+        })?;
         Ok(Box::new(Dylib { name: path.into(), lib }))
     }
 }

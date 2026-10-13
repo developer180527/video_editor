@@ -9,8 +9,10 @@
 //!                              a new project with the media end to end on V1/A1
 //!   ve bench [--only NAME] [--secs N] [--clip-secs N] [--media DIR]
 //!                              playback, scrubbing and export, measured
+//!   ve clap [FILE.clap...]     load CLAP effects and test each one
 
 mod bench;
+mod clap;
 
 use std::sync::Arc;
 use ve_engine::Engine;
@@ -39,6 +41,7 @@ fn main() {
         Some("caps") => caps(),
         Some("assemble") if args.len() > 2 => assemble(&args[1], &args[2..]),
         Some("bench") => bench::bench(&args[1..]),
+        Some("clap") => clap::clap(&args[1..]),
         _ => {
             eprintln!("usage: ve probe <media>... | new <project> | info <project> | plugins | caps | assemble <project> <media>...");
             2
