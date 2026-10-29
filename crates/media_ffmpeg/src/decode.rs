@@ -54,10 +54,7 @@ impl Codec {
             (*ctx).pkt_timebase = (*st).time_base;
             (*ctx).thread_count = 0; // automatic
             let mut using_hw = false;
-            // MPEG-4 Part 2 decodes in software: it is light, and D3D12VA
-            // on Windows ARM64 opens for it and then refuses every frame.
-            let light = (*par).codec_id == sys::AVCodecID::AV_CODEC_ID_MPEG4;
-            if hw && !light && (*par).codec_type == sys::AVMediaType::AVMEDIA_TYPE_VIDEO {
+            if hw && (*par).codec_type == sys::AVMediaType::AVMEDIA_TYPE_VIDEO {
                 if let Some((dev, fmt)) = hw_device_for(codec) {
                     (*ctx).hw_device_ctx = dev;
                     // `pick_hw_format` reads which format this device decodes to.

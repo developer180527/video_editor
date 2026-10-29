@@ -54,6 +54,27 @@ fn put(e: &mut Engine, track: usize, c: Clip) -> ClipId {
     id
 }
 
+/// Decode `file` with our FFmpeg; if that fails, say whether the file or our
+/// build is at fault, by asking the ffmpeg CLI (a different build) to decode
+/// it too. On Windows ARM64 our MPEG-4 decode of a tiny clip has failed with
+/// "not yet implemented" while larger clips decode: this tells which side.
+fn decodes_or_explain(file: &std::path::Path) {
+    use ve_ports::{MediaBackend, Resolved};
+    let r = Resolved { path: Some(file.to_path_buf()), guard: Box::new(()) };
+    let ours = media_ffmpeg::Ffmpeg::new().open_video(&r).and_then(|mut d| d.next_frame().map(|f| f.is_some()));
+    if matches!(ours, Ok(true)) {
+        return;
+    }
+    let cli = std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(file).args(["-f", "null", "-"]).output();
+    let cli = match cli {
+        Ok(o) if o.status.success() && o.stderr.is_empty() => "the ffmpeg CLI decodes it: our FFmpeg build is at fault".to_string(),
+        Ok(o) => format!("the ffmpeg CLI fails too, so the file is bad: {}", String::from_utf8_lossy(&o.stderr).trim()),
+        Err(e) => format!("could not run the ffmpeg CLI: {e}"),
+    };
+    let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    panic!("{} ({size} bytes) does not decode here: {ours:?}; {cli}", file.display());
+}
+
 /// The monitor at `t` (seconds), as RGBA8 rows, and a pixel reader.
 fn shot(e: &Engine, gpu: &(wgpu::Device, wgpu::Queue), t: f64, proxies: bool) -> (u32, Vec<u8>) {
     let snap = e.snapshot();
@@ -188,6 +209,9 @@ fn proxies_stand_in_at_the_original_size() {
     let (Some(orig), Some(proxy)) = (make("orig.mov", "red", "32x18"), make("proxy.mov", "blue", "16x8")) else {
         return eprintln!("skipped: no ffmpeg CLI");
     };
+    for f in [&orig, &proxy] {
+        decodes_or_explain(f);
+    }
     let mut e = engine("proxy");
     let asset = e.import(orig.to_str().unwrap()).unwrap();
     e.attach_proxy(asset, proxy.to_str().unwrap()).unwrap();
