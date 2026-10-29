@@ -166,8 +166,10 @@ jobs:
           }
           if (-not $got) { throw "no ffmpeg CLI could be downloaded" }
           Expand-Archive ffmpeg.zip -DestinationPath C:\ffmpeg-cli
-          (Get-ChildItem C:\ffmpeg-cli -Directory | Select-Object -First 1).FullName + "\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-          ffmpeg -hide_banner -version | Select-Object -First 1
+          $bin = (Get-ChildItem C:\ffmpeg-cli -Directory | Select-Object -First 1).FullName + "\bin"
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          # (GITHUB_PATH applies from the next step: call it by its path here.)
+          & "$bin\ffmpeg.exe" -hide_banner -version | Select-Object -First 1
 
       # ---- FFmpeg (pinned, LGPL) ------------------------------------------
 
