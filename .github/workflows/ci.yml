@@ -140,10 +140,34 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # x64 build; runs emulated on ARM64. Only used to generate test media.
-          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          # Only used to generate test media (never shipped, so a GPL build is
+          # fine). BtbN's builds are GitHub releases, native for each
+          # architecture; gyan.dev (x64, emulated on ARM64) is the fallback.
+          # Each source is tried a few times: one site's outage (gyan.dev
+          # answered 503 once) should not fail the run.
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'winarm64' } else { 'win64' }
+          $sources = @(
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-$arch-gpl.zip",
+            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          )
+          $got = $false
+          foreach ($url in $sources) {
+            foreach ($try in 1..3) {
+              try {
+                Invoke-WebRequest $url -OutFile ffmpeg.zip -MaximumRetryCount 2 -RetryIntervalSec 5
+                $got = $true
+                break
+              } catch {
+                Write-Host "ffmpeg download from $url failed (try $try): $($_.Exception.Message)"
+                Start-Sleep -Seconds (10 * $try)
+              }
+            }
+            if ($got) { Write-Host "ffmpeg CLI from $url"; break }
+          }
+          if (-not $got) { throw "no ffmpeg CLI could be downloaded" }
           Expand-Archive ffmpeg.zip -DestinationPath C:\ffmpeg-cli
           (Get-ChildItem C:\ffmpeg-cli -Directory | Select-Object -First 1).FullName + "\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          ffmpeg -hide_banner -version | Select-Object -First 1
 
       # ---- FFmpeg (pinned, LGPL) ------------------------------------------
 
