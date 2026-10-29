@@ -65,6 +65,7 @@ jobs:
             msystem: CLANGARM64
             msys_bin: clangarm64
             msys_install: make diffutils
+            warp: true
 
     steps:
       - name: Long paths (Windows)
@@ -173,6 +174,17 @@ jobs:
 
       - name: Build
         run: cargo build --workspace --all-targets --locked
+
+      # The Windows ARM64 runner has no GPU; whatever adapter wgpu picked by
+      # default crashed GPU tests (access violations). Use D3D12's own
+      # software renderer, WARP. (Set only here: an empty WGPU_BACKEND would
+      # mean no backends at all, and every GPU test would skip.)
+      - name: GPU tests on WARP
+        if: matrix.warp
+        shell: bash
+        run: |
+          echo "WGPU_BACKEND=dx12" >> "$GITHUB_ENV"
+          echo "VE_GPU_FALLBACK=1" >> "$GITHUB_ENV"
 
       - name: Test
         run: cargo test --workspace --locked

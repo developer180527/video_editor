@@ -45,8 +45,10 @@ fn clip() -> Option<PathBuf> {
 #[test]
 fn import_place_decode_composite() {
     let Some(file) = clip() else { return eprintln!("skipped: no ffmpeg CLI") };
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("skipped: no GPU") };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
+    // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
+    eprintln!("test GPU: {:?}", adapter.get_info());
     let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
 
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("render");
@@ -103,8 +105,10 @@ fn export_h264_with_audio() {
     if !made {
         return eprintln!("skipped: no ffmpeg CLI");
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("skipped: no GPU") };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
+    // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
+    eprintln!("test GPU: {:?}", adapter.get_info());
     let gpu = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
 
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("export");
@@ -174,8 +178,10 @@ fn export_h264_with_audio() {
 #[test]
 fn export_fails_on_missing_media_and_ignores_the_preview() {
     let Some(file) = clip() else { return eprintln!("skipped: no ffmpeg CLI") };
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("skipped: no GPU") };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
+    // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
+    eprintln!("test GPU: {:?}", adapter.get_info());
     let gpu = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
 
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("export_missing");
@@ -242,8 +248,10 @@ fn prores_export_keeps_ten_bits() {
     if !made {
         return eprintln!("skipped: no ffmpeg CLI");
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("skipped: no GPU") };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
+    // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
+    eprintln!("test GPU: {:?}", adapter.get_info());
     if !adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
         return eprintln!("skipped: no 16-bit textures (10-bit sources are read at 8 bits)");
     }
@@ -294,8 +302,10 @@ fn create_proxies_makes_and_attaches_a_small_copy() {
     let Some(src) = generated("proxy_src.mov", &["-f", "lavfi", "-i", "smptebars=size=1280x720:rate=25:duration=2", "-c:v", "mpeg4", "-q:v", "2"]) else {
         return eprintln!("skipped: no ffmpeg CLI");
     };
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("skipped: no GPU") };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
+    // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
+    eprintln!("test GPU: {:?}", adapter.get_info());
     let gpu = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
 
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("proxies");

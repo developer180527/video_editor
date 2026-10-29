@@ -12,8 +12,10 @@ use ve_render::Compositor;
 use ve_time::Time;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })).ok()?;
+    // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
+    eprintln!("test GPU: {:?}", adapter.get_info());
     pollster::block_on(adapter.request_device(&Default::default())).ok()
 }
 
