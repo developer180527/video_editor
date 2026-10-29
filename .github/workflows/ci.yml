@@ -1,5 +1,6 @@
-# Build and test on every platform the editor targets, on x86_64 and ARM64:
-# macOS, Linux and Windows (each both architectures), plus iPadOS (device and
+# Build and test on every platform the editor targets: macOS on Apple
+# silicon only (Apple no longer supports Intel Macs; never add an Intel macOS
+# job), Linux and Windows on both x86_64 and ARM64, plus iPadOS (device and
 # simulator builds).
 #
 # FFmpeg is built from the pinned source by scripts/build_ffmpeg.sh and
@@ -44,9 +45,6 @@ jobs:
             os: macos-15
             ffmpeg: macos-arm64
             lint: true
-          - name: macOS x86_64
-            os: macos-15-intel
-            ffmpeg: macos-x86_64
           - name: Linux x86_64
             os: ubuntu-24.04
             ffmpeg: linux-x86_64
