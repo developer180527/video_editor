@@ -328,7 +328,8 @@ fn create_proxies_makes_and_attaches_a_small_copy() {
     assert_eq!((proxy.width, proxy.height), (960, 540));
     let info = media_ffmpeg::Ffmpeg::new().probe(&Resolved { path: Some(path.clone().into()), guard: Box::new(()) }).unwrap();
     let v = info.video.unwrap();
-    assert_eq!((v.width, v.height, v.codec.as_str()), (960, 540, "h264"));
+    assert_eq!((v.width, v.height), (960, 540));
+    assert!(["h264", "mpeg4"].contains(&v.codec.as_str()), "H.264, or MPEG-4 where no H.264 encoder exists: {}", v.codec);
     assert_eq!(v.rate, ve_time::Rate::FPS_25);
     let secs = info.duration.as_seconds_f64();
     assert!((secs - 2.0).abs() < 0.1, "as long as the original: {secs}");

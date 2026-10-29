@@ -173,7 +173,16 @@ fn run(
         prefer_hardware: true,
     };
     let target = platform.storage.resolve_new(out).map_err(|e| e.to_string())?;
-    let mut enc = platform.media.open_encoder(&target, &settings).map_err(|e| e.to_string())?;
+    let mut enc = match platform.media.open_encoder(&target, &settings) {
+        Ok(enc) => enc,
+        // A proxy only has to play here: where no H.264 encoder exists (an
+        // LGPL build has no x264; no GPU encoder), MPEG-4 Part 2 does.
+        Err(ve_ports::MediaError::Unsupported(_)) if preset == ExportPreset::Proxy => {
+            let mpeg4 = EncoderSettings { video_codec: "mpeg4".into(), prefer_hardware: false, ..settings.clone() };
+            platform.media.open_encoder(&target, &mpeg4).map_err(|e| e.to_string())?
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     let mut comp = Compositor::new(device);
     comp.set_importer(importer);
     // 16 bits per channel out of the compositor: 10-bit codecs get 10 real

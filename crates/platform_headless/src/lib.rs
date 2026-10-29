@@ -261,14 +261,21 @@ impl AudioInput for NullInput {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         std::thread::spawn(move || {
+            // Paced by the clock, not by sleeps: a busy machine oversleeps,
+            // and a real microphone does not slow down.
+            let start = std::time::Instant::now();
             let mut n = 0u64;
-            let mut block = vec![0f32; 480];
+            let mut block = Vec::with_capacity(4800);
             while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-                for s in block.iter_mut() {
-                    *s = (n as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.25;
+                let due = (start.elapsed().as_secs_f64() * 48_000.0) as u64;
+                block.clear();
+                while n < due {
+                    block.push((n as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.25);
                     n += 1;
                 }
-                capture(&block);
+                if !block.is_empty() {
+                    capture(&block);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         });

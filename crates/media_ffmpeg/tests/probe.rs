@@ -380,3 +380,45 @@ fn debug_open_audio_of_a_given_file() {
         Err(e) => println!("open_audio failed: {e}"),
     }
 }
+
+/// MPEG-4 Part 2, the proxy encoder of last resort (every build has it):
+/// RGBA in, a file that plays back at the size and length asked.
+#[test]
+fn mpeg4_encodes_where_nothing_else_does() {
+    use ve_ports::{ColorTags, EncoderSettings, FrameData, PixelFormat, VideoFrame};
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mpeg4_test.mp4");
+    let _ = std::fs::remove_file(&out);
+    let target = Resolved { path: Some(out.clone()), guard: Box::new(()) };
+    let s = EncoderSettings {
+        video_codec: "mpeg4".into(),
+        audio_codec: String::new(),
+        container: "mp4".into(),
+        width: 160,
+        height: 90,
+        rate: Rate::FPS_25,
+        sample_rate: 48_000,
+        channels: 2,
+        video_bitrate: Some(500_000),
+        prefer_hardware: false,
+    };
+    let ff = Ffmpeg::new();
+    let mut enc = ff.open_encoder(&target, &s).unwrap();
+    for i in 0..25 {
+        let px = vec![(i * 10) as u8; 160 * 90 * 4];
+        enc.push_video(VideoFrame {
+            pts: Rate::FPS_25.frame_to_time(i),
+            duration: Rate::FPS_25.frame_duration(),
+            width: 160,
+            height: 90,
+            format: PixelFormat::Rgba8,
+            color: ColorTags::default(),
+            data: FrameData::Cpu { planes: vec![px], strides: vec![160 * 4] },
+        })
+        .unwrap();
+    }
+    enc.finish().unwrap();
+    let info = ff.probe(&target).unwrap();
+    let v = info.video.unwrap();
+    assert_eq!((v.width, v.height, v.codec.as_str()), (160, 90, "mpeg4"));
+    assert!((info.duration.as_seconds_f64() - 1.0).abs() < 0.1, "{:?}", info.duration);
+}

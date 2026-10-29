@@ -96,7 +96,8 @@ impl Recording {
         let cb = shared.clone();
         let capture = Box::new(move |buf: &[f32]| {
             let peak = buf.iter().fold(0f32, |m, x| m.max(x.abs()));
-            let _ = cb.peak.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| Some(f32::from_bits(p).max(peak).to_bits()));
+            // Non-negative floats order as their bits do.
+            cb.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
             let frames = buf.len() as u64 / channels;
             match cb.pending.try_lock() {
                 Ok(mut p) if p.len() + buf.len() <= p.capacity() => {

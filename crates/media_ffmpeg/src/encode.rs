@@ -33,6 +33,8 @@ fn pixel_formats(name: &str) -> &'static [sys::AVPixelFormat] {
     use sys::AVPixelFormat::*;
     if name == "prores_ks" {
         &[AV_PIX_FMT_YUV422P10LE]
+    } else if name == "mpeg4" {
+        &[AV_PIX_FMT_YUV420P]
     } else if name.starts_with("hevc") {
         &[AV_PIX_FMT_P010LE, AV_PIX_FMT_NV12]
     } else {
@@ -66,6 +68,9 @@ fn video_encoders(codec: &str) -> &'static [Candidate] {
             ("hevc_mf", None, &[]),
         ],
         "prores" => &[("prores_ks", None, &[("profile", "hq")])],
+        // FFmpeg's own MPEG-4 Part 2: in every build, light to decode (proxies
+        // where no H.264 encoder exists).
+        "mpeg4" => &[("mpeg4", None, &[])],
         _ => &[
             ("h264_videotoolbox", None, &[]),
             ("h264_nvenc", None, &[]),

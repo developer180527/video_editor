@@ -65,6 +65,8 @@ fn an_instance_processes_with_its_parameters_on_the_callers_thread() {
 }
 
 /// A macOS-style bundle (`Name.clap/Contents/MacOS/Name`) loads like a file.
+/// (Bundles are macOS's; elsewhere a .clap is a plain library.)
+#[cfg(target_os = "macos")]
 #[test]
 fn a_bundle_loads_like_a_file() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("Test Gain.clap");
