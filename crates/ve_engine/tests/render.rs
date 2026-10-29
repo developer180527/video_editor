@@ -45,6 +45,10 @@ fn clip() -> Option<PathBuf> {
 #[test]
 fn import_place_decode_composite() {
     let Some(file) = clip() else { return eprintln!("skipped: no ffmpeg CLI") };
+    // CI runners whose software GPU crashes (Windows ARM64) skip GPU tests.
+    if std::env::var_os("VE_NO_GPU").is_some() {
+        return eprintln!("skipped: VE_NO_GPU");
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
     // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
@@ -104,6 +108,10 @@ fn export_h264_with_audio() {
         .is_ok_and(|s| s.success());
     if !made {
         return eprintln!("skipped: no ffmpeg CLI");
+    }
+    // CI runners whose software GPU crashes (Windows ARM64) skip GPU tests.
+    if std::env::var_os("VE_NO_GPU").is_some() {
+        return eprintln!("skipped: VE_NO_GPU");
     }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
@@ -178,6 +186,10 @@ fn export_h264_with_audio() {
 #[test]
 fn export_fails_on_missing_media_and_ignores_the_preview() {
     let Some(file) = clip() else { return eprintln!("skipped: no ffmpeg CLI") };
+    // CI runners whose software GPU crashes (Windows ARM64) skip GPU tests.
+    if std::env::var_os("VE_NO_GPU").is_some() {
+        return eprintln!("skipped: VE_NO_GPU");
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
     // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
@@ -248,6 +260,10 @@ fn prores_export_keeps_ten_bits() {
     if !made {
         return eprintln!("skipped: no ffmpeg CLI");
     }
+    // CI runners whose software GPU crashes (Windows ARM64) skip GPU tests.
+    if std::env::var_os("VE_NO_GPU").is_some() {
+        return eprintln!("skipped: VE_NO_GPU");
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
     // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
@@ -302,6 +318,10 @@ fn create_proxies_makes_and_attaches_a_small_copy() {
     let Some(src) = generated("proxy_src.mov", &["-f", "lavfi", "-i", "smptebars=size=1280x720:rate=25:duration=2", "-c:v", "mpeg4", "-q:v", "2"]) else {
         return eprintln!("skipped: no ffmpeg CLI");
     };
+    // CI runners whose software GPU crashes (Windows ARM64) skip GPU tests.
+    if std::env::var_os("VE_NO_GPU").is_some() {
+        return eprintln!("skipped: VE_NO_GPU");
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
     // Which GPU the tests got (CI logs: a software adapter where there is no GPU).

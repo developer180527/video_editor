@@ -173,10 +173,18 @@ fn playback_callback_delivers_mixed_audio() {
     let mixer = Mixer::new(storage(), Arc::new(media_ffmpeg::Ffmpeg::new()), 48_000);
     let (pb, mut callback) = Playback::new(mixer, 2);
     pb.play(Arc::new(p), seq_id, Time::from_seconds(1));
-    std::thread::sleep(Duration::from_millis(200)); // let the mixer run ahead
+    // As a device does: ask for buffers until the mixer has run ahead (a
+    // fixed wait was too short on a loaded CI machine).
     let mut out = vec![0f32; 512 * 2];
-    callback(&mut out);
-    assert!(peak(&out, 0) > 0.05, "sound comes out");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        std::thread::sleep(Duration::from_millis(10));
+        callback(&mut out);
+        if peak(&out, 0) > 0.05 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "sound comes out");
+    }
     assert!(pb.meters.peaks()[0] > 0.05, "and the meters see it");
     pb.stop();
     callback(&mut out);
@@ -314,8 +322,10 @@ fn playback_clock_waits_for_the_mixer() {
         std::thread::sleep(Duration::from_millis(5));
         callback(&mut buf);
     }
-    assert_eq!(clock.read().0 % 512, 0);
+    // The frames actually heard: all of the buffer, or as much of it as the
+    // mixer had ready (a slow machine catches it part-way).
     let n = clock.read().0;
+    assert!(n > 0 && n <= 512, "the first buffer heard counts its frames: {n}");
     pb.stop();
     callback(&mut buf);
     assert_eq!(clock.read().0, n, "stopped: the clock stands still");

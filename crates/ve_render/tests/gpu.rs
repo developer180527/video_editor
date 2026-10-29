@@ -7,6 +7,10 @@ use ve_render::*;
 use ve_time::Time;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+    // CI runners whose software GPU crashes (Windows ARM64) skip GPU tests.
+    if std::env::var_os("VE_NO_GPU").is_some() {
+        return None;
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })).ok()?;
     // Which GPU the tests got (CI logs: a software adapter where there is no GPU).
