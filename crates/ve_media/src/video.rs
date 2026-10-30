@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -82,6 +82,38 @@ struct State {
     asked: Option<std::time::Instant>,
     error: Option<String>,
     closed: bool,
+    /// Lane mode (see `VideoPool::set_lanes`): the source cut into spans.
+    spans: Option<Spans>,
+    /// When a blocking ask last had to wait for its frame: decoding is what
+    /// the consumer waits on, so more lanes help.
+    starved: Option<std::time::Instant>,
+}
+
+/// A source cut at its seek points into spans that separate decoder
+/// sessions ("lanes") decode side by side.
+#[derive(Default)]
+struct Spans {
+    /// Span `k` is `[starts[k], starts[k + 1])`; the last runs to the end.
+    starts: Vec<Time>,
+    /// Being decoded.
+    taken: HashSet<usize>,
+    /// Decoded. Its frames are dropped once passed; a span the wanted time
+    /// comes back to is decoded again from there (see `State::pick`).
+    done: HashSet<usize>,
+    /// Where a span was last decoded again from: not twice from the same
+    /// place, so a frame that cannot be made fails the wait instead of
+    /// being decoded for ever.
+    redone: HashMap<usize, Time>,
+}
+
+impl Spans {
+    fn of(&self, t: Time) -> usize {
+        self.starts.partition_point(|s| *s <= t).saturating_sub(1)
+    }
+
+    fn end(&self, k: usize) -> Time {
+        self.starts.get(k + 1).copied().unwrap_or(Time::MAX)
+    }
 }
 
 impl State {
@@ -164,6 +196,69 @@ impl State {
         }
     }
 
+    /// Lane mode: drop frames already passed (in the direction of travel)
+    /// until `bytes` fits, oldest first. Never what is ahead: that is the
+    /// lanes' work, wanted next.
+    fn evict_behind(&mut self, budget: usize) {
+        let Some(t) = self.want else { return };
+        while self.bytes > budget {
+            let behind = if self.backward {
+                self.frames.iter().rev().find(|(k, _)| **k > t && !self.protected(**k)).map(|(k, _)| *k)
+            } else {
+                self.frames.iter().find(|(k, f)| (**k).max(f.pts) + f.duration <= t && !self.protected(**k)).map(|(k, _)| *k)
+            };
+            match behind {
+                Some(k) => self.remove(k),
+                None => break,
+            }
+        }
+    }
+
+    /// Lane mode: the next span for an idle lane, and where to start it:
+    /// the wanted time's span first, then the spans after it (before it,
+    /// moving back) up to `window`, then the next clip's.
+    fn pick(&self, window: usize) -> Option<(usize, Time)> {
+        let sp = self.spans.as_ref()?;
+        let t = self.want?;
+        let cur = sp.of(t);
+        let free = |k: usize| !sp.taken.contains(&k) && !sp.done.contains(&k) && self.end.is_none_or(|e| sp.starts[k] < e);
+        // The wanted span: whole if never decoded; decoded once already
+        // (come back to, its frames since dropped), from the wanted time.
+        let missing = self.covering(t).is_none() && self.past_end(t).is_none();
+        if missing && !sp.taken.contains(&cur) {
+            if !sp.done.contains(&cur) {
+                return Some((cur, sp.starts[cur]));
+            }
+            if sp.redone.get(&cur) != Some(&t) {
+                return Some((cur, t));
+            }
+        }
+        // Side by side only while the consumer waits on decoding; otherwise
+        // one session at a time, going on into the next span. When the
+        // consumer does not wait (a decoder faster than the encoder), more
+        // sessions only take the media engine from the encoder: measured
+        // slower.
+        let starved = self.starved.is_some_and(|at| at.elapsed() < STARVED);
+        if !starved && !sp.taken.is_empty() {
+            return None;
+        }
+        let window = if starved { window } else { 1 };
+        let last = sp.starts.len() - 1;
+        let ahead: Vec<usize> = if self.backward { (cur.saturating_sub(window)..cur).rev().collect() } else { (cur + 1..=(cur + window).min(last)).collect() };
+        if let Some(k) = ahead.into_iter().find(|k| free(*k)) {
+            return Some((k, sp.starts[k]));
+        }
+        let k = sp.of(self.upcoming()?);
+        free(k).then(|| (k, sp.starts[k]))
+    }
+
+    /// Lane mode: whether a lane decoding span `k`, at `pos`, makes frames
+    /// wanted now (so it goes on even over budget).
+    fn needed_soon(&self, k: usize, pos: Time) -> bool {
+        let (Some(sp), Some(t)) = (&self.spans, self.want) else { return true };
+        sp.of(t) == k && (self.backward || pos <= t + AHEAD)
+    }
+
     fn evict(&mut self, budget: usize) {
         let Some(t) = self.want else { return };
         // Behind the window: drop (unless kept for an upcoming clip).
@@ -210,7 +305,19 @@ pub struct VideoPool {
     /// consumer whose compositor can import them. Applies to decoders opened
     /// from then on.
     gpu_frames: std::sync::atomic::AtomicBool,
+    /// Decoder sessions per source (see `set_lanes`), and the bytes each
+    /// source may hold then.
+    lanes: std::sync::atomic::AtomicUsize,
+    lane_budget: std::sync::atomic::AtomicUsize,
 }
+
+/// Lane mode: the shortest span. Each span costs its lane a few frames
+/// decoded twice (the reorder delay at its start); a second keeps that
+/// small.
+const MIN_SPAN: Time = Time::from_seconds(1);
+/// Lane mode: how long after the consumer last waited for a frame more
+/// lanes keep taking spans ahead.
+const STARVED: Duration = Duration::from_secs(1);
 
 impl VideoPool {
     pub fn new(storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>, budget_per_source: usize) -> Arc<Self> {
@@ -221,7 +328,22 @@ impl VideoPool {
             budget: budget_per_source,
             waker: Mutex::new(None),
             gpu_frames: Default::default(),
+            lanes: std::sync::atomic::AtomicUsize::new(1),
+            lane_budget: Default::default(),
         })
+    }
+
+    /// Decode each source with `lanes` sessions side by side, for a
+    /// consumer that reads through sources in order as fast as it can
+    /// (export). A hardware decoder is limited by the time each frame takes,
+    /// not by the hardware, so separate sessions decoding separate spans
+    /// multiply its speed; they decode ahead into `budget` bytes per source,
+    /// so the spans must fit in it to run side by side. Sources whose seek
+    /// points are not known decode with one session. Applies to sources
+    /// opened from then on.
+    pub fn set_lanes(&self, lanes: usize, budget: usize) {
+        self.lanes.store(lanes.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.lane_budget.store(budget, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_waker(&self, w: Waker) {
@@ -242,9 +364,10 @@ impl VideoPool {
         let src = Arc::new(Source { state: Mutex::new(State::default()), wake: Condvar::new() });
         sources.insert(media.clone(), src.clone());
         let (pool, s, media) = (Arc::downgrade(self), src.clone(), media.clone());
+        let lanes = self.lanes.load(std::sync::atomic::Ordering::Relaxed);
         std::thread::Builder::new()
             .name("ve-decode".into())
-            .spawn(move || worker(pool, s, media))
+            .spawn(move || if lanes > 1 { start_lanes(pool, s, media, lanes) } else { worker(pool, s, media) })
             .expect("decode thread");
         src
     }
@@ -295,6 +418,9 @@ impl VideoPool {
         let src = self.source(media);
         let deadline = std::time::Instant::now() + timeout;
         let mut st = src.state.lock().unwrap();
+        if let Some(prev) = st.want.filter(|p| *p != t) {
+            st.backward = t < prev;
+        }
         st.want = Some(t);
         st.asked = Some(std::time::Instant::now());
         src.wake.notify_all();
@@ -304,6 +430,9 @@ impl VideoPool {
             }
             if let Some(f) = st.covering(t).or_else(|| st.past_end(t)) {
                 return Ok(f.clone());
+            }
+            if !st.frames.is_empty() {
+                st.starved = Some(std::time::Instant::now());
             }
             let now = std::time::Instant::now();
             if now >= deadline {
@@ -338,6 +467,10 @@ impl VideoPool {
             st.bytes = 0;
             st.end = None;
             st.restart = true;
+            if let Some(sp) = &mut st.spans {
+                sp.done.clear();
+                sp.redone.clear();
+            }
             if let Some((k, f)) = keep {
                 st.bytes = frame_bytes(&f);
                 st.frames.insert(k, f);
@@ -504,6 +637,188 @@ fn worker(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef) {
     }
 }
 
+/// Open `media`'s decoder as the pool asks (frames left in GPU memory or not).
+fn open_decoder(pool: &std::sync::Weak<VideoPool>, storage: &dyn Storage, backend: &dyn MediaBackend, media: &MediaRef) -> Result<(Resolved, Box<dyn VideoDecoder>), String> {
+    let for_gpu = pool.upgrade().is_some_and(|p| p.gpu_frames.load(std::sync::atomic::Ordering::Relaxed));
+    let r = storage.resolve(media).map_err(|e| e.to_string())?;
+    let d = if for_gpu { backend.open_video_for_gpu(&r) } else { backend.open_video(&r) };
+    d.map(|d| (r, d)).map_err(|e| e.to_string())
+}
+
+/// Lane mode's first thread: open the source, cut it into spans at its seek
+/// points and start the other lanes — or, with no seek points (or just one
+/// span), decode it the usual way.
+fn start_lanes(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef, lanes: usize) {
+    let Some(p) = pool.upgrade() else { return };
+    let (storage, backend) = (p.storage.clone(), p.media.clone());
+    drop(p);
+    let mut dec = match open_decoder(&pool, &*storage, &*backend, &media) {
+        Ok(d) => d,
+        Err(e) => {
+            src.state.lock().unwrap().error = Some(e);
+            src.wake.notify_all();
+            return;
+        }
+    };
+    let mut starts: Vec<Time> = Vec::new();
+    for t in dec.1.seek_points().unwrap_or_default() {
+        if starts.last().is_none_or(|l| t >= *l + MIN_SPAN) {
+            starts.push(t);
+        }
+    }
+    if starts.len() < 2 {
+        drop(dec);
+        return worker(pool, src, media);
+    }
+    src.state.lock().unwrap().spans = Some(Spans { starts, ..Default::default() });
+    for _ in 1..lanes {
+        let (pool, src, media) = (pool.clone(), src.clone(), media.clone());
+        std::thread::Builder::new().name("ve-decode".into()).spawn(move || lane(pool, src, media, None, lanes)).expect("decode thread");
+    }
+    dec.1.keep_lead_in(false);
+    lane(pool, src, media, Some(dec), lanes)
+}
+
+/// One lane: take the next span the wanted time needs, decode it whole
+/// (sleeping while the source's frames fill its budget, unless they are
+/// wanted now), and again, until the pool closes the source.
+fn lane(pool: std::sync::Weak<VideoPool>, src: Arc<Source>, media: MediaRef, mut dec: Option<(Resolved, Box<dyn VideoDecoder>)>, lanes: usize) {
+    let Some(p) = pool.upgrade() else { return };
+    let (storage, backend) = (p.storage.clone(), p.media.clone());
+    let budget = p.lane_budget.load(std::sync::atomic::Ordering::Relaxed);
+    drop(p);
+    let first_lane = dec.is_some();
+    // The span this lane last finished and the frame it read past its end
+    // (the next span's first): taking the next span, it goes on from there
+    // without seeking.
+    let mut carry: Option<(usize, VideoFrame)> = None;
+    loop {
+        let (k, from, to, repair) = {
+            let mut st = src.state.lock().unwrap();
+            loop {
+                if st.closed {
+                    return;
+                }
+                if let Some((k, from)) = st.pick(lanes * 2) {
+                    let sp = st.spans.as_mut().unwrap();
+                    sp.taken.insert(k);
+                    let repair = from != sp.starts[k];
+                    if repair {
+                        sp.redone.insert(k, from);
+                    }
+                    break (k, from, sp.end(k), repair);
+                }
+                st = src.wake.wait(st).unwrap();
+            }
+        };
+        let untake = |st: &mut State| {
+            if let Some(sp) = &mut st.spans {
+                sp.taken.remove(&k);
+            }
+            src.wake.notify_all();
+        };
+        if dec.is_none() {
+            match open_decoder(&pool, &*storage, &*backend, &media) {
+                Ok(d) => dec = Some(d),
+                // The first lane's decoder opened, so this is a limit on
+                // sessions (or memory): the others do without this lane.
+                Err(_) if !first_lane => return untake(&mut src.state.lock().unwrap()),
+                Err(e) => {
+                    let mut st = src.state.lock().unwrap();
+                    st.error = Some(e);
+                    return untake(&mut st);
+                }
+            }
+        }
+        let (_, d) = dec.as_mut().unwrap();
+        let mut next = match carry.take() {
+            Some((j, f)) if j + 1 == k && !repair => Some(f),
+            _ => {
+                if let Err(e) = d.seek(from) {
+                    let mut st = src.state.lock().unwrap();
+                    st.error = Some(e.to_string());
+                    return untake(&mut st);
+                }
+                None
+            }
+        };
+        let sought = next.is_none();
+        let mut first = true;
+        let mut pos = from;
+        let ended = loop {
+            // Room for one more frame, or wanted now.
+            {
+                let mut st = src.state.lock().unwrap();
+                loop {
+                    if st.closed {
+                        return;
+                    }
+                    if st.bytes + st.frame_bytes <= budget {
+                        break;
+                    }
+                    let keep = budget.saturating_sub(st.frame_bytes);
+                    st.evict_behind(keep);
+                    if st.bytes + st.frame_bytes <= budget || st.needed_soon(k, pos) {
+                        break;
+                    }
+                    st = src.wake.wait(st).unwrap();
+                }
+            }
+            let f = match next.take() {
+                Some(f) => f,
+                None => match d.next_frame() {
+                    Ok(Some(f)) => f,
+                    Ok(None) => break Ok(true),
+                    Err(e) => break Err(e.to_string()),
+                },
+            };
+            if f.pts >= to {
+                carry = Some((k, f));
+                break Ok(false);
+            }
+            pos = f.pts + f.duration;
+            // The first frame after a seek starts after the target only at
+            // the head of the stream: it is shown from the target on.
+            let key = if sought && first && f.pts > from { from } else { f.pts };
+            first = false;
+            let f = Arc::new(f);
+            let fresh;
+            {
+                let mut st = src.state.lock().unwrap();
+                fresh = st.waiting && st.want.is_some_and(|t| key <= t && t < f.pts + f.duration);
+                st.frame_bytes = frame_bytes(&f);
+                st.bytes += frame_bytes(&f);
+                if let Some(old) = st.frames.insert(key, f) {
+                    st.bytes -= frame_bytes(&old);
+                }
+            }
+            src.wake.notify_all();
+            if fresh {
+                if let Some(p) = pool.upgrade() {
+                    p.wake_ui();
+                }
+            }
+        };
+        let mut st = src.state.lock().unwrap();
+        match ended {
+            Ok(at_end) => {
+                if at_end {
+                    st.end = Some(pos);
+                }
+                if let Some(sp) = &mut st.spans {
+                    sp.done.insert(k);
+                }
+            }
+            Err(e) => st.error = Some(e),
+        }
+        untake(&mut st);
+        drop(st);
+        if let Some(p) = pool.upgrade() {
+            p.wake_ui();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,9 +838,19 @@ mod tests {
         alive: Arc<AtomicUsize>,
         /// Ticks each frame's stored length falls short of the next frame.
         trim: i64,
+        /// A key frame every this many frames (seek points), if any: a seek
+        /// decodes from the one before its target.
+        keys: Option<i64>,
+        /// Time each frame takes, and how many are being decoded at once
+        /// (now, most).
+        cost: Duration,
+        busy: Arc<(AtomicUsize, AtomicUsize)>,
     }
 
     struct FakeDec {
+        keys: Option<i64>,
+        cost: Duration,
+        busy: Arc<(AtomicUsize, AtomicUsize)>,
         alive: Arc<AtomicUsize>,
         first: i64,
         next: i64,
@@ -544,12 +869,24 @@ mod tests {
         fn seek(&mut self, t: Time) -> Result<(), MediaError> {
             // Like the real decoder: past the end, the last frame.
             self.next = t.to_frame(RATE).clamp(self.first, self.end - 1);
+            // From the key frame before: the frames on the way are decoded too.
+            if let Some(k) = self.keys {
+                self.decoded.fetch_add(((self.next - self.first) % k) as usize, Ordering::SeqCst);
+            }
             Ok(())
+        }
+        fn seek_points(&mut self) -> Option<Vec<Time>> {
+            let k = self.keys?;
+            Some((0..).map(|i| RATE.frame_to_time(i * k)).take_while(|t| t.to_frame(RATE) < self.end).collect())
         }
         fn next_frame(&mut self) -> Result<Option<VideoFrame>, MediaError> {
             if self.next >= self.end {
                 return Ok(None);
             }
+            let (now, most) = &*self.busy;
+            most.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            std::thread::sleep(self.cost);
+            now.fetch_sub(1, Ordering::SeqCst);
             self.decoded.fetch_add(1, Ordering::SeqCst);
             let pts = RATE.frame_to_time(self.next);
             self.next += 1;
@@ -574,7 +911,17 @@ mod tests {
         }
         fn open_video(&self, _: &Resolved) -> Result<Box<dyn VideoDecoder>, MediaError> {
             self.alive.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(FakeDec { alive: self.alive.clone(), first: self.first, next: self.first, end: self.first + self.count, decoded: self.decoded.clone(), trim: self.trim }))
+            Ok(Box::new(FakeDec {
+                alive: self.alive.clone(),
+                first: self.first,
+                next: self.first,
+                end: self.first + self.count,
+                decoded: self.decoded.clone(),
+                trim: self.trim,
+                keys: self.keys,
+                cost: self.cost,
+                busy: self.busy.clone(),
+            }))
         }
         fn open_audio(&self, _: &Resolved, _: usize, _: u32, _: u16) -> Result<Box<dyn AudioDecoder>, MediaError> {
             unimplemented!()
@@ -592,7 +939,7 @@ mod tests {
 
     fn pool_trimmed(first: i64, count: i64, budget_frames: usize, trim: i64) -> (Arc<VideoPool>, Arc<AtomicUsize>) {
         let decoded = Arc::new(AtomicUsize::new(0));
-        let media = Arc::new(Fake { first, count, decoded: decoded.clone(), alive: Arc::new(AtomicUsize::new(0)), trim });
+        let media = Arc::new(Fake { first, count, decoded: decoded.clone(), alive: Arc::new(AtomicUsize::new(0)), trim, keys: None, cost: Duration::ZERO, busy: Default::default() });
         (VideoPool::new(Arc::new(AnyFile), media, budget_frames * FRAME), decoded)
     }
 
@@ -706,7 +1053,7 @@ mod tests {
     #[test]
     fn idle_sources_close_their_decoders() {
         let alive = Arc::new(AtomicUsize::new(0));
-        let media = Arc::new(Fake { first: 0, count: 10_000, decoded: Arc::new(AtomicUsize::new(0)), alive: alive.clone(), trim: 0 });
+        let media = Arc::new(Fake { first: 0, count: 10_000, decoded: Arc::new(AtomicUsize::new(0)), alive: alive.clone(), trim: 0, keys: None, cost: Duration::ZERO, busy: Default::default() });
         let pool = VideoPool::new(Arc::new(AnyFile), media, 1000 * FRAME);
         let m = MediaRef("x".into());
         pool.frame_blocking(&m, Time::ZERO, WAIT).unwrap();
@@ -730,5 +1077,67 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert!(src.upgrade().is_none(), "worker still holds its source");
         let _ = decoded;
+    }
+
+    /// Export's lane mode: a 40 s source with a key frame each second,
+    /// read through frame by frame. Every frame comes, in order; three
+    /// sessions decode at once; seeks land on key frames (little decoded
+    /// twice); the frames held stay near the budget.
+    #[test]
+    fn lanes_decode_spans_side_by_side() {
+        let (decoded, busy) = (Arc::new(AtomicUsize::new(0)), Arc::new((AtomicUsize::new(0), AtomicUsize::new(0))));
+        let media = Arc::new(Fake { first: 0, count: 1000, decoded: decoded.clone(), alive: Default::default(), trim: 0, keys: Some(25), cost: Duration::from_micros(300), busy: busy.clone() });
+        let pool = VideoPool::new(Arc::new(AnyFile), media, 1000 * FRAME);
+        let budget = 100;
+        pool.set_lanes(3, budget * FRAME);
+        let m = MediaRef("x".into());
+        let mut most_held = 0;
+        for i in 0..1000 {
+            let f = pool.frame_blocking(&m, RATE.frame_to_time(i), WAIT).unwrap();
+            assert_eq!(f.pts, RATE.frame_to_time(i));
+            let src = pool.sources.lock().unwrap().get(&m).unwrap().clone();
+            most_held = most_held.max(src.state.lock().unwrap().bytes / FRAME);
+        }
+        let most = busy.1.load(Ordering::SeqCst);
+        let n = decoded.load(Ordering::SeqCst);
+        eprintln!("{most} sessions at once, {n} frames decoded, {most_held} held at most");
+        assert!(most >= 2, "only {most} session decoded at a time");
+        assert!(n <= 1000 + 3 * 40, "decoded {n} frames to read 1000");
+        // The budget, plus what the span being read may take beyond it
+        // (wanted now: a second's look-ahead), plus a frame per lane.
+        assert!(most_held <= budget + 25 + 3, "held {most_held} frames");
+    }
+
+    /// Without seek points (no index), lane mode is the one decoder.
+    #[test]
+    fn lanes_need_seek_points() {
+        let busy = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let alive = Arc::new(AtomicUsize::new(0));
+        let media = Arc::new(Fake { first: 0, count: 200, decoded: Default::default(), alive: alive.clone(), trim: 0, keys: None, cost: Duration::from_micros(200), busy: busy.clone() });
+        let pool = VideoPool::new(Arc::new(AnyFile), media, 1000 * FRAME);
+        pool.set_lanes(3, 100 * FRAME);
+        let m = MediaRef("x".into());
+        for i in 0..200 {
+            assert_eq!(pool.frame_blocking(&m, RATE.frame_to_time(i), WAIT).unwrap().pts, RATE.frame_to_time(i));
+        }
+        assert_eq!(busy.1.load(Ordering::SeqCst), 1);
+        assert_eq!(alive.load(Ordering::SeqCst), 1);
+    }
+
+    /// Read backwards (a reversed clip), lane mode still finds every frame,
+    /// each span decoded about once.
+    #[test]
+    fn lanes_read_backwards() {
+        let decoded = Arc::new(AtomicUsize::new(0));
+        let media = Arc::new(Fake { first: 0, count: 300, decoded: decoded.clone(), alive: Default::default(), trim: 0, keys: Some(25), cost: Duration::ZERO, busy: Default::default() });
+        let pool = VideoPool::new(Arc::new(AnyFile), media, 1000 * FRAME);
+        pool.set_lanes(3, 100 * FRAME);
+        let m = MediaRef("x".into());
+        for i in (0..300).rev() {
+            assert_eq!(pool.frame_blocking(&m, RATE.frame_to_time(i), WAIT).unwrap().pts, RATE.frame_to_time(i));
+        }
+        let n = decoded.load(Ordering::SeqCst);
+        eprintln!("{n} frames decoded to read 300 backwards");
+        assert!(n <= 330, "decoded {n} frames to read 300 backwards");
     }
 }

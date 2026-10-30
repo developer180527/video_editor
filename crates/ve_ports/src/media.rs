@@ -127,6 +127,15 @@ pub trait VideoDecoder: Send {
     /// it lands on and its target, instead of discarding them. Scrubbing
     /// backwards wants exactly those next. A decoder that cannot ignores it.
     fn keep_lead_in(&mut self, _on: bool) {}
+    /// Times a seek can go to without wasting work: decoding on from one
+    /// yields every frame from it, and nothing before it is decoded and
+    /// thrown away — the key frames (from the container's index), moved past
+    /// any frames shown before them. Ascending, starting at zero. `None`
+    /// when not known (no index). Lets export decode the spans between them
+    /// side by side, in separate sessions.
+    fn seek_points(&mut self) -> Option<Vec<Time>> {
+        None
+    }
 }
 
 pub trait AudioDecoder: Send {

@@ -618,6 +618,56 @@ impl VideoDecoder for VideoDec {
         self.lead_in = on;
     }
 
+    /// The key frames in the container's index. A key frame's index time is
+    /// when it is decoded; with reordering (B-frames) it is shown up to the
+    /// reorder delay later, and frames shown before it (the end of the
+    /// previous group, or open-GOP leading pictures) are not decodable from
+    /// it. So each point is moved past the delay: seeking there lands on the
+    /// key frame, and the frames before the point belong to the span before.
+    /// A point is kept only while the next key frame is after it.
+    fn seek_points(&mut self) -> Option<Vec<Time>> {
+        unsafe {
+            let st = self.input.streams()[self.stream];
+            let n = sys::avformat_index_get_entries_count(st);
+            let par = (*st).codecpar;
+            let desc = sys::avcodec_descriptor_get((*par).codec_id);
+            let intra = !desc.is_null() && (*desc).props & sys::AV_CODEC_PROP_INTRA_ONLY as c_int != 0;
+            let delay = (*par).video_delay.max((*self.codec.ctx).has_b_frames).max(0) as i64;
+            let margin = if intra { Time::ZERO } else { Time::from_ticks(self.frame_dur.ticks() * (delay + 1)) };
+            let keys: Vec<Time> = (0..n)
+                .filter_map(|i| {
+                    let e = sys::avformat_index_get_entry(st, i);
+                    (!e.is_null() && (*e).flags() & sys::AVINDEX_KEYFRAME as c_int != 0).then(|| to_time((*e).timestamp, self.tb) - self.origin)
+                })
+                .collect();
+            // Zero is the first key frame's point: a seek there starts the file.
+            let mut points = vec![Time::ZERO];
+            for (i, k) in keys.iter().enumerate().skip(1) {
+                let p = *k + margin;
+                if p > *points.last().unwrap() && keys.get(i + 1).is_none_or(|next| *next > p) {
+                    points.push(p);
+                }
+            }
+            if points.len() < 2 {
+                return None;
+            }
+            // Try a couple: a seek to a point must land on the key frame
+            // just before it, not further back. (MOV seeks by presentation
+            // time and refuses key frames it cannot start from; H.264 key
+            // frames that are not IDR pictures — open GOP, as x264's
+            // open-gop and some cameras write — are not clean starts: the
+            // P-frame after one was measured to differ. A file is encoded
+            // one way throughout.)
+            let h264 = (*par).codec_id == sys::AVCodecID::AV_CODEC_ID_H264;
+            for i in [1, points.len() / 2] {
+                if !self.clean_start(points[i], points[i - 1], h264) {
+                    return None;
+                }
+            }
+            Some(points)
+        }
+    }
+
     /// Frames last until the next one starts. A stream's frame lengths are
     /// a poor guide: variable-rate video (phones switch between 60, 30 and
     /// 24 fps as the light changes) has no one length, and stored lengths
@@ -642,6 +692,56 @@ impl VideoDecoder for VideoDec {
 }
 
 impl VideoDec {
+    /// Whether a seek to `point` lands on a key frame after `before` (the
+    /// point before it) and, for H.264, an IDR picture. Reads one packet;
+    /// the decoder seeks again before decoding.
+    unsafe fn clean_start(&mut self, point: Time, before: Time, h264: bool) -> bool {
+        unsafe {
+            if self.codec.seek(&self.input, self.stream, point + self.origin).is_err() {
+                return false;
+            }
+            let pkt = self.codec.pkt;
+            while sys::av_read_frame(self.input.0, pkt) >= 0 {
+                if (*pkt).stream_index as usize != self.stream {
+                    sys::av_packet_unref(pkt);
+                    continue;
+                }
+                let pts = if (*pkt).pts != NOPTS { (*pkt).pts } else { (*pkt).dts };
+                let key = (*pkt).flags & sys::AV_PKT_FLAG_KEY as c_int != 0;
+                let ok = key && to_time(pts, self.tb) - self.origin > before && (!h264 || self.h264_idr(pkt));
+                sys::av_packet_unref(pkt);
+                return ok;
+            }
+            false
+        }
+    }
+
+    /// Whether H.264 packet `pkt` holds an IDR picture (NAL unit type 5).
+    unsafe fn h264_idr(&self, pkt: *const sys::AVPacket) -> bool {
+        unsafe {
+            let data = std::slice::from_raw_parts((*pkt).data, (*pkt).size.max(0) as usize);
+            let par = (*self.input.streams()[self.stream]).codecpar;
+            let extra = std::slice::from_raw_parts((*par).extradata, (*par).extradata_size.max(0) as usize);
+            // MP4/MOV store NAL units length-prefixed (the length's size is
+            // in the avcC header); elementary streams use start codes.
+            if extra.len() > 4 && extra[0] == 1 {
+                let len_size = ((extra[4] & 3) + 1) as usize;
+                let mut at = 0;
+                while at + len_size < data.len() {
+                    let len = data[at..at + len_size].iter().fold(0usize, |a, b| a << 8 | *b as usize);
+                    at += len_size;
+                    if data[at] & 0x1f == 5 {
+                        return true;
+                    }
+                    at += len.max(1);
+                }
+                false
+            } else {
+                data.windows(4).any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && w[3] & 0x1f == 5)
+            }
+        }
+    }
+
     /// The next frame as decoded, with its stored length.
     fn next_decoded(&mut self) -> Result<Option<VideoFrame>, MediaError> {
         loop {

@@ -128,6 +128,10 @@ impl ExportState {
 
 const SAMPLE_RATE: u32 = 48_000;
 
+/// Decoder sessions per source. Measured (`ve bench --jobs`, M4 Pro, UHD
+/// H.264 through VideoToolbox): one session 128 fps, three 335 fps.
+const DECODE_LANES: usize = 3;
+
 /// How long to wait for one decoded frame before giving up.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -189,8 +193,13 @@ pub(crate) fn launch(
     std::thread::Builder::new()
         .name("ve-export".into())
         .spawn(move || {
-            let budget = (platform.capabilities().memory_budget / 8) as usize;
-            let pool = VideoPool::new(platform.storage.clone(), platform.media.clone(), budget);
+            let memory = platform.capabilities().memory_budget as usize;
+            let pool = VideoPool::new(platform.storage.clone(), platform.media.clone(), memory / 8);
+            // Several decoder sessions per source, a span each: a hardware
+            // decoder is limited by the time each frame takes, not by the
+            // hardware. The spans they decode ahead need memory to run side
+            // by side; export is the one thing running, so half the budget.
+            pool.set_lanes(DECODE_LANES, memory / 2);
             pool.set_gpu_frames(importer.is_some());
             // A panic in here (a GPU validation error, a codec bug) must still
             // end the export, or whoever shows its progress waits forever.

@@ -390,7 +390,7 @@ pub fn jobs(args: &[String]) -> i32 {
     };
     println!("ve bench --jobs — two {secs} s exports; cores = CPU time / wall time");
     let presets = [ve_engine::ExportPreset::H264Mp4, ve_engine::ExportPreset::HevcMp4, ve_engine::ExportPreset::ProResMov];
-    for (label, path) in [("1080p H.264", &m.hd), ("UHD H.264", &m.uhd_h264)] {
+    for (label, path) in [("1080p H.264", &m.hd), ("UHD H.264", &m.uhd_h264), ("UHD HEVC 10-bit", &m.uhd_hevc)] {
         let e = match project(path, Kind::Plain, secs) {
             Ok(e) => e,
             Err(err) => {

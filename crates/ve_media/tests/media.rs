@@ -392,3 +392,54 @@ fn clips_play_their_own_audio_stream() {
     let crossings = left.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count() as f64;
     assert!((crossings / 2.0 - 880.0).abs() < 5.0, "heard {} Hz", crossings / 2.0);
 }
+
+/// Export's lane mode decodes a source as spans between its key frames, in
+/// separate sessions. Where spans meet, B-frames are shown out of decode
+/// order and open GOPs start with pictures that need the span before:
+/// every frame must still come, the same picture as decoding straight
+/// through. Checked frame by frame, pixel for pixel, against one decoder.
+#[test]
+fn lanes_give_the_same_frames_as_one_decoder() {
+    let src = "testsrc2=size=320x180:rate=25:duration=8";
+    let cases: [(&str, &[&str]); 4] = [
+        ("lanes_h264_closed.mp4", &["-c:v", "libx264", "-x264-params", "keyint=25:min-keyint=25:scenecut=0:bframes=3:b-pyramid=normal:open-gop=0"]),
+        ("lanes_h264_open.mp4", &["-c:v", "libx264", "-x264-params", "keyint=25:min-keyint=25:scenecut=0:bframes=3:b-pyramid=normal:open-gop=1"]),
+        ("lanes_hevc_open.mp4", &["-c:v", "libx265", "-x265-params", "keyint=25:min-keyint=25:scenecut=0:bframes=4:open-gop=1:log-level=error", "-tag:v", "hvc1"]),
+        ("lanes_prores.mov", &["-c:v", "prores_ks"]),
+    ];
+    let digest = |f: &ve_ports::VideoFrame| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        f.data.cpu().expect("frames in memory").planes.hash(&mut h);
+        h.finish()
+    };
+    let mut tried = 0;
+    for (name, codec) in cases {
+        let Some(file) = generated(name, &[&["-f", "lavfi", "-i", src], codec].concat()) else {
+            eprintln!("{name}: skipped (no such encoder in the ffmpeg CLI)");
+            continue;
+        };
+        tried += 1;
+        let media = MediaRef(format!("file:{}", file.display()));
+        let ffmpeg = Arc::new(media_ffmpeg::Ffmpeg::new());
+        // Straight through (lanes go on from span to span, and side by
+        // side); then a second at a time from the end (every span entered
+        // by a seek).
+        let forward: Vec<i64> = (0..200).collect();
+        let jumps: Vec<i64> = (0..8).rev().flat_map(|s| s * 25..s * 25 + 25).collect();
+        for order in [forward, jumps] {
+            let one = VideoPool::new(storage(), ffmpeg.clone(), 64 << 20);
+            let lanes = VideoPool::new(storage(), ffmpeg.clone(), 64 << 20);
+            lanes.set_lanes(3, 16 << 20);
+            let r = Rate::FPS_25;
+            for i in order {
+                let t = r.frame_to_time(i);
+                let a = one.frame_blocking(&media, t, Duration::from_secs(10)).unwrap();
+                let b = lanes.frame_blocking(&media, t, Duration::from_secs(10)).unwrap_or_else(|e| panic!("{name}: frame {i}: {e}"));
+                assert_eq!(a.pts, b.pts, "{name}: frame {i}");
+                assert_eq!(digest(&a), digest(&b), "{name}: frame {i} differs");
+            }
+        }
+    }
+    assert!(tried > 0 || Command::new("ffmpeg").arg("-version").output().is_err());
+}
