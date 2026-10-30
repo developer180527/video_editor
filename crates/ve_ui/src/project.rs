@@ -123,11 +123,10 @@ fn grid(ui: &mut Ui, app: &mut EditorUi, drop_hover: bool) {
                     }
                     let has_proxy = a.variants.iter().any(|v| v.kind == VariantKind::Proxy);
                     let video = a.info.as_ref().is_some_and(|i| i.video.is_some());
-                    let idle = app.proxies_job.is_none();
                     let id = a.id;
                     if let Some(Some(m)) = ui.context_menu(&r, |ui| {
                         let mut m = None;
-                        if ui.menu_item_ex("Create Proxy", None, idle && video).clicked {
+                        if ui.menu_item_ex("Create Proxy", None, video).clicked {
                             m = Some(AssetMenu::CreateProxy(id));
                         }
                         if ui.menu_item("Attach Proxy…").clicked {

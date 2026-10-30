@@ -15,6 +15,7 @@ mod effects;
 mod features;
 mod bands;
 mod graph;
+mod jobs_panel;
 mod keys;
 mod graphics;
 mod icon_shapes;
@@ -249,9 +250,8 @@ pub struct EditorUi {
     pub(crate) meter_db: [f32; 2],
     /// The GPU, kept for exports.
     gpu: Option<(wgpu::Device, wgpu::Queue)>,
-    pub(crate) export: Option<std::sync::Arc<ve_engine::ExportState>>,
-    /// Create Proxies, while it runs.
-    pub(crate) proxies_job: Option<std::sync::Arc<ve_engine::ProxyJob>>,
+    /// Jobs already announced as finished (toasts), by id.
+    announced: std::collections::HashSet<ve_engine::JobId>,
     pub(crate) export_preset: usize,
     pub(crate) show_export: bool,
     /// Thumbnail textures, by (asset, second).
@@ -324,6 +324,8 @@ pub struct EditorUi {
     source_catching_up: bool,
     /// Refusals from this frame, shown as toasts on the next.
     errors: Vec<String>,
+    /// Things worth saying (not errors), shown as info toasts.
+    notes: Vec<String>,
     requests: Vec<HostRequest>,
     #[allow(dead_code)] // the tablet arrangement is chosen at construction; kept for touch-specific input next
     touch: bool,
@@ -388,8 +390,7 @@ impl EditorUi {
             catching_up: false,
             meter_db: [-96.0; 2],
             gpu: None,
-            export: None,
-            proxies_job: None,
+            announced: Default::default(),
             export_preset: 0,
             show_export: false,
             thumbs: HashMap::new(),
@@ -431,6 +432,7 @@ impl EditorUi {
             text_gesture: None,
             color_gesture: None,
             errors: Vec::new(),
+            notes: Vec::new(),
             requests: Vec::new(),
             touch,
         }
@@ -492,6 +494,8 @@ impl EditorUi {
         }
         if self.gpu.is_none() {
             self.gpu = Some((device.clone(), queue.clone()));
+            // Queued exports and proxies can run now.
+            self.engine.enable_jobs((device.clone(), queue.clone()), self.importer.clone());
         }
         // Template pictures, once, when a graphics panel first wants them.
         if self.graphics_wanted && self.template_tex.is_empty() {
@@ -638,71 +642,58 @@ impl EditorUi {
         self.engine.relink(asset, path.to_string_lossy().into_owned());
     }
 
-    /// Make proxies of `assets` in the background, as tall as Settings says.
+    /// Queue proxies of `assets`, as tall as Settings says (Jobs panel).
     pub(crate) fn create_proxies(&mut self, assets: Vec<AssetId>) {
-        if self.proxies_job.is_some() {
-            return;
-        }
         if assets.is_empty() {
             self.errors.push("Every video clip already has a proxy.".into());
             return;
         }
-        let Some(gpu) = self.gpu.clone() else {
-            self.errors.push("Proxies need the GPU, which is not ready yet.".into());
-            return;
-        };
-        self.proxies_job = Some(self.engine.create_proxies(gpu, assets, self.settings.proxy_height, self.importer.clone()));
+        let n = self.engine.queue_proxies(assets, self.settings.proxy_height).len();
+        if n > 0 {
+            self.notes.push(format!("{n} prox{} queued — see the Jobs panel", if n == 1 { "y" } else { "ies" }));
+        }
     }
 
-    /// The end of a Create Proxies: say how it went.
-    fn proxies_ui(&mut self, ui: &mut Ui) {
-        let Some(job) = &self.proxies_job else { return };
-        let Some(results) = job.result() else { return };
-        let made = results.iter().filter(|r| r.is_ok()).count();
-        let failed: Vec<String> = results.iter().zip(&job.names).filter_map(|(r, n)| r.as_ref().err().map(|e| format!("{n}: {e}"))).collect();
-        if job.cancelled() {
-            ui.toast(Toast::info(format!("Proxies cancelled ({made} made)")));
-        } else if failed.is_empty() {
-            let hint = if self.view.proxies { "" } else { " — turn on Use Proxies (Program monitor) to play them" };
-            ui.toast(Toast::success(format!("{made} prox{} ready{hint}", if made == 1 { "y" } else { "ies" })));
-        } else {
-            ui.toast(Toast::error(format!("{} proxy(ies) failed: {}", failed.len(), failed.join("; "))));
+    /// A toast for each job that has just finished.
+    fn jobs_ui(&mut self, ui: &mut Ui) {
+        // The engine's queue holds playback-sensitive work back while playing.
+        self.engine.jobs().set_playing(self.engine.is_playing());
+        for j in self.engine.jobs().list() {
+            if !j.state.finished() || !self.announced.insert(j.id) {
+                continue;
+            }
+            match (&j.state, j.kind) {
+                (ve_engine::JobState::Done, "Proxy") => {
+                    let hint = if self.view.proxies { "" } else { " — turn on Use Proxies to play it" };
+                    ui.toast(Toast::success(format!("Proxy of {} ready{hint}", j.title)));
+                }
+                (ve_engine::JobState::Done, _) => {
+                    ui.toast(Toast::success(format!("Exported {}", j.title)));
+                }
+                (ve_engine::JobState::Cancelled, _) => {
+                    ui.toast(Toast::info(format!("{} cancelled: {}", j.kind, j.title)));
+                }
+                (ve_engine::JobState::Failed(e), _) => {
+                    ui.toast(Toast::error(format!("{} failed: {}: {e}", j.kind, j.title)));
+                }
+                _ => {}
+            }
         }
-        self.proxies_job = None;
     }
 
     /// Export to `path` with the chosen preset (after the host's save dialog).
     pub fn start_export(&mut self, path: &std::path::Path) {
-        let Some(gpu) = self.gpu.clone() else {
-            self.errors.push("Export needs the GPU, which is not ready yet.".into());
-            return;
-        };
         let preset = ve_engine::ExportPreset::ALL[self.export_preset.min(2)];
         let mut p = path.to_path_buf();
         if p.extension().is_none() {
             p.set_extension(preset.extension());
         }
-        self.export = Some(self.engine.export(gpu, preset, MediaRef(format!("file:{}", p.display())), self.importer.clone()));
+        self.engine.queue_export(preset, MediaRef(format!("file:{}", p.display())));
+        self.notes.push(format!("Export of {} queued — see the Jobs panel", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
     }
 
     /// The export dialog, and the end of a finished export.
     fn export_ui(&mut self, ui: &mut Ui) {
-        if let Some(job) = &self.export {
-            if let Some(r) = job.result() {
-                match r {
-                    Ok(()) => {
-                        ui.toast(Toast::success(format!("Exported {}", job.name)));
-                    }
-                    Err(e) if e == "cancelled" => {
-                        ui.toast(Toast::info("Export cancelled"));
-                    }
-                    Err(e) => {
-                        ui.toast(Toast::error(format!("Export failed: {e}")));
-                    }
-                }
-                self.export = None;
-            }
-        }
         if !self.show_export {
             return;
         }
@@ -1038,6 +1029,9 @@ impl EditorUi {
             for msg in self.errors.drain(..) {
                 ui.toast(Toast::error(msg));
             }
+            for msg in self.notes.drain(..) {
+                ui.toast(Toast::info(msg));
+            }
             self.default_targets();
             self.update_meters(ui.input().dt.min(0.1));
         }
@@ -1075,7 +1069,7 @@ impl EditorUi {
         }
         if surface == SurfaceId::MAIN {
             self.export_ui(ui);
-            self.proxies_ui(ui);
+            self.jobs_ui(ui);
             self.dialogs(ui);
         }
         // Keys go to the focused window, so every window takes shortcuts
@@ -1121,13 +1115,13 @@ impl EditorUi {
             || self.source_catching_up
             || self.meter_db.iter().any(|d| *d > -95.0)
             || self.track_db.values().flatten().any(|d| *d > -95.0)
-            || self.export.as_ref().is_some_and(|e| e.result().is_none())
-            || self.proxies_job.as_ref().is_some_and(|j| j.result().is_none())
             || !self.thumb_uploads.is_empty())
         .then_some(STEADY);
+        // Jobs running: a progress bar's worth of looks, four a second.
+        let jobs = self.engine.jobs().active().then_some(0.25);
         // While playing, everything else (meters, late frames) rides along
         // with the picture's frames rather than adding its own.
-        playing.or(steady)
+        playing.or(steady).or(jobs)
     }
 
     /// Tell the editor whether the OS is in dark mode (for Theme: System).

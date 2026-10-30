@@ -396,7 +396,19 @@ fn rubber_band_keyframes_on_clips() {
     // Down by a few pixels: a lower constant level, one undo step.
     click(&mut ui, &mut app, Vec2::new(x, y), Some(Vec2::new(x, y + 8.0)));
     wait(&app.engine, |a| matches!(op(a), Param::Constant(Value::Float(v)) if v < 100.0));
-    let Param::Constant(Value::Float(lowered)) = opacity(&app) else { panic!() };
+    // The drag's steps reach the engine one by one: read the level once it
+    // has settled, not at the first step below 100 (a slow machine).
+    let mut lowered = f64::NAN;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let Param::Constant(Value::Float(v)) = opacity(&app) else { panic!() };
+        if v == lowered {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the level never settled");
+        lowered = v;
+        std::thread::sleep(Duration::from_millis(100));
+    }
     // Pen: a click on the line adds a key there.
     app.view.tool = ve_ui::Tool::Pen;
     let line_y = y + 8.0;
@@ -442,6 +454,28 @@ fn voice_over_recording_shows_and_stops() {
     app.perform(&ve_ui::Action::RecordVoiceOver);
     assert!(!app.engine.is_recording());
     assert!(!app.engine.is_playing(), "the take's playback stopped with it");
+}
+
+/// The Jobs panel: queued exports and proxies (no GPU here, so they wait),
+/// one paused, one cancelled; the tab's title counts what is left to do.
+#[test]
+fn jobs_panel_lists_the_queue() {
+    let mut app = editor();
+    let out = |n: &str| MediaRef(format!("file:/tmp/{n}"));
+    let a = app.engine.queue_export(ve_engine::ExportPreset::H264Mp4, out("Hiking.mp4"));
+    let b = app.engine.queue_export(ve_engine::ExportPreset::ProResMov, out("Hiking master.mov"));
+    let c = app.engine.queue_export(ve_engine::ExportPreset::HevcMp4, out("Hiking HEVC.mp4"));
+    app.engine.jobs().pause(b, true);
+    app.engine.jobs().cancel(c);
+    let states: Vec<_> = app.engine.jobs().list().into_iter().map(|j| (j.title, j.state)).collect();
+    assert_eq!(states[0], ("Hiking.mp4".to_string(), ve_engine::JobState::Queued), "{states:?}");
+    assert_eq!(states[1].1, ve_engine::JobState::Paused);
+    assert_eq!(states[2].1, ve_engine::JobState::Cancelled);
+    let _ = a;
+    render(&mut app, 2000, 1129, "panel-jobs.png", |app| {
+        let at = app.dock().find_tab(|t| *t == ve_ui::Tab::Jobs).expect("Jobs is in the layout");
+        app.dock_mut().focus_tab(at);
+    });
 }
 
 /// The title bar as the editor draws it: the window buttons it draws

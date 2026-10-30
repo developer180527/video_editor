@@ -223,8 +223,10 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
                 if let Some(j) = st.queue.pop_front() {
                     break j;
                 }
-                // Wait with a timeout so a dropped pool ends the thread.
-                st = stills.wake.wait_timeout(st, std::time::Duration::from_millis(500)).unwrap().0;
+                // Wait with a (long) timeout so a dropped pool ends the
+                // thread eventually; idle, it wakes once a minute, not twice
+                // a second.
+                st = stills.wake.wait_timeout(st, std::time::Duration::from_secs(60)).unwrap().0;
                 if std::sync::Arc::strong_count(&stills) == 1 {
                     return;
                 }

@@ -96,6 +96,8 @@ struct Shared {
     generation: AtomicU64,
     playing: AtomicBool,
     quit: AtomicBool,
+    /// Wakes the mixer thread, which sleeps (no timer) while nothing plays.
+    wake: std::sync::Condvar,
 }
 
 pub struct Playback {
@@ -114,7 +116,7 @@ impl Playback {
         let rate = mixer.rate();
         // Half a second of stereo, tagged with its generation every block.
         let (prod, cons) = RingBuffer::<(u64, [f32; 2])>::new(rate as usize / 2);
-        let shared = Arc::new(Shared { job: Mutex::new(None), generation: AtomicU64::new(0), playing: AtomicBool::new(false), quit: AtomicBool::new(false) });
+        let shared = Arc::new(Shared { job: Mutex::new(None), generation: AtomicU64::new(0), playing: AtomicBool::new(false), quit: AtomicBool::new(false), wake: std::sync::Condvar::new() });
         let meters = Arc::new(Meters::default());
         let clock = Arc::new(AudioClock::new());
         let overrides = mixer.overrides();
@@ -149,18 +151,21 @@ impl Playback {
         // `playing` first: the mixer drops a job it finds while not playing.
         self.shared.playing.store(true, Ordering::SeqCst);
         *self.shared.job.lock().unwrap() = Some((project, seq, at, g));
+        self.shared.wake.notify_all();
     }
 
     pub fn stop(&self) {
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
         self.shared.playing.store(false, Ordering::SeqCst);
         *self.shared.job.lock().unwrap() = None;
+        self.shared.wake.notify_all();
     }
 }
 
 impl Drop for Playback {
     fn drop(&mut self) {
         self.shared.quit.store(true, Ordering::SeqCst);
+        self.shared.wake.notify_all();
     }
 }
 
@@ -188,7 +193,9 @@ fn mix_thread(mut mixer: Mixer, mut prod: Producer<(u64, [f32; 2])>, s: Arc<Shar
             current = None;
         }
         let Some((project, seq_id, at, g)) = current.as_mut() else {
-            std::thread::sleep(Duration::from_millis(5));
+            // Nothing to play: sleep until there is (race to idle — no timer).
+            let job = s.job.lock().unwrap();
+            let _job = s.wake.wait_while(job, |j| j.is_none() && !s.quit.load(Ordering::Relaxed)).unwrap();
             continue;
         };
         if prod.slots() < BLOCK || capacity - prod.slots() > ahead {

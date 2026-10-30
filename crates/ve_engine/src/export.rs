@@ -63,6 +63,12 @@ pub struct ExportState {
     pub total: u64,
     done: AtomicU64,
     cancel: AtomicBool,
+    /// Paused by the user, or held while the editor plays (the job system):
+    /// the export waits between frames, using nothing.
+    paused: AtomicBool,
+    held: AtomicBool,
+    gate: Mutex<()>,
+    wake: std::sync::Condvar,
     result: Mutex<Option<Result<(), String>>>,
 }
 
@@ -73,6 +79,39 @@ impl ExportState {
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+
+    pub fn set_paused(&self, on: bool) {
+        self.paused.store(on, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+
+    /// Hold the export while the editor plays back (resumes when it stops).
+    pub fn set_held(&self, on: bool) {
+        self.held.store(on, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed) || self.held.load(Ordering::Relaxed)
+    }
+
+    /// Between frames: sleep (no timer) while paused or held.
+    fn gate(&self) {
+        let g = self.gate.lock().unwrap();
+        let _g = self.wake.wait_while(g, |_| self.is_paused() && !self.cancel.load(Ordering::Relaxed)).unwrap();
+    }
+
+    /// Block until the export has finished (or failed, or was cancelled).
+    pub fn wait(&self) -> Result<(), String> {
+        let mut g = self.gate.lock().unwrap();
+        loop {
+            if let Some(r) = self.result() {
+                return r;
+            }
+            g = self.wake.wait(g).unwrap();
+        }
     }
 
     /// `Some` once finished (or failed, or cancelled).
@@ -109,6 +148,10 @@ pub fn start(
         total,
         done: AtomicU64::new(0),
         cancel: AtomicBool::new(false),
+        paused: AtomicBool::new(false),
+        held: AtomicBool::new(false),
+        gate: Mutex::new(()),
+        wake: std::sync::Condvar::new(),
         result: Mutex::new(None),
     });
     let st = state.clone();
@@ -136,6 +179,8 @@ pub fn start(
             }
             let r = if st.cancel.load(Ordering::Relaxed) { Err("cancelled".into()) } else { r };
             *st.result.lock().unwrap() = Some(r);
+            let _g = st.gate.lock().unwrap();
+            st.wake.notify_all();
         })
         .expect("export thread");
     state
@@ -211,6 +256,7 @@ fn run(
     };
     let mut pending: Option<(ve_render::Readback, Time)> = None;
     for i in 0..state.total {
+        state.gate();
         if state.cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }

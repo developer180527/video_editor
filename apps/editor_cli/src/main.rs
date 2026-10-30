@@ -188,21 +188,17 @@ fn proxy(args: &[String]) -> i32 {
     let durations: f64 = assets.iter().filter_map(|a| e.snapshot().assets.get(a).and_then(|a| a.info.as_ref()).map(|i| i.duration.as_seconds_f64())).sum();
     let client = e.spawn(Arc::new(|| {}));
     let t = std::time::Instant::now();
-    let job = client.create_proxies(gpu, assets, height, gpu_import::importer());
-    let results = loop {
-        if let Some(r) = job.result() {
-            break r;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    };
+    client.enable_jobs(gpu, gpu_import::importer());
+    client.queue_proxies(assets, height);
+    client.jobs().wait_idle();
     let secs = t.elapsed().as_secs_f64();
     let mut failed = false;
-    for (name, r) in job.names.iter().zip(&results) {
-        match r {
-            Ok(p) => println!("{name} -> {p}"),
-            Err(err) => {
+    for j in client.jobs().list() {
+        match &j.state {
+            ve_engine::JobState::Done => println!("{} -> {}", j.title, j.detail),
+            s => {
                 failed = true;
-                println!("{name}: {err}");
+                println!("{}: {:?}", j.title, s);
             }
         }
     }

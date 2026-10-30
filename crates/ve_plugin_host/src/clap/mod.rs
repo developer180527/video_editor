@@ -25,7 +25,6 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::ThreadId;
-use std::time::Duration;
 
 use sys::*;
 use ve_model::{PluginApi, PluginRef};
@@ -39,10 +38,14 @@ pub fn discover(libs: &dyn NativeLibraries) -> Vec<String> {
 
 /// The most frames handed to a plugin at once (longer blocks are split).
 const MAX_FRAMES: u32 = 4096;
-/// How often the main thread looks for `request_callback`s.
-const CALLBACK_POLL: Duration = Duration::from_millis(30);
-
 type Job = Box<dyn FnOnce() + Send>;
+
+/// The main thread as a plugin's host context sees it: which thread it is,
+/// and how to wake it.
+struct MainRef {
+    id: ThreadId,
+    kick: mpsc::Sender<Job>,
+}
 
 /// CLAP's main thread: runs jobs, and `on_main_thread` for instances that
 /// asked.
@@ -63,12 +66,11 @@ impl MainThread {
             .name("ve-clap".into())
             .spawn(move || {
                 let _ = id_tx.send(std::thread::current().id());
-                loop {
-                    match rx.recv_timeout(CALLBACK_POLL) {
-                        Ok(job) => job(),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
+                // Sleeps until there is work: a job, or a plugin's
+                // `request_callback` (which posts an empty job to wake it).
+                // No polling timer: idle means idle.
+                while let Ok(job) = rx.recv() {
+                    job();
                     let asked: Vec<Arc<HostCtx>> = polled.lock().unwrap().iter().filter(|c| c.wants_callback.swap(false, Ordering::SeqCst)).cloned().collect();
                     for ctx in asked {
                         let p = ctx.plugin.load(Ordering::SeqCst);
@@ -81,6 +83,11 @@ impl MainThread {
             .expect("CLAP main thread");
         let id = id_rx.recv().expect("CLAP main thread started");
         Arc::new(MainThread { tx: Mutex::new(tx), id, callbacks })
+    }
+
+    /// What a plugin's host context needs of the main thread.
+    fn handle(&self) -> MainRef {
+        MainRef { id: self.id, kick: self.tx.lock().unwrap().clone() }
     }
 
     /// Run `f` on the main thread and wait for its result.
@@ -110,6 +117,8 @@ struct HostCtx {
     wants_callback: AtomicBool,
     plugin: AtomicPtr<clap_plugin>,
     name: String,
+    /// Wakes the main thread (an empty job) when the plugin asks for a callback.
+    kick: Mutex<mpsc::Sender<Job>>,
 }
 
 // The raw pointers in `clap_host` are to static strings and to this context.
@@ -168,11 +177,13 @@ unsafe extern "C" fn host_extension(_: *const clap_host, id: *const c_char) -> *
 unsafe extern "C" fn request_restart(_: *const clap_host) {}
 unsafe extern "C" fn request_process(_: *const clap_host) {}
 unsafe extern "C" fn request_callback(host: *const clap_host) {
-    unsafe { ctx(host) }.wants_callback.store(true, Ordering::SeqCst);
+    let c = unsafe { ctx(host) };
+    c.wants_callback.store(true, Ordering::SeqCst);
+    let _ = c.kick.lock().unwrap().send(Box::new(|| {}));
 }
 
 impl HostCtx {
-    fn new(main: ThreadId, name: &str) -> Arc<HostCtx> {
+    fn new(main: &MainRef, name: &str) -> Arc<HostCtx> {
         let ctx = Arc::new(HostCtx {
             host: clap_host {
                 clap_version: CLAP_VERSION,
@@ -186,7 +197,8 @@ impl HostCtx {
                 request_process,
                 request_callback,
             },
-            main,
+            main: main.id,
+            kick: Mutex::new(main.kick.clone()),
             wants_callback: AtomicBool::new(false),
             plugin: AtomicPtr::new(std::ptr::null_mut()),
             name: name.into(),
@@ -290,7 +302,7 @@ unsafe impl Send for Created {}
 
 impl Created {
     /// Create and `init` plugin `id` from `bundle`. Main thread.
-    fn new(main: ThreadId, bundle: &Bundle, id: &CStr, name: &str) -> Result<Created, String> {
+    fn new(main: &MainRef, bundle: &Bundle, id: &CStr, name: &str) -> Result<Created, String> {
         let ctx = HostCtx::new(main, name);
         let plugin = unsafe { ((*bundle.factory).create_plugin)(bundle.factory, &ctx.host, id.as_ptr()) };
         if plugin.is_null() {
@@ -397,7 +409,7 @@ impl ClapHost {
                     continue;
                 }
             };
-            let main_id = main.id;
+            let main_id = main.handle();
             let b = bundle.clone();
             // Descriptors, and each effect's ports and parameters, on the main thread.
             let found: Vec<Result<Scanned, String>> = main.run(move || {
@@ -422,7 +434,7 @@ impl ClapHost {
                         }
                         let (id, name, vendor) = (cstr(d.id), cstr(d.name), cstr(d.vendor));
                         let cid = CString::new(id.clone()).ok()?;
-                        Some(Created::new(main_id, &b, &cid, &name).and_then(|c| {
+                        Some(Created::new(&main_id, &b, &cid, &name).and_then(|c| {
                             let (inputs, _) = c.main_channels();
                             let (infos, maps) = c.params();
                             c.destroy();
@@ -466,9 +478,9 @@ impl ClapHost {
 impl AudioPlugins for ClapHost {
     fn instantiate(&self, plugin: &PluginRef, sample_rate: u32) -> Result<Box<dyn AudioProcessor>, String> {
         let k = self.known.get(&plugin.id).filter(|_| plugin.api == PluginApi::Clap).ok_or_else(|| format!("{}: not installed", plugin.id))?;
-        let (bundle, id, name, main_id) = (k.bundle.clone(), k.id.clone(), k.name.clone(), self.main.id);
+        let (bundle, id, name, main_id) = (k.bundle.clone(), k.id.clone(), k.name.clone(), self.main.handle());
         let created = self.main.run(move || -> Result<(Created, u32, u32), String> {
-            let c = Created::new(main_id, &bundle, &id, &name)?;
+            let c = Created::new(&main_id, &bundle, &id, &name)?;
             let (inputs, outputs) = c.main_channels();
             if !unsafe { ((*c.plugin).activate)(c.plugin, sample_rate as f64, 1, MAX_FRAMES) } {
                 c.destroy();

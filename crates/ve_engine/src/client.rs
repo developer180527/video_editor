@@ -85,6 +85,7 @@ pub struct EngineClient {
     events: mpsc::Receiver<Event>,
     watch: Mutex<Watchdog>,
     recording: Mutex<Option<crate::record::Recording>>,
+    jobs: crate::Jobs,
 }
 
 /// A voice-over in progress, as the UI shows it.
@@ -262,7 +263,7 @@ impl Engine {
                 }
             })
             .expect("engine thread");
-        EngineClient { platform, video, stills, tx, shared, events, watch: Mutex::new(Watchdog::default()), recording: Mutex::new(None) }
+        EngineClient { platform, video, stills, tx, shared, events, watch: Mutex::new(Watchdog::default()), recording: Mutex::new(None), jobs: crate::Jobs::default() }
     }
 }
 
@@ -553,21 +554,40 @@ impl EngineClient {
         crate::export::start(p.snapshot, self.platform.clone(), p.plugins, gpu, preset, out, importer)
     }
 
-    /// Make proxies of `assets`, `height` pixels tall, in the background;
-    /// each is attached to its asset as it finishes.
-    pub fn create_proxies(
-        &self,
-        gpu: (wgpu::Device, wgpu::Queue),
-        assets: Vec<ve_model::AssetId>,
-        height: u32,
-        importer: Option<Arc<dyn ve_render::TextureImporter>>,
-    ) -> Arc<crate::ProxyJob> {
-        let p = self.published();
+    /// The job queue (exports, proxies).
+    pub fn jobs(&self) -> &crate::Jobs {
+        &self.jobs
+    }
+
+    /// Let queued jobs run: the GPU they render on, and how hardware
+    /// frames are imported. Jobs queued earlier start now.
+    pub fn enable_jobs(&self, gpu: (wgpu::Device, wgpu::Queue), importer: Option<Arc<dyn ve_render::TextureImporter>>) {
         let tx = Mutex::new(self.tx.clone());
         let attach = move |asset, path| {
             let _ = tx.lock().unwrap().send(Request::AttachProxy(asset, path));
         };
-        crate::proxy::start(p.snapshot, self.platform.clone(), p.plugins, gpu, assets, height, importer, attach)
+        self.jobs.set_context(crate::JobContext { platform: self.platform.clone(), registry: self.published().plugins, gpu, importer, attach: Arc::new(attach) });
+    }
+
+    /// Queue an export of the active sequence as it is now.
+    pub fn queue_export(&self, preset: crate::ExportPreset, out: MediaRef) -> crate::JobId {
+        let p = self.published();
+        let name = self.platform.storage.display_name(&out);
+        let seq = p.snapshot.active().map(|s| s.name.clone()).unwrap_or_default();
+        self.jobs.add(name, format!("{seq} · {}", preset.label()), crate::JobKind::Export { project: p.snapshot, preset, out })
+    }
+
+    /// Queue a proxy of each of `assets` (those with a picture), `height` tall.
+    pub fn queue_proxies(&self, assets: Vec<ve_model::AssetId>, height: u32) -> Vec<crate::JobId> {
+        let snap = self.published().snapshot;
+        assets
+            .into_iter()
+            .filter_map(|id| {
+                let a = snap.assets.get(&id)?;
+                a.info.as_ref()?.video.as_ref()?;
+                Some(self.jobs.add(a.name.clone(), format!("{height}p proxy"), crate::JobKind::Proxy { project: snap.clone(), asset: id, height }))
+            })
+            .collect()
     }
 
     pub fn drain_events(&self) -> Vec<Event> {

@@ -334,17 +334,15 @@ fn create_proxies_makes_and_attaches_a_small_copy() {
     e.new_project("t");
     let asset = e.import(src.to_str().unwrap()).unwrap();
     let client = e.spawn(Arc::new(|| {}));
-    let job = client.create_proxies(gpu, vec![asset], 540, None);
-    assert_eq!(job.names, vec!["proxy_src.mov".to_string()]);
+    client.enable_jobs(gpu, None);
+    let ids = client.queue_proxies(vec![asset], 540);
+    assert_eq!(ids.len(), 1);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let results = loop {
-        if let Some(r) = job.result() {
-            break r;
-        }
-        assert!(std::time::Instant::now() < deadline, "proxies hung at {:.0}%", job.progress().2 * 100.0);
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let path = results[0].clone().expect("proxy made");
+    client.jobs().wait_idle();
+    let job = client.jobs().list().into_iter().find(|j| j.id == ids[0]).unwrap();
+    assert_eq!((job.kind, job.title.as_str()), ("Proxy", "proxy_src.mov"));
+    assert_eq!(job.state, JobState::Done, "{:?}", job.state);
+    let path = job.detail.clone();
     assert!(path.ends_with("Proxies/proxy_src Proxy.mp4"), "{path}");
     // Attached, once the engine has probed it.
     let proxy = loop {
@@ -363,4 +361,58 @@ fn create_proxies_makes_and_attaches_a_small_copy() {
     assert_eq!(v.rate, ve_time::Rate::FPS_25);
     let secs = info.duration.as_seconds_f64();
     assert!((secs - 2.0).abs() < 0.1, "as long as the original: {secs}");
+}
+
+/// The job queue with real exports: one at a time in order; held while the
+/// editor plays and carried on after; a cancelled one leaves no file; and
+/// when the queue is empty its thread is gone (race to idle).
+#[test]
+fn the_job_queue_runs_holds_and_cancels_exports() {
+    let Some(src) = clip() else { return eprintln!("skipped: no ffmpeg CLI") };
+    if std::env::var_os("VE_NO_GPU").is_some() {
+        return eprintln!("skipped: VE_NO_GPU");
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })) else { return eprintln!("skipped: no GPU") };
+    let gpu = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("jobs");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut e = Engine::new(platform_headless::platform(&dir, Arc::new(media_ffmpeg::Ffmpeg::new())));
+    e.new_project("t");
+    let asset = e.import(src.to_str().unwrap()).unwrap();
+    let snap = e.snapshot();
+    let seq = snap.active().unwrap().clone();
+    let a = snap.assets[&asset].clone();
+    let c = make_clip(e.plugins(), &seq.format, &a, TrackKind::Video, Time::from_seconds(2), None);
+    e.execute(edit::overwrite(&snap, seq.id, Time::ZERO, &[(seq.tracks[0].id, Arc::new(c))]).unwrap()).unwrap();
+    let client = e.spawn(Arc::new(|| {}));
+    let out = |n: &str| MediaRef(format!("file:{}", dir.join(n).display()));
+    // Queued before the GPU is ready: they wait.
+    let first = client.queue_export(ExportPreset::ProResMov, out("first.mov"));
+    let second = client.queue_export(ExportPreset::ProResMov, out("second.mov"));
+    let third = client.queue_export(ExportPreset::ProResMov, out("third.mov"));
+    let state = |id| client.jobs().list().into_iter().find(|j| j.id == id).unwrap().state;
+    assert_eq!(state(first), JobState::Queued);
+    // The editor is playing when the GPU arrives: the first starts, held.
+    client.jobs().set_playing(true);
+    client.jobs().cancel(third);
+    client.enable_jobs(gpu, None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while state(first) != JobState::Held {
+        assert!(std::time::Instant::now() < deadline, "the first export never started: {:?}", state(first));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(state(first), JobState::Held, "held while playing");
+    assert_eq!(state(second), JobState::Queued, "one at a time");
+    client.jobs().set_playing(false);
+    client.jobs().wait_idle();
+    assert_eq!((state(first), state(second), state(third)), (JobState::Done, JobState::Done, JobState::Cancelled));
+    assert!(dir.join("first.mov").exists() && dir.join("second.mov").exists());
+    assert!(!dir.join("third.mov").exists(), "a job cancelled before it ran made nothing");
+    // Nothing left: the runner thread has ended.
+    assert!(!client.jobs().active());
+    client.jobs().clear_finished();
+    assert!(client.jobs().list().is_empty());
 }

@@ -23,10 +23,12 @@ pub enum Tab {
     TrackMixer,
     Color,
     Graphics,
+    /// Exports and proxies: running, queued, done.
+    Jobs,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 15] = [
+    pub const ALL: [Tab; 16] = [
         Tab::Source,
         Tab::EffectControls,
         Tab::AudioClipMixer,
@@ -42,6 +44,7 @@ impl Tab {
         Tab::TrackMixer,
         Tab::Color,
         Tab::Graphics,
+        Tab::Jobs,
     ];
 
     /// Identity in a saved layout: a name, never a position.
@@ -62,6 +65,7 @@ impl Tab {
             Tab::TrackMixer => "track-mixer",
             Tab::Color => "color",
             Tab::Graphics => "essential-graphics",
+            Tab::Jobs => "jobs",
         })
         .0
     }
@@ -84,6 +88,7 @@ impl Tab {
             Tab::TrackMixer => "Audio Track Mixer",
             Tab::Color => "Lumetri Color",
             Tab::Graphics => "Essential Graphics",
+            Tab::Jobs => "Jobs",
         }
     }
 
@@ -100,7 +105,7 @@ pub(crate) fn initial(touch: bool) -> DockState<Tab> {
     }
     let top_right = dock.leaf(vec![Tab::Program]);
     let top = dock.split(Axis::X, if touch { 0.42 } else { 0.505 }, top_left, top_right);
-    let bin = dock.leaf(vec![Tab::Project, Tab::Effects, Tab::MediaBrowser, Tab::Info]);
+    let bin = dock.leaf(vec![Tab::Project, Tab::Effects, Tab::MediaBrowser, Tab::Info, Tab::Jobs]);
     let seq = dock.leaf(vec![Tab::Timeline]);
     let bottom = dock.split(Axis::X, 0.325, bin, seq);
     let root = dock.split(Axis::Y, if touch { 0.5 } else { 0.615 }, top, bottom);
@@ -142,6 +147,7 @@ impl TabViewer for Viewer<'_> {
             Tab::TrackMixer => format!("Audio Track Mixer: {seq}"),
             Tab::Color => "Lumetri Color".into(),
             Tab::Graphics => "Essential Graphics".into(),
+            Tab::Jobs => crate::jobs_panel::title(self.app),
         }
     }
 
@@ -174,6 +180,7 @@ impl TabViewer for Viewer<'_> {
             Tab::TrackMixer => crate::mixer_panel::panel(ui, self.app),
             Tab::Color => crate::color_panel::panel(ui, self.app),
             Tab::Graphics => crate::graphics::panel(ui, self.app),
+            Tab::Jobs => crate::jobs_panel::panel(ui, self.app),
             other => placeholder(ui, &self.title(other)),
         }
     }
@@ -242,6 +249,16 @@ pub(crate) fn toggle_tab(dock: &mut DockState<Tab>, tab: Tab) {
                 dock.focus_tab(at);
             }
         }
+    }
+}
+
+/// Bring `tab` to the front, opening it in the main window if it is closed.
+pub(crate) fn show_tab(dock: &mut DockState<Tab>, tab: Tab) {
+    if dock.find_tab(|t| *t == tab).is_none() {
+        dock.add_tab(SurfaceId::MAIN, tab);
+    }
+    if let Some(at) = dock.find_tab(|t| *t == tab) {
+        dock.focus_tab(at);
     }
 }
 

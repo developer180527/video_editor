@@ -138,7 +138,7 @@ impl EditorUi {
             .on("Save As…", Action::SaveAs, Some(Chord::primary(Key::S).shift()))
             .sep()
             // The selected bin item's media (also on its context menu).
-            .item("Create Proxies", Action::CreateProxies, None, self.proxies_job.is_none())
+            .on("Create Proxies", Action::CreateProxies, None)
             .item("Attach Proxy…", Action::AttachProxy, None, asset.is_some())
             .item("Remove Proxy", Action::RemoveProxy, None, has_proxy)
             .item("Link Media…", Action::LinkMedia, None, asset.is_some())

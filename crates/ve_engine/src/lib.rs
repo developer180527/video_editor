@@ -18,6 +18,7 @@ mod clips;
 pub mod export;
 pub mod frame;
 mod project_file;
+mod jobs;
 mod proxy;
 mod record;
 mod viewer;
@@ -39,7 +40,8 @@ pub use ve_render::{FramePlan, Quality, TextureImporter};
 pub use frame::Frame;
 pub use viewer::{SourceView, Viewer};
 pub use export::{ExportPreset, ExportState};
-pub use proxy::{proxy_size, ProxyJob};
+pub use jobs::{JobContext, JobId, JobInfo, JobKind, JobState, Jobs};
+pub use proxy::proxy_size;
 pub use ve_media::{Levels, Loudness, Meters, Stills, Thumb, PEAKS_PER_SECOND};
 
 use std::sync::Arc;
@@ -512,8 +514,9 @@ impl Engine {
         }
         let (playback, callback) = ve_media::Playback::new(mixer, cfg.channels);
         match self.platform.audio.open(cfg, callback) {
-            Ok(mut s) => {
-                let _ = s.play();
+            Ok(s) => {
+                // Opened now (so playback starts promptly) but paused: it
+                // runs only while something plays (`restart_audio`).
                 self.transport.set_sample_rate(s.config().sample_rate);
                 self.parked.set_sample_rate(s.config().sample_rate);
                 self.audio = Some(s);
@@ -535,8 +538,18 @@ impl Engine {
         match (self.transport.state(), target) {
             (State::Playing { rate }, Some((project, seq))) if (rate - 1.0).abs() < 1e-9 => {
                 pb.play(project, seq, self.playhead());
+                if let Some(a) = &mut self.audio {
+                    let _ = a.play();
+                }
             }
-            _ => pb.stop(),
+            _ => {
+                pb.stop();
+                // Race to idle: a stopped transport lets the sound card sleep
+                // too (it otherwise asks for silence ~100 times a second).
+                if let Some(a) = &mut self.audio {
+                    let _ = a.pause();
+                }
+            }
         }
     }
 

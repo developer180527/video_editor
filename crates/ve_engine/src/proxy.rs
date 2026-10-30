@@ -1,6 +1,5 @@
 //! Create Proxies: a small H.264 copy of each chosen clip's picture, made
-//! one after another in the background and attached to its asset as it
-//! finishes (the "Use Proxies" switch then plays it in place of the
+//! as a job (see `jobs`) and attached to its asset when it (the "Use Proxies" switch then plays it in place of the
 //! original; export always uses the original).
 //!
 //! Each proxy is an export of a one-clip sequence sized to the proxy and
@@ -8,54 +7,13 @@
 //! hardware decoding and encoding, upright rotation, square pixels, exact
 //! frames, progress and cancelling. Files go to Documents/Proxies.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use ve_model::*;
 use ve_plugin_host::Registry;
 use ve_ports::{Location, Platform};
 use ve_time::{Rate, Time, TimeRange};
 
-use crate::export::{ExportPreset, ExportState};
-
-/// A running Create Proxies, shared with whoever shows its progress.
-pub struct ProxyJob {
-    /// The assets, by name, in the order they are made.
-    pub names: Vec<String>,
-    current: AtomicUsize,
-    export: Mutex<Option<Arc<ExportState>>>,
-    cancel: AtomicBool,
-    /// Per asset: the proxy's path, or why it failed.
-    results: Mutex<Vec<Result<String, String>>>,
-    finished: AtomicBool,
-}
-
-impl ProxyJob {
-    /// (which one is being made, how many, overall fraction done).
-    pub fn progress(&self) -> (usize, usize, f32) {
-        let n = self.names.len().max(1);
-        let i = self.current.load(Ordering::Relaxed).min(n - 1);
-        let within = self.export.lock().unwrap().as_ref().map_or(0.0, |e| e.progress());
-        (i, self.names.len(), (i as f32 + within) / n as f32)
-    }
-
-    pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if let Some(e) = self.export.lock().unwrap().as_ref() {
-            e.cancel();
-        }
-    }
-
-    pub fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
-    }
-
-    /// `Some` when all are done (or it was cancelled): each one's outcome.
-    pub fn result(&self) -> Option<Vec<Result<String, String>>> {
-        self.finished.load(Ordering::SeqCst).then(|| self.results.lock().unwrap().clone())
-    }
-}
 
 /// The nearest common rate when `r` is within 0.1% of one (a 23.976 file
 /// that stores 879609375/36687041), else `r`.
@@ -113,60 +71,13 @@ fn target(platform: &Platform, asset: &Asset) -> Option<(MediaRef, String)> {
     })
 }
 
-/// Make proxies of `assets` (those with a picture) `height` pixels tall,
-/// one after another; `attach` is called with each finished one.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn start(
-    project: Snapshot,
-    platform: Platform,
-    registry: Arc<Registry>,
-    gpu: (wgpu::Device, wgpu::Queue),
-    assets: Vec<AssetId>,
-    height: u32,
-    importer: Option<Arc<dyn ve_render::TextureImporter>>,
-    attach: impl Fn(AssetId, String) + Send + 'static,
-) -> Arc<ProxyJob> {
-    let chosen: Vec<Arc<Asset>> = assets.iter().filter_map(|id| project.assets.get(id).cloned()).filter(|a| a.info.as_ref().is_some_and(|i| i.video.is_some())).collect();
-    let job = Arc::new(ProxyJob {
-        names: chosen.iter().map(|a| a.name.clone()).collect(),
-        current: AtomicUsize::new(0),
-        export: Mutex::new(None),
-        cancel: AtomicBool::new(false),
-        results: Mutex::new(Vec::new()),
-        finished: AtomicBool::new(false),
-    });
-    let j = job.clone();
-    std::thread::Builder::new()
-        .name("ve-proxies".into())
-        .spawn(move || {
-            for (i, asset) in chosen.iter().enumerate() {
-                if j.cancelled() {
-                    break;
-                }
-                j.current.store(i, Ordering::Relaxed);
-                let r = (|| {
-                    let p = one_clip(&project, &registry, asset, height).ok_or("no picture to make a proxy of")?;
-                    let (out, path) = target(&platform, asset).ok_or("no place to write the proxy")?;
-                    let e = crate::export::start(Arc::new(p), platform.clone(), registry.clone(), gpu.clone(), ExportPreset::Proxy, out, importer.clone());
-                    *j.export.lock().unwrap() = Some(e.clone());
-                    let r = loop {
-                        if let Some(r) = e.result() {
-                            break r;
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
-                    };
-                    r.map(|()| path)
-                })();
-                if let Ok(path) = &r {
-                    attach(asset.id, path.clone());
-                }
-                j.results.lock().unwrap().push(r);
-            }
-            *j.export.lock().unwrap() = None;
-            j.finished.store(true, Ordering::SeqCst);
-        })
-        .expect("proxy thread");
-    job
+/// What making `asset`'s proxy exports: a one-clip project, where to write
+/// it, and that file's path (to attach when done).
+pub(crate) fn prepare(project: &Project, registry: &Registry, platform: &Platform, asset: AssetId, height: u32) -> Result<(Project, MediaRef, String), String> {
+    let a = project.assets.get(&asset).ok_or("the clip is no longer in the project")?;
+    let p = one_clip(project, registry, a, height).ok_or("no picture to make a proxy of")?;
+    let (out, path) = target(platform, a).ok_or("no place to write the proxy")?;
+    Ok((p, out, path))
 }
 
 #[cfg(test)]

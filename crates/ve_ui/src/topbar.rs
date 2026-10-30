@@ -40,23 +40,18 @@ pub fn bar(ui: &mut Ui, app: &mut EditorUi) {
         if let Some(busy) = &app.st.busy {
             ui.text_with(busy, 11.0, ui.theme.palette.text_muted);
         }
-        if let Some(job) = app.export.clone() {
-            ui.text_with(&format!("Exporting {} — {:.0}%", job.name, job.progress() * 100.0), 11.0, ui.theme.palette.text_muted);
+        // The running job (and how many wait), with a way to the Jobs panel.
+        let jobs = app.engine.jobs().list();
+        let waiting = jobs.iter().filter(|j| matches!(j.state, ve_engine::JobState::Queued | ve_engine::JobState::Paused)).count();
+        if let Some(j) = jobs.iter().find(|j| matches!(j.state, ve_engine::JobState::Running | ve_engine::JobState::Held)) {
+            let more = if waiting > 0 { format!(" (+{waiting} queued)") } else { String::new() };
+            let verb = if j.state == ve_engine::JobState::Held { "Waiting" } else if j.kind == "Proxy" { "Proxy" } else { "Exporting" };
+            ui.text_with(&format!("{verb} {} — {:.0}%{more}", j.title, j.progress * 100.0), 11.0, ui.theme.palette.text_muted);
             ui.container(Layout::row().width(Size::Fixed(120.0)).height(Size::Fixed(20.0)).align(Align::Start, Align::Center), Frame::none(), |ui| {
-                ui.progress("export", Some(job.progress()));
+                ui.progress("", Some(j.progress));
             });
-            if ui.button_keyed("cancel-export", "Cancel").clicked {
-                job.cancel();
-            }
-        }
-        if let Some(job) = app.proxies_job.clone() {
-            let (i, n, frac) = job.progress();
-            ui.text_with(&format!("Proxies {}/{n} — {:.0}%", (i + 1).min(n), frac * 100.0), 11.0, ui.theme.palette.text_muted);
-            ui.container(Layout::row().width(Size::Fixed(120.0)).height(Size::Fixed(20.0)).align(Align::Start, Align::Center), Frame::none(), |ui| {
-                ui.progress("proxies", Some(frac));
-            });
-            if ui.button_keyed("cancel-proxies", "Cancel").clicked {
-                job.cancel();
+            if ui.button_keyed("open-jobs", "Jobs").clicked {
+                crate::dock::show_tab(&mut app.dock, crate::Tab::Jobs);
             }
         }
         let save = icon_button(ui, "save", Icon::Panel, 24.0, false);
