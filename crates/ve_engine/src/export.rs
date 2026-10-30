@@ -78,18 +78,24 @@ impl ExportState {
     }
 
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        self.wake.notify_all();
+        self.signal(&self.cancel, true);
     }
 
     pub fn set_paused(&self, on: bool) {
-        self.paused.store(on, Ordering::Relaxed);
-        self.wake.notify_all();
+        self.signal(&self.paused, on);
     }
 
     /// Hold the export while the editor plays back (resumes when it stops).
     pub fn set_held(&self, on: bool) {
-        self.held.store(on, Ordering::Relaxed);
+        self.signal(&self.held, on);
+    }
+
+    /// Set a flag the export thread waits on. Under the gate's lock: set
+    /// between the waiter's check and its sleep, the wake would be lost and
+    /// a resumed export would sleep on for good.
+    fn signal(&self, flag: &AtomicBool, on: bool) {
+        let _g = self.gate.lock().unwrap();
+        flag.store(on, Ordering::Relaxed);
         self.wake.notify_all();
     }
 
@@ -125,6 +131,32 @@ const SAMPLE_RATE: u32 = 48_000;
 /// How long to wait for one decoded frame before giving up.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 
+impl ExportState {
+    /// The export of `project`'s active sequence to `out`, not started yet:
+    /// whoever starts it can pause, hold or cancel it first.
+    pub(crate) fn new(project: &Snapshot, platform: &Platform, out: &MediaRef) -> Arc<ExportState> {
+        let seq = project.active();
+        let rate = seq.map(|s| s.format.rate).unwrap_or(ve_time::Rate::FPS_24);
+        // The in/out range when set, else the whole sequence: every frame that
+        // touches it.
+        let range = seq.map(|s| s.marks.range(s.duration())).unwrap_or_default();
+        let first = range.start.to_frame(rate);
+        let total = if range.duration > Time::ZERO { ((range.end() - Time(1)).to_frame(rate) - first + 1) as u64 } else { 0 };
+        Arc::new(ExportState {
+            name: platform.storage.display_name(out),
+            first,
+            total,
+            done: AtomicU64::new(0),
+            cancel: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            held: AtomicBool::new(false),
+            gate: Mutex::new(()),
+            wake: std::sync::Condvar::new(),
+            result: Mutex::new(None),
+        })
+    }
+}
+
 /// Start exporting `project`'s active sequence to `out`.
 pub fn start(
     project: Snapshot,
@@ -135,26 +167,25 @@ pub fn start(
     out: MediaRef,
     importer: Option<Arc<dyn ve_render::TextureImporter>>,
 ) -> Arc<ExportState> {
-    let seq = project.active().cloned();
-    let rate = seq.as_ref().map(|s| s.format.rate).unwrap_or(ve_time::Rate::FPS_24);
-    // The in/out range when set, else the whole sequence: every frame that
-    // touches it.
-    let range = seq.as_ref().map(|s| s.marks.range(s.duration())).unwrap_or_default();
-    let first = range.start.to_frame(rate);
-    let total = if range.duration > Time::ZERO { ((range.end() - Time(1)).to_frame(rate) - first + 1) as u64 } else { 0 };
-    let state = Arc::new(ExportState {
-        name: platform.storage.display_name(&out),
-        first,
-        total,
-        done: AtomicU64::new(0),
-        cancel: AtomicBool::new(false),
-        paused: AtomicBool::new(false),
-        held: AtomicBool::new(false),
-        gate: Mutex::new(()),
-        wake: std::sync::Condvar::new(),
-        result: Mutex::new(None),
-    });
-    let st = state.clone();
+    let state = ExportState::new(&project, &platform, &out);
+    launch(state.clone(), project, platform, registry, gpu, preset, out, importer, Box::new(|| {}));
+    state
+}
+
+/// Run `state`'s export on its own thread; `done` is called once its
+/// result is set.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch(
+    st: Arc<ExportState>,
+    project: Snapshot,
+    platform: Platform,
+    registry: Arc<Registry>,
+    gpu: (wgpu::Device, wgpu::Queue),
+    preset: ExportPreset,
+    out: MediaRef,
+    importer: Option<Arc<dyn ve_render::TextureImporter>>,
+    done: Box<dyn FnOnce() + Send>,
+) {
     std::thread::Builder::new()
         .name("ve-export".into())
         .spawn(move || {
@@ -179,11 +210,13 @@ pub fn start(
             }
             let r = if st.cancel.load(Ordering::Relaxed) { Err("cancelled".into()) } else { r };
             *st.result.lock().unwrap() = Some(r);
-            let _g = st.gate.lock().unwrap();
-            st.wake.notify_all();
+            {
+                let _g = st.gate.lock().unwrap();
+                st.wake.notify_all();
+            }
+            done();
         })
         .expect("export thread");
-    state
 }
 
 #[allow(clippy::too_many_arguments)]

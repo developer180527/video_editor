@@ -198,8 +198,15 @@ fn mix_thread(mut mixer: Mixer, mut prod: Producer<(u64, [f32; 2])>, s: Arc<Shar
             let _job = s.wake.wait_while(job, |j| j.is_none() && !s.quit.load(Ordering::Relaxed)).unwrap();
             continue;
         };
-        if prod.slots() < BLOCK || capacity - prod.slots() > ahead {
-            std::thread::sleep(Duration::from_millis(3));
+        let filled = capacity - prod.slots();
+        if prod.slots() < BLOCK || filled > ahead {
+            // Far enough ahead: sleep until the device has played enough to
+            // make room — about one wake per block mixed, not a 3 ms poll
+            // (~330 a second) — or until a new job, stop or quit.
+            let frames = filled.saturating_sub(ahead).max(BLOCK.saturating_sub(prod.slots())).max(1);
+            let wait = Duration::from_secs_f64(frames as f64 / rate as f64);
+            let job = s.job.lock().unwrap();
+            let _ = s.wake.wait_timeout_while(job, wait, |j| j.is_none() && !s.quit.load(Ordering::Relaxed) && s.playing.load(Ordering::Relaxed));
             continue;
         }
         if let Some(seq) = project.sequence(*seq_id).cloned() {

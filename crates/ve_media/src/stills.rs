@@ -51,18 +51,44 @@ struct State {
     /// not asked for again, or every frame would ask and fail.
     failed_peaks: HashSet<(AssetId, usize)>,
     version: u64,
+    /// The `Stills` is gone: the worker ends.
+    closed: bool,
 }
 
 pub struct Stills {
+    shared: Arc<Shared>,
+}
+
+/// What the worker shares with the owners. The worker holds this, not the
+/// `Stills`, so dropping the last `Stills` can tell it to stop.
+pub struct Shared {
     state: Mutex<State>,
     wake: Condvar,
     waker: Mutex<Option<Waker>>,
 }
 
+impl std::ops::Deref for Stills {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+impl Drop for Stills {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().closed = true;
+        self.wake.notify_all();
+    }
+}
+
+/// A decoder nobody has asked anything of for this long is closed: it holds
+/// a thread per core and their frames.
+const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Stills {
     pub fn new(storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>) -> Arc<Self> {
-        let s = Arc::new(Stills { state: Mutex::new(State::default()), wake: Condvar::new(), waker: Mutex::new(None) });
-        let w = Arc::downgrade(&s);
+        let shared = Arc::new(Shared { state: Mutex::new(State::default()), wake: Condvar::new(), waker: Mutex::new(None) });
+        let w = shared.clone();
         std::thread::Builder::new()
             .name("ve-stills".into())
             .spawn(move || {
@@ -71,7 +97,7 @@ impl Stills {
                 worker(w, storage, media)
             })
             .expect("stills thread");
-        s
+        Arc::new(Stills { shared })
     }
 
     pub fn set_waker(&self, w: Waker) {
@@ -211,28 +237,32 @@ fn read_peaks(storage: &dyn Storage, r: &MediaRef) -> Option<Vec<f32>> {
     (!bytes.is_empty() && bytes.len() % 4 == 0).then(|| bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
 }
 
-fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>) {
+fn worker(stills: Arc<Shared>, storage: Arc<dyn Storage>, media: Arc<dyn MediaBackend>) {
     // The last asset's decoder stays open: thumbnails come in runs along a
-    // clip, and opening a file costs far more than seeking it.
+    // clip, and opening a file costs far more than seeking it. Idle for
+    // IDLE, it is closed; then the worker sleeps until asked (no timer).
     let mut open: Option<(AssetId, ve_ports::Resolved, Box<dyn ve_ports::VideoDecoder>)> = None;
     loop {
-        let Some(stills) = s.upgrade() else { return };
         let job = {
             let mut st = stills.state.lock().unwrap();
             loop {
+                if st.closed {
+                    return;
+                }
                 if let Some(j) = st.queue.pop_front() {
                     break j;
                 }
-                // Wait with a (long) timeout so a dropped pool ends the
-                // thread eventually; idle, it wakes once a minute, not twice
-                // a second.
-                st = stills.wake.wait_timeout(st, std::time::Duration::from_secs(60)).unwrap().0;
-                if std::sync::Arc::strong_count(&stills) == 1 {
-                    return;
+                if open.is_none() {
+                    st = stills.wake.wait(st).unwrap();
+                    continue;
+                }
+                let (g, waited) = stills.wake.wait_timeout(st, IDLE).unwrap();
+                st = g;
+                if waited.timed_out() && st.queue.is_empty() {
+                    open = None;
                 }
             }
         };
-        drop(stills);
         let result: Result<(), AssetId> = match &job {
             Job::Thumb(asset, m, slot) => {
                 if open.as_ref().is_none_or(|(a, _, _)| a != asset) {
@@ -249,11 +279,9 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
                 }
                 match made.and_then(|f| to_thumb(&f)) {
                     Some(t) => {
-                        if let Some(stills) = s.upgrade() {
-                            let mut st = stills.state.lock().unwrap();
-                            st.add_thumb((*asset, *slot), t);
-                            st.version += 1;
-                        }
+                        let mut st = stills.state.lock().unwrap();
+                        st.add_thumb((*asset, *slot), t);
+                        st.version += 1;
                         Ok(())
                     }
                     None => Err(*asset),
@@ -289,33 +317,29 @@ fn worker(s: std::sync::Weak<Stills>, storage: Arc<dyn Storage>, media: Arc<dyn 
                 }
                 match peaks {
                     Some(p) => {
-                        if let Some(stills) = s.upgrade() {
-                            let mut st = stills.state.lock().unwrap();
-                            st.peaks.insert((*asset, *stream), Arc::new(p));
-                            st.version += 1;
-                        }
+                        let mut st = stills.state.lock().unwrap();
+                        st.peaks.insert((*asset, *stream), Arc::new(p));
+                        st.version += 1;
                         Ok(())
                     }
                     None => Err(*asset),
                 }
             }
         };
-        if let Some(stills) = s.upgrade() {
-            if let Err(asset) = result {
-                let mut st = stills.state.lock().unwrap();
-                match &job {
-                    Job::Thumb(..) => {
-                        st.failed.insert(asset);
-                    }
-                    Job::Peaks(_, _, stream) => {
-                        st.failed_peaks.insert((asset, *stream));
-                    }
+        if let Err(asset) = result {
+            let mut st = stills.state.lock().unwrap();
+            match &job {
+                Job::Thumb(..) => {
+                    st.failed.insert(asset);
+                }
+                Job::Peaks(_, _, stream) => {
+                    st.failed_peaks.insert((asset, *stream));
                 }
             }
-            stills.state.lock().unwrap().queued.remove(&job);
-            if let Some(w) = stills.waker.lock().unwrap().as_ref() {
-                w();
-            }
+        }
+        stills.state.lock().unwrap().queued.remove(&job);
+        if let Some(w) = stills.waker.lock().unwrap().as_ref() {
+            w();
         }
     }
 }

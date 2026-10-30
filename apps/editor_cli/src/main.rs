@@ -42,11 +42,12 @@ fn main() {
         Some("plugins") => plugins(),
         Some("caps") => caps(),
         Some("assemble") if args.len() > 2 => assemble(&args[1], &args[2..]),
+        Some("bench") if args.get(1).is_some_and(|a| a == "--jobs") => bench::jobs(&args[2..]),
         Some("bench") => bench::bench(&args[1..]),
         Some("clap") => clap::clap(&args[1..]),
         Some("proxy") if args.len() > 1 => proxy(&args[1..]),
         _ => {
-            eprintln!("usage: ve probe <media>... | new <project> | info <project> | plugins | caps | assemble <project> <media>...");
+            eprintln!("usage: ve probe <media>... | new <project> | info <project> | plugins | caps | assemble <project> <media>... | bench [--jobs] | clap | proxy [--height N] <media>...");
             2
         }
     };

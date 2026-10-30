@@ -148,6 +148,11 @@ impl Engine {
         let stills = self.stills().clone();
         stills.set_waker(waker.clone());
         let out = shared.clone();
+        // Jobs wake the UI when they change, and hold while the editor plays:
+        // told here, by the transport, not by whoever draws it.
+        let jobs = crate::Jobs::default();
+        jobs.set_waker(waker.clone());
+        let hold = jobs.clone();
         std::thread::Builder::new()
             .name("ve-engine".into())
             .spawn(move || {
@@ -164,7 +169,9 @@ impl Engine {
                         next.viewer = shared.viewer;
                     }
                     *shared = next;
+                    let playing = matches!(shared.transport.state(), State::Playing { .. });
                     drop(shared);
+                    hold.set_playing(playing);
                     for ev in e.drain_events() {
                         let _ = etx.send(ev);
                     }
@@ -174,14 +181,22 @@ impl Engine {
                 // takes a moment, and the clock should not change basis mid-play.
                 self.prepare_audio();
                 flush(&mut self, None, adopted);
-                // Ends when the client is dropped. Between requests (and at
-                // least every AUTOSAVE_EVERY) unsaved changes are autosaved.
+                // Ends when the client is dropped. Unsaved changes are
+                // autosaved at most AUTOSAVE_EVERY after they were made; with
+                // none, it sleeps until asked (race to idle — no timer).
                 let mut last_autosave = std::time::Instant::now();
                 loop {
-                    let req = match rx.recv_timeout(AUTOSAVE_EVERY) {
-                        Ok(r) => Some(r),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    let req = if self.needs_autosave() {
+                        match rx.recv_timeout(AUTOSAVE_EVERY.saturating_sub(last_autosave.elapsed())) {
+                            Ok(r) => Some(r),
+                            Err(mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(r) => Some(r),
+                            Err(_) => break,
+                        }
                     };
                     if last_autosave.elapsed() >= AUTOSAVE_EVERY {
                         last_autosave = std::time::Instant::now();
@@ -263,7 +278,7 @@ impl Engine {
                 }
             })
             .expect("engine thread");
-        EngineClient { platform, video, stills, tx, shared, events, watch: Mutex::new(Watchdog::default()), recording: Mutex::new(None), jobs: crate::Jobs::default() }
+        EngineClient { platform, video, stills, tx, shared, events, watch: Mutex::new(Watchdog::default()), recording: Mutex::new(None), jobs }
     }
 }
 
@@ -395,6 +410,7 @@ impl EngineClient {
             p.transport_rev += 1;
             (p.transport.clone(), p.transport_rev)
         };
+        self.jobs.set_playing(matches!(t.0.state(), State::Playing { .. }));
         self.send(Request::Transport(t.0, t.1));
     }
 
@@ -445,6 +461,7 @@ impl EngineClient {
             p.transport_rev += 1;
             Request::Viewer(v, p.transport.clone(), p.parked.clone(), p.transport_rev)
         };
+        self.jobs.set_playing(false);
         self.send(msg);
     }
 
@@ -566,7 +583,7 @@ impl EngineClient {
         let attach = move |asset, path| {
             let _ = tx.lock().unwrap().send(Request::AttachProxy(asset, path));
         };
-        self.jobs.set_context(crate::JobContext { platform: self.platform.clone(), registry: self.published().plugins, gpu, importer, attach: Arc::new(attach) });
+        self.jobs.set_context(crate::JobContext { platform: self.platform.clone(), gpu, importer, attach: Arc::new(attach) });
     }
 
     /// Queue an export of the active sequence as it is now.
@@ -574,18 +591,19 @@ impl EngineClient {
         let p = self.published();
         let name = self.platform.storage.display_name(&out);
         let seq = p.snapshot.active().map(|s| s.name.clone()).unwrap_or_default();
-        self.jobs.add(name, format!("{seq} · {}", preset.label()), crate::JobKind::Export { project: p.snapshot, preset, out })
+        self.jobs.add(name, format!("{seq} · {}", preset.label()), crate::JobKind::Export { project: p.snapshot, plugins: p.plugins, preset, out })
     }
 
     /// Queue a proxy of each of `assets` (those with a picture), `height` tall.
     pub fn queue_proxies(&self, assets: Vec<ve_model::AssetId>, height: u32) -> Vec<crate::JobId> {
-        let snap = self.published().snapshot;
+        let p = self.published();
+        let (snap, plugins) = (p.snapshot, p.plugins);
         assets
             .into_iter()
             .filter_map(|id| {
                 let a = snap.assets.get(&id)?;
                 a.info.as_ref()?.video.as_ref()?;
-                Some(self.jobs.add(a.name.clone(), format!("{height}p proxy"), crate::JobKind::Proxy { project: snap.clone(), asset: id, height }))
+                Some(self.jobs.add(a.name.clone(), format!("{height}p proxy"), crate::JobKind::Proxy { project: snap.clone(), plugins: plugins.clone(), asset: id, height }))
             })
             .collect()
     }

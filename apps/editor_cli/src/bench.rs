@@ -370,3 +370,58 @@ pub fn bench(args: &[String]) -> i32 {
     println!("\npeak memory {:.0} MB", peak_mb());
     0
 }
+
+/// `ve bench --jobs`: export throughput through the job queue. The same
+/// pair of exports run one after the other (as the queue runs them) and
+/// side by side, so it shows whether one export alone keeps the machine
+/// busy (race to idle: work at full speed, then nothing).
+pub fn jobs(args: &[String]) -> i32 {
+    let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let dir = PathBuf::from(arg("--media").unwrap_or_else(|| "target/bench".into()));
+    let secs: u32 = arg("--clip-secs").and_then(|s| s.parse().ok()).unwrap_or(10);
+    let only = arg("--only");
+    let Some(m) = media(&dir, secs) else {
+        eprintln!("bench needs the ffmpeg command-line tool");
+        return 1;
+    };
+    let Some(g) = gpu() else {
+        eprintln!("no GPU");
+        return 1;
+    };
+    println!("ve bench --jobs — two {secs} s exports; cores = CPU time / wall time");
+    let presets = [ve_engine::ExportPreset::H264Mp4, ve_engine::ExportPreset::HevcMp4, ve_engine::ExportPreset::ProResMov];
+    for (label, path) in [("1080p H.264", &m.hd), ("UHD H.264", &m.uhd_h264)] {
+        let e = match project(path, Kind::Plain, secs) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("{label}: {err}");
+                continue;
+            }
+        };
+        let client = e.spawn(Arc::new(|| {}));
+        client.enable_jobs(g.clone(), gpu_import::importer());
+        println!("\n{label}");
+        for preset in presets {
+            let name = format!("{label} → {}", preset.label());
+            if only.as_ref().is_some_and(|o| !name.to_lowercase().contains(&o.to_lowercase())) {
+                continue;
+            }
+            let out = |n: usize| MediaRef(format!("file:{}", std::path::absolute(dir.join(format!("jobs_{n}.{}", preset.extension()))).unwrap().display()));
+            // Queued: one at a time.
+            let (t0, c0) = (Instant::now(), cpu_time());
+            let ids: Vec<_> = (0..2).map(|n| client.queue_export(preset, out(n))).collect();
+            client.jobs().wait_idle();
+            let (wall, cpu) = (t0.elapsed().as_secs_f64(), (cpu_time() - c0).as_secs_f64());
+            let ok = client.jobs().list().iter().filter(|j| ids.contains(&j.id)).all(|j| j.state == ve_engine::JobState::Done);
+            client.jobs().clear_finished();
+            println!("  {:<44} {:>6.2} cores  {:>5.1}× real time{}", format!("{} queued", preset.label()), cpu / wall, 2.0 * secs as f64 / wall, if ok { "" } else { "  FAILED" });
+            // Side by side.
+            let (t0, c0) = (Instant::now(), cpu_time());
+            let runs: Vec<_> = (0..2).map(|n| client.export(g.clone(), preset, out(n + 2), gpu_import::importer())).collect();
+            let ok = runs.iter().all(|r| r.wait().is_ok());
+            let (wall, cpu) = (t0.elapsed().as_secs_f64(), (cpu_time() - c0).as_secs_f64());
+            println!("  {:<44} {:>6.2} cores  {:>5.1}× real time{}", format!("{} side by side", preset.label()), cpu / wall, 2.0 * secs as f64 / wall, if ok { "" } else { "  FAILED" });
+        }
+    }
+    0
+}

@@ -656,8 +656,6 @@ impl EditorUi {
 
     /// A toast for each job that has just finished.
     fn jobs_ui(&mut self, ui: &mut Ui) {
-        // The engine's queue holds playback-sensitive work back while playing.
-        self.engine.jobs().set_playing(self.engine.is_playing());
         for j in self.engine.jobs().list() {
             if !j.state.finished() || !self.announced.insert(j.id) {
                 continue;
@@ -1117,8 +1115,10 @@ impl EditorUi {
             || self.track_db.values().flatten().any(|d| *d > -95.0)
             || !self.thumb_uploads.is_empty())
         .then_some(STEADY);
-        // Jobs running: a progress bar's worth of looks, four a second.
-        let jobs = self.engine.jobs().active().then_some(0.25);
+        // A job running: a progress bar's worth of looks, four a second.
+        // Queued, paused or held jobs change only when told to (the queue
+        // wakes the UI then), so they cost nothing.
+        let jobs = self.engine.jobs().running().then_some(0.25);
         // While playing, everything else (meters, late frames) rides along
         // with the picture's frames rather than adding its own.
         playing.or(steady).or(jobs)

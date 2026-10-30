@@ -462,10 +462,15 @@ impl Engine {
         storage.location(ve_ports::Location::AppData, &format!("Autosave/{name}.{}.veproj", self.session))
     }
 
+    /// Whether there are changes since the last save or autosave.
+    pub fn needs_autosave(&self) -> bool {
+        self.is_dirty() && !self.autosaved.as_ref().is_some_and(|a| Arc::ptr_eq(a, &self.project))
+    }
+
     /// Write the autosave if there are changes since the last save or
     /// autosave. Returns whether it wrote.
     pub fn autosave(&mut self) -> Result<bool, EngineError> {
-        if !self.is_dirty() || self.autosaved.as_ref().is_some_and(|a| Arc::ptr_eq(a, &self.project)) {
+        if !self.needs_autosave() {
             return Ok(false);
         }
         let mut bytes = Vec::new();

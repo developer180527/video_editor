@@ -1,17 +1,20 @@
 //! The job system: long work the editor does in the background — exports
 //! and proxies — in one queue, shown in the Jobs panel.
 //!
-//! - **One at a time, at full speed.** An export already uses every core and
-//!   the hardware encoder; two at once would only share them, and finish
-//!   both later. Jobs run in the order queued.
-//! - **Race to idle.** The runner thread starts when a job is queued and
-//!   ends when the queue is empty; nothing waits on a timer. A paused job
-//!   sleeps between frames until resumed or cancelled.
+//! - **One at a time, at full speed.** Jobs run in the order queued. (Two
+//!   exports side by side share the decoders and encoders an export is
+//!   limited by — `ve bench --jobs` measures it — and finish both later.)
+//! - **Race to idle.** The runner thread starts when a job can run and ends
+//!   when none can; nothing waits on a timer. A paused job sleeps between
+//!   frames until resumed or cancelled.
+//! - **Pausing yields.** A job paused part-way gives up its turn: the next
+//!   one runs. Resumed, it waits for its turn again and carries on from
+//!   where it stopped.
 //! - **Playback first.** While the editor plays, the running job is held
 //!   (between frames), so a background export never makes playback stutter;
-//!   it carries on when playback stops.
-//! - Each export renders the project as it was when it was queued, as an
-//!   export queue does: later edits change later exports.
+//!   it carries on when playback stops. The engine says when it plays.
+//! - Each job renders the project — and the plugins — as they were when it
+//!   was queued, as an export queue does: later edits change later exports.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -27,6 +30,7 @@ pub type JobId = u64;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum JobState {
+    /// Waiting for its turn (a resumed job too, part-way through).
     Queued,
     Running,
     /// Paused by the user (a queued job can be paused too: it is skipped).
@@ -56,13 +60,13 @@ impl JobState {
     }
 }
 
-/// What a job does.
+/// What a job does, with what it was queued with.
 #[derive(Clone)]
 pub enum JobKind {
     /// The active sequence of `project` (as queued) to `out`.
-    Export { project: Snapshot, preset: ExportPreset, out: MediaRef },
+    Export { project: Snapshot, plugins: Arc<Registry>, preset: ExportPreset, out: MediaRef },
     /// A proxy of `asset`, `height` pixels tall.
-    Proxy { project: Snapshot, asset: AssetId, height: u32 },
+    Proxy { project: Snapshot, plugins: Arc<Registry>, asset: AssetId, height: u32 },
 }
 
 /// One job, as the Jobs panel shows it.
@@ -78,7 +82,7 @@ pub struct JobInfo {
     /// 0–1 while running or paused part-way; 1 when done.
     pub progress: f32,
     pub queued_at: Instant,
-    /// How long it ran (so far, or in all).
+    /// How long it has run (paused stretches not counted).
     pub ran: Option<Duration>,
 }
 
@@ -86,15 +90,33 @@ struct Entry {
     info: JobInfo,
     job: JobKind,
     paused: bool,
-    started: Option<Instant>,
+    /// Since when it has been running, this stretch.
+    since: Option<Instant>,
+    /// Run time before this stretch (it was paused part-way).
+    ran: Duration,
+    /// Its export, once started; kept while paused part-way.
     export: Option<Arc<ExportState>>,
+}
+
+impl Entry {
+    fn ran(&self) -> Option<Duration> {
+        let now = self.since.map(|t| t.elapsed());
+        (now.is_some() || self.ran > Duration::ZERO).then(|| self.ran + now.unwrap_or_default())
+    }
+
+    /// Stop the clock (paused, or over).
+    fn stop_clock(&mut self) {
+        if let Some(t) = self.since.take() {
+            self.ran += t.elapsed();
+        }
+        self.info.ran = self.ran();
+    }
 }
 
 /// What the runner needs that the queue does not hold per job.
 #[derive(Clone)]
 pub struct JobContext {
     pub platform: Platform,
-    pub registry: Arc<Registry>,
     pub gpu: (wgpu::Device, wgpu::Queue),
     pub importer: Option<Arc<dyn ve_render::TextureImporter>>,
     /// A finished proxy, to attach to its asset: (asset, file path).
@@ -107,6 +129,8 @@ struct Inner {
     next: JobId,
     /// A runner thread is alive.
     running: bool,
+    /// The job the runner is on (waiting for it to end or be paused).
+    current: Option<JobId>,
     ctx: Option<JobContext>,
     /// Bumped on every change, so a UI can tell when to look again.
     version: u64,
@@ -117,15 +141,22 @@ struct Inner {
 pub struct Jobs {
     inner: Arc<(Mutex<Inner>, Condvar)>,
     playing: Arc<AtomicBool>,
+    waker: Arc<Mutex<Option<crate::Waker>>>,
 }
 
 impl Jobs {
-    /// Give the runner what it needs (the GPU, plugins, …). Jobs queued
-    /// before this wait for it.
+    /// Called on every change (a job added, started, paused, finished…),
+    /// so a UI that sleeps when idle wakes to show it.
+    pub fn set_waker(&self, w: crate::Waker) {
+        *self.waker.lock().unwrap() = Some(w);
+    }
+
+    /// Give the runner what it needs (the GPU, …). Jobs queued before this
+    /// wait for it.
     pub fn set_context(&self, ctx: JobContext) {
-        let (m, _) = &*self.inner;
-        m.lock().unwrap().ctx = Some(ctx);
-        self.kick();
+        let mut g = self.inner.0.lock().unwrap();
+        g.ctx = Some(ctx);
+        self.kick(g);
     }
 
     pub fn has_context(&self) -> bool {
@@ -134,8 +165,7 @@ impl Jobs {
 
     /// Queue a job; it starts when the ones before it are done.
     pub fn add(&self, title: String, detail: String, job: JobKind) -> JobId {
-        let (m, _) = &*self.inner;
-        let mut g = m.lock().unwrap();
+        let mut g = self.inner.0.lock().unwrap();
         g.next += 1;
         let id = g.next;
         let kind = match job {
@@ -146,12 +176,11 @@ impl Jobs {
             info: JobInfo { id, kind, title, detail, state: JobState::Queued, progress: 0.0, queued_at: Instant::now(), ran: None },
             job,
             paused: false,
-            started: None,
+            since: None,
+            ran: Duration::ZERO,
             export: None,
         });
-        g.version += 1;
-        drop(g);
-        self.kick();
+        self.kick(g);
         id
     }
 
@@ -162,13 +191,11 @@ impl Jobs {
             .iter()
             .map(|e| {
                 let mut i = e.info.clone();
-                if let Some(x) = &e.export {
-                    if !i.state.finished() {
-                        i.progress = x.progress();
-                    }
+                if let (Some(x), false) = (&e.export, i.state.finished()) {
+                    i.progress = x.progress();
                 }
-                if let (Some(t), false) = (e.started, i.state.finished()) {
-                    i.ran = Some(t.elapsed());
+                if !i.state.finished() {
+                    i.ran = e.ran();
                 }
                 i
             })
@@ -185,99 +212,126 @@ impl Jobs {
         self.inner.0.lock().unwrap().entries.iter().any(|e| !e.info.state.finished())
     }
 
+    /// Whether a job is making progress now (worth redrawing its bar for).
+    pub fn running(&self) -> bool {
+        self.inner.0.lock().unwrap().entries.iter().any(|e| e.info.state == JobState::Running)
+    }
+
     pub fn pause(&self, id: JobId, on: bool) {
-        let (m, _) = &*self.inner;
-        let mut g = m.lock().unwrap();
+        let mut g = self.inner.0.lock().unwrap();
         let held = self.playing.load(Ordering::Relaxed);
-        if let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id && !e.info.state.finished()) {
-            e.paused = on;
-            if let Some(x) = &e.export {
-                x.set_paused(on);
-            }
-            e.info.state = match (on, &e.export, held) {
-                (true, _, _) => JobState::Paused,
-                (false, Some(_), true) => JobState::Held,
-                (false, Some(_), false) => JobState::Running,
-                (false, None, _) => JobState::Queued,
-            };
+        let current = g.current == Some(id);
+        let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id && !e.info.state.finished()) else { return };
+        if e.paused == on {
+            return;
         }
-        g.version += 1;
-        drop(g);
-        self.kick();
+        e.paused = on;
+        if on {
+            // Gated at once; the runner sees it paused and moves on.
+            if let Some(x) = &e.export {
+                x.set_paused(true);
+            }
+            e.stop_clock();
+            e.info.state = JobState::Paused;
+        } else if !current {
+            // Resumed: back in line. The runner lifts the gate on its turn.
+            e.info.state = JobState::Queued;
+        } else {
+            // Paused and resumed before the runner noticed: it never yielded.
+            if let Some(x) = &e.export {
+                x.set_paused(false);
+            }
+            e.since = Some(Instant::now());
+            e.info.state = if held { JobState::Held } else { JobState::Running };
+        }
+        self.kick(g);
     }
 
     pub fn cancel(&self, id: JobId) {
-        let (m, _) = &*self.inner;
-        let mut g = m.lock().unwrap();
-        if let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id && !e.info.state.finished()) {
-            match &e.export {
-                // The runner records the outcome when the export stops.
-                Some(x) => x.cancel(),
-                None => e.info.state = JobState::Cancelled,
+        let mut g = self.inner.0.lock().unwrap();
+        let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id && !e.info.state.finished()) else { return };
+        match &e.export {
+            // Its thread stops between frames, removes the partial file and
+            // records the outcome.
+            Some(x) => x.cancel(),
+            // Not started (or still being prepared): over now. The runner
+            // checks before it starts the export.
+            None => {
+                e.stop_clock();
+                e.info.state = JobState::Cancelled;
             }
         }
-        g.version += 1;
+        self.changed(&mut g);
     }
 
     /// Queue a finished (failed, cancelled or done) job again.
     pub fn retry(&self, id: JobId) {
-        let (m, _) = &*self.inner;
-        let mut g = m.lock().unwrap();
-        if let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id && e.info.state.finished()) {
-            e.info.state = JobState::Queued;
-            e.info.progress = 0.0;
-            e.info.ran = None;
-            e.paused = false;
-            e.started = None;
-            e.export = None;
-        }
-        g.version += 1;
-        drop(g);
-        self.kick();
+        let mut g = self.inner.0.lock().unwrap();
+        let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id && e.info.state.finished()) else { return };
+        e.info.state = JobState::Queued;
+        e.info.progress = 0.0;
+        e.info.ran = None;
+        e.paused = false;
+        e.since = None;
+        e.ran = Duration::ZERO;
+        e.export = None;
+        self.kick(g);
     }
 
     /// Drop a finished job from the list.
     pub fn remove(&self, id: JobId) {
         let mut g = self.inner.0.lock().unwrap();
         g.entries.retain(|e| e.info.id != id || !e.info.state.finished());
-        g.version += 1;
+        self.changed(&mut g);
     }
 
     pub fn clear_finished(&self) {
         let mut g = self.inner.0.lock().unwrap();
         g.entries.retain(|e| !e.info.state.finished());
-        g.version += 1;
+        self.changed(&mut g);
     }
 
     /// The editor started or stopped playing: hold the running job meanwhile.
+    /// The engine client calls this whenever its transport changes.
     pub fn set_playing(&self, on: bool) {
         if self.playing.swap(on, Ordering::Relaxed) == on {
             return;
         }
         let mut g = self.inner.0.lock().unwrap();
-        for e in g.entries.iter_mut().filter(|e| e.export.is_some() && !e.info.state.finished()) {
+        for e in g.entries.iter_mut().filter(|e| !e.info.state.finished()) {
             if let Some(x) = &e.export {
                 x.set_held(on);
             }
-            if !e.paused {
-                e.info.state = if on { JobState::Held } else { JobState::Running };
+            match (&e.info.state, on) {
+                (JobState::Running, true) => e.info.state = JobState::Held,
+                (JobState::Held, false) => e.info.state = JobState::Running,
+                _ => {}
             }
         }
-        g.version += 1;
+        self.changed(&mut g);
     }
 
-    /// Wait (blocking, no timer) until nothing is queued or running. For
-    /// tools and tests.
+    /// Wait (blocking, no timer) until no job can go on without the user:
+    /// each is finished or paused. For tools and tests.
     pub fn wait_idle(&self) {
         let (m, cv) = &*self.inner;
         let g = m.lock().unwrap();
-        let _g = cv.wait_while(g, |g| g.running || g.entries.iter().any(|e| matches!(e.info.state, JobState::Queued | JobState::Running | JobState::Held))).unwrap();
+        let _g = cv.wait_while(g, |g| g.entries.iter().any(|e| !e.info.state.finished() && !e.paused)).unwrap();
     }
 
-    /// Start the runner if there is work and it is not running.
-    fn kick(&self) {
-        let (m, _) = &*self.inner;
-        let mut g = m.lock().unwrap();
+    /// Something changed: tell whoever waits or shows it.
+    fn changed(&self, g: &mut Inner) {
+        g.version += 1;
+        self.inner.1.notify_all();
+        if let Some(w) = self.waker.lock().unwrap().as_ref() {
+            w();
+        }
+    }
+
+    /// After a change: start the runner if there is a job it can run and it
+    /// is not running.
+    fn kick(&self, mut g: std::sync::MutexGuard<Inner>) {
+        self.changed(&mut g);
         let ready = g.ctx.is_some() && g.entries.iter().any(|e| e.info.state == JobState::Queued && !e.paused);
         if g.running || !ready {
             return;
@@ -288,89 +342,109 @@ impl Jobs {
         std::thread::Builder::new().name("ve-jobs".into()).spawn(move || me.run()).expect("jobs thread");
     }
 
-    /// The runner: the next queued job, until there are none; then it ends.
+    /// The runner: the next job in line, until there are none; then it ends.
     fn run(&self) {
         let (m, cv) = &*self.inner;
         loop {
-            let (id, job, ctx) = {
-                let mut g = m.lock().unwrap();
-                let ctx = g.ctx.clone();
-                let next = g.entries.iter().position(|e| e.info.state == JobState::Queued && !e.paused);
-                match (next, ctx) {
-                    (Some(i), Some(ctx)) => {
-                        let e = &mut g.entries[i];
-                        e.started = Some(Instant::now());
-                        e.info.state = JobState::Running;
-                        let job = e.job.clone();
-                        let id = e.info.id;
-                        g.version += 1;
-                        (id, job, ctx)
-                    }
-                    _ => {
-                        // Race to idle: no work, no thread.
-                        g.running = false;
-                        g.version += 1;
-                        cv.notify_all();
-                        return;
-                    }
-                }
-            };
-            let outcome = self.run_one(id, job, &ctx);
             let mut g = m.lock().unwrap();
-            if let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id) {
-                e.info.ran = e.started.map(|t| t.elapsed());
-                match outcome {
-                    Ok(detail) => {
-                        e.info.state = JobState::Done;
-                        e.info.progress = 1.0;
-                        if let Some(d) = detail {
-                            e.info.detail = d;
-                        }
-                    }
-                    Err(err) if err == "cancelled" => e.info.state = JobState::Cancelled,
-                    Err(err) => e.info.state = JobState::Failed(err),
+            let next = g.entries.iter().position(|e| e.info.state == JobState::Queued && !e.paused);
+            let (Some(i), Some(ctx)) = (next, g.ctx.clone()) else {
+                // Race to idle: no work, no thread.
+                g.running = false;
+                self.changed(&mut g);
+                return;
+            };
+            let held = self.playing.load(Ordering::Relaxed);
+            g.current = next.map(|i| g.entries[i].info.id);
+            let e = &mut g.entries[i];
+            let id = e.info.id;
+            e.since = Some(Instant::now());
+            e.info.state = if held { JobState::Held } else { JobState::Running };
+            match e.export.clone() {
+                // Its turn again after a pause: lift the gate.
+                Some(x) => {
+                    x.set_held(held);
+                    x.set_paused(false);
+                    self.changed(&mut g);
                 }
-                e.export = None;
+                None => {
+                    let job = e.job.clone();
+                    self.changed(&mut g);
+                    drop(g);
+                    if let Err(err) = self.start(id, job, &ctx) {
+                        self.finish(id, Err(err), None);
+                    }
+                    g = m.lock().unwrap();
+                }
             }
-            g.version += 1;
-            cv.notify_all();
+            // Until it is over or paused (then the next one runs).
+            let mut g = cv.wait_while(g, |g| g.entries.iter().find(|e| e.info.id == id).is_some_and(|e| !e.info.state.finished() && !e.paused)).unwrap();
+            g.current = None;
         }
     }
 
-    /// Run one job to its end. `Ok(Some(detail))` replaces the job's detail.
-    fn run_one(&self, id: JobId, job: JobKind, ctx: &JobContext) -> Result<Option<String>, String> {
-        let (project, preset, out, attach) = match job {
-            JobKind::Export { project, preset, out } => (project, preset, out, None),
-            JobKind::Proxy { project, asset, height } => {
-                let (p, out, path) = crate::proxy::prepare(&project, &ctx.registry, &ctx.platform, asset, height)?;
-                (Arc::new(p), ExportPreset::Proxy, out, Some((asset, path)))
+    /// Start job `id`'s export; its outcome is recorded when it ends.
+    fn start(&self, id: JobId, job: JobKind, ctx: &JobContext) -> Result<(), String> {
+        let (project, plugins, preset, out, proxy) = match job {
+            JobKind::Export { project, plugins, preset, out } => (project, plugins, preset, out, None),
+            JobKind::Proxy { project, plugins, asset, height } => {
+                let (p, out, path) = crate::proxy::prepare(&project, &plugins, &ctx.platform, asset, height)?;
+                (Arc::new(p), plugins, ExportPreset::Proxy, out, Some((asset, path)))
             }
         };
-        let e = crate::export::start(project, ctx.platform.clone(), ctx.registry.clone(), ctx.gpu.clone(), preset, out, ctx.importer.clone());
+        let x = ExportState::new(&project, &ctx.platform, &out);
         {
             let mut g = self.inner.0.lock().unwrap();
-            if let Some(entry) = g.entries.iter_mut().find(|x| x.info.id == id) {
-                // Paused or cancelled before it started, or the editor is playing.
-                if entry.paused {
-                    e.set_paused(true);
-                }
-                if self.playing.load(Ordering::Relaxed) {
-                    e.set_held(true);
-                    if !entry.paused {
-                        entry.info.state = JobState::Held;
+            let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id) else { return Ok(()) };
+            // Cancelled while being prepared: nothing is made.
+            if e.info.state.finished() {
+                return Ok(());
+            }
+            // Paused while being prepared, or the editor is playing: it starts
+            // gated. From here on pause, hold and cancel reach it directly.
+            x.set_paused(e.paused);
+            x.set_held(self.playing.load(Ordering::Relaxed));
+            e.export = Some(x.clone());
+        }
+        let (me, attach) = (self.clone(), ctx.attach.clone());
+        let done = {
+            let x = x.clone();
+            move || {
+                let r = x.result().unwrap_or(Err("the export ended without a result".into()));
+                let detail = match (&r, proxy) {
+                    (Ok(()), Some((asset, path))) => {
+                        attach(asset, path.clone());
+                        Some(path)
+                    }
+                    _ => None,
+                };
+                me.finish(id, r, detail);
+            }
+        };
+        crate::export::launch(x, project, ctx.platform.clone(), plugins, ctx.gpu.clone(), preset, out, ctx.importer.clone(), Box::new(done));
+        Ok(())
+    }
+
+    /// Record how job `id` ended. `detail` replaces its detail.
+    fn finish(&self, id: JobId, r: Result<(), String>, detail: Option<String>) {
+        let mut g = self.inner.0.lock().unwrap();
+        if let Some(e) = g.entries.iter_mut().find(|e| e.info.id == id) {
+            e.stop_clock();
+            match r {
+                Ok(()) => {
+                    e.info.state = JobState::Done;
+                    e.info.progress = 1.0;
+                    if let Some(d) = detail {
+                        e.info.detail = d;
                     }
                 }
-                entry.export = Some(e.clone());
+                Err(err) if err == "cancelled" => e.info.state = JobState::Cancelled,
+                Err(err) => e.info.state = JobState::Failed(err),
             }
+            // Its frames, decoders and encoder are gone with its thread.
+            e.export = None;
         }
-        e.wait()?;
-        Ok(match attach {
-            Some((asset, path)) => {
-                (ctx.attach)(asset, path.clone());
-                Some(path)
-            }
-            None => None,
-        })
+        self.changed(&mut g);
     }
 }
 
@@ -388,7 +462,7 @@ mod tests {
     fn without_a_context_jobs_wait_and_no_thread_starts() {
         let jobs = Jobs::default();
         let p: Snapshot = Arc::new(ve_model::Project::new("t"));
-        let id = jobs.add("a.mp4".into(), String::new(), JobKind::Export { project: p, preset: ExportPreset::H264Mp4, out: MediaRef("file:/x".into()) });
+        let id = jobs.add("a.mp4".into(), String::new(), JobKind::Export { project: p, plugins: Arc::new(Registry::default()), preset: ExportPreset::H264Mp4, out: MediaRef("file:/x".into()) });
         assert!(!jobs.inner.0.lock().unwrap().running, "nothing runs without the GPU");
         assert_eq!(jobs.list()[0].state, JobState::Queued);
         jobs.pause(id, true);
@@ -397,5 +471,28 @@ mod tests {
         assert_eq!(jobs.list()[0].state, JobState::Cancelled, "a job that never started cancels at once");
         jobs.clear_finished();
         assert!(jobs.list().is_empty());
+    }
+
+    #[test]
+    fn every_change_wakes_the_ui_and_waiting_jobs_ignore_playback() {
+        let jobs = Jobs::default();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = wakes.clone();
+        jobs.set_waker(Arc::new(move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        }));
+        let p: Snapshot = Arc::new(ve_model::Project::new("t"));
+        let id = jobs.add("a.mp4".into(), String::new(), JobKind::Export { project: p, plugins: Arc::new(Registry::default()), preset: ExportPreset::H264Mp4, out: MediaRef("file:/x".into()) });
+        assert!(wakes.load(Ordering::SeqCst) >= 1, "queued: the UI is told");
+        let before = wakes.load(Ordering::SeqCst);
+        jobs.set_playing(true);
+        assert_eq!(jobs.list()[0].state, JobState::Queued, "only a started job is held");
+        jobs.pause(id, true);
+        assert!(!jobs.running(), "nothing to redraw for");
+        // Only paused jobs left: nothing more can happen without the user.
+        jobs.wait_idle();
+        jobs.pause(id, false);
+        assert_eq!(jobs.list()[0].state, JobState::Queued, "resumed: back in line");
+        assert!(wakes.load(Ordering::SeqCst) >= before + 3);
     }
 }

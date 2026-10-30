@@ -395,7 +395,8 @@ fn the_job_queue_runs_holds_and_cancels_exports() {
     let state = |id| client.jobs().list().into_iter().find(|j| j.id == id).unwrap().state;
     assert_eq!(state(first), JobState::Queued);
     // The editor is playing when the GPU arrives: the first starts, held.
-    client.jobs().set_playing(true);
+    // (The engine's transport tells the queue; nothing else has to.)
+    client.play(1.0);
     client.jobs().cancel(third);
     client.enable_jobs(gpu, None);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -406,7 +407,8 @@ fn the_job_queue_runs_holds_and_cancels_exports() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(state(first), JobState::Held, "held while playing");
     assert_eq!(state(second), JobState::Queued, "one at a time");
-    client.jobs().set_playing(false);
+    assert_eq!(client.jobs().list().iter().find(|j| j.id == first).unwrap().progress, 0.0, "held before its first frame");
+    client.stop();
     client.jobs().wait_idle();
     assert_eq!((state(first), state(second), state(third)), (JobState::Done, JobState::Done, JobState::Cancelled));
     assert!(dir.join("first.mov").exists() && dir.join("second.mov").exists());
@@ -415,4 +417,83 @@ fn the_job_queue_runs_holds_and_cancels_exports() {
     assert!(!client.jobs().active());
     client.jobs().clear_finished();
     assert!(client.jobs().list().is_empty());
+}
+
+/// An engine with a 2 s clip on the timeline, for the job queue tests below.
+fn queue_setup(dir_name: &str) -> Option<(EngineClient, PathBuf, (wgpu::Device, wgpu::Queue))> {
+    let src = clip()?;
+    if std::env::var_os("VE_NO_GPU").is_some() {
+        return None;
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { force_fallback_adapter: std::env::var_os("VE_GPU_FALLBACK").is_some(), ..Default::default() })).ok()?;
+    let gpu = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(dir_name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut e = Engine::new(platform_headless::platform(&dir, Arc::new(media_ffmpeg::Ffmpeg::new())));
+    e.new_project("t");
+    let asset = e.import(src.to_str().unwrap()).unwrap();
+    let snap = e.snapshot();
+    let seq = snap.active().unwrap().clone();
+    let a = snap.assets[&asset].clone();
+    let c = make_clip(e.plugins(), &seq.format, &a, TrackKind::Video, Time::from_seconds(2), None);
+    e.execute(edit::overwrite(&snap, seq.id, Time::ZERO, &[(seq.tracks[0].id, Arc::new(c))]).unwrap()).unwrap();
+    Some((e.spawn(Arc::new(|| {})), dir, gpu))
+}
+
+/// Pausing a job part-way gives the next one its turn; resumed, it waits
+/// for its turn and carries on from where it stopped, and its file is whole.
+/// `wait_idle` returns once only paused jobs are left.
+#[test]
+fn a_paused_job_yields_and_resumes_where_it_stopped() {
+    let Some((client, dir, gpu)) = queue_setup("jobs_pause") else { return eprintln!("skipped: no ffmpeg CLI or GPU") };
+    let out = |n: &str| MediaRef(format!("file:{}", dir.join(n).display()));
+    let state = |id| client.jobs().list().into_iter().find(|j| j.id == id).unwrap();
+    // Playing: the first starts held, before its first frame.
+    client.play(1.0);
+    let a = client.queue_export(ExportPreset::ProResMov, out("a.mov"));
+    let b = client.queue_export(ExportPreset::ProResMov, out("b.mov"));
+    client.enable_jobs(gpu, None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while state(a).state != JobState::Held {
+        assert!(std::time::Instant::now() < deadline, "the first export never started: {:?}", state(a).state);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Paused: the second takes its turn and finishes.
+    client.jobs().pause(a, true);
+    client.stop();
+    client.jobs().wait_idle();
+    assert_eq!(state(a).state, JobState::Paused);
+    assert_eq!(state(b).state, JobState::Done, "the queue went on past the paused job");
+    assert_eq!(state(a).progress, 0.0, "paused before its first frame, it made none");
+    // Resumed: it finishes, as long as the other.
+    client.jobs().pause(a, false);
+    client.jobs().wait_idle();
+    assert_eq!(state(a).state, JobState::Done);
+    let probe = |n: &str| {
+        use ve_ports::MediaBackend;
+        let r = ve_ports::Resolved { path: Some(dir.join(n)), guard: Box::new(()) };
+        media_ffmpeg::Ffmpeg::new().probe(&r).unwrap().duration.as_seconds_f64()
+    };
+    assert!((probe("a.mov") - probe("b.mov")).abs() < 0.05, "a: {} s, b: {} s", probe("a.mov"), probe("b.mov"));
+    assert!(state(a).ran.is_some() && !client.jobs().active());
+}
+
+/// Cancelled the moment it starts: never Done, and nothing left on disk
+/// (it was once marked Cancelled and then overwritten by Done when the
+/// export, started anyway, finished).
+#[test]
+fn a_job_cancelled_as_it_starts_makes_nothing() {
+    let Some((client, dir, gpu)) = queue_setup("jobs_cancel") else { return eprintln!("skipped: no ffmpeg CLI or GPU") };
+    client.enable_jobs(gpu, None);
+    for n in 0..5 {
+        let name = format!("c{n}.mov");
+        let id = client.queue_export(ExportPreset::ProResMov, MediaRef(format!("file:{}", dir.join(&name).display())));
+        client.jobs().cancel(id);
+        client.jobs().wait_idle();
+        let s = client.jobs().list().into_iter().find(|j| j.id == id).unwrap().state;
+        assert_eq!(s, JobState::Cancelled);
+        assert!(!dir.join(&name).exists(), "a cancelled export left {name}");
+    }
 }
