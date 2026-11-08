@@ -247,9 +247,14 @@ fn export_renders_the_in_out_range() {
     let client = e.spawn(Arc::new(|| {}));
     let out = tmp("inout-out").join("range.mov");
     let job = client.export(gpu, ExportPreset::ProResMov, MediaRef(format!("file:{}", out.display())), None);
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    // Fails only when it stops making progress: on a CI runner with a
+    // software GPU, healthy exports take minutes when tests run side by side.
+    let (mut seen, mut since) = (job.progress(), std::time::Instant::now());
     while job.result().is_none() {
-        assert!(std::time::Instant::now() < deadline, "export hung");
+        if job.progress() != seen {
+            (seen, since) = (job.progress(), std::time::Instant::now());
+        }
+        assert!(since.elapsed() < Duration::from_secs(60), "export stalled at {:.0}%", seen * 100.0);
         std::thread::sleep(Duration::from_millis(20));
     }
     job.result().unwrap().unwrap();

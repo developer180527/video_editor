@@ -38,6 +38,45 @@ fn generated(name: &str, args: &[&str]) -> Option<PathBuf> {
     Some(p)
 }
 
+/// Wait for `job` to end, calling `each` meanwhile. Fails only when it
+/// stops making progress: on a shared CI runner whose GPU is software
+/// (WARP) the GPU tests run side by side on a few cores, and a healthy
+/// export there was measured at 71% after a minute.
+fn finish(job: &ExportState, mut each: impl FnMut()) -> Result<(), String> {
+    const STALL: Duration = Duration::from_secs(60);
+    let (mut seen, mut since) = (job.progress(), std::time::Instant::now());
+    loop {
+        if let Some(r) = job.result() {
+            return r;
+        }
+        if job.progress() != seen {
+            (seen, since) = (job.progress(), std::time::Instant::now());
+        }
+        assert!(since.elapsed() < STALL, "export stalled at {:.0}%", seen * 100.0);
+        each();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `jobs.wait_idle()`, failing (instead of blocking CI for hours) when no
+/// job makes progress or changes state for a minute.
+fn wait_idle(jobs: &Jobs) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let j = jobs.clone();
+    std::thread::spawn(move || {
+        j.wait_idle();
+        let _ = tx.send(());
+    });
+    let look = || (jobs.version(), jobs.list().iter().map(|j| (j.progress * 1000.0) as u64).sum::<u64>());
+    let (mut seen, mut since) = (look(), std::time::Instant::now());
+    while rx.recv_timeout(Duration::from_millis(100)).is_err() {
+        if look() != seen {
+            (seen, since) = (look(), std::time::Instant::now());
+        }
+        assert!(since.elapsed() < Duration::from_secs(60), "jobs stalled: {:?}", jobs.list().iter().map(|j| (&j.title, &j.state, j.progress)).collect::<Vec<_>>());
+    }
+}
+
 fn clip() -> Option<PathBuf> {
     generated("render_src.mov", &["-f", "lavfi", "-i", "smptebars=size=640x360:rate=25:duration=3", "-c:v", "mpeg4", "-q:v", "2"])
 }
@@ -137,14 +176,7 @@ fn export_h264_with_audio() {
     let out = dir.join("out.mp4");
     let client = e.spawn(Arc::new(|| {}));
     let job = client.export(gpu, ExportPreset::H264Mp4, MediaRef(format!("file:{}", out.display())), None);
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let result = loop {
-        if let Some(r) = job.result() {
-            break r;
-        }
-        assert!(std::time::Instant::now() < deadline, "export hung at {:.0}%", job.progress() * 100.0);
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let result = finish(&job, || {});
     if let Err(e) = &result {
         if e.contains("encoder works here") {
             // No GPU media engine on this machine (a CI runner); the export
@@ -216,17 +248,11 @@ fn export_fails_on_missing_media_and_ignores_the_preview() {
     let run = |gpu, name: &str| {
         // ProRes: encoded in software, so this runs on any machine.
         let job = client.export(gpu, ExportPreset::ProResMov, MediaRef(format!("file:{}", dir.join(name).display())), None);
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            assert!(std::time::Instant::now() < deadline, "export hung at {:.0}%", job.progress() * 100.0);
-            // The preview keeps asking for the frame at the playhead.
+        // The preview keeps asking for the frame at the playhead.
+        finish(&job, || {
             client.seek(Time::from_seconds(1));
             let _ = client.frame(Quality::FULL);
-            if let Some(r) = job.result() {
-                break r;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        })
     };
     run(gpu.clone(), "ok.mov").unwrap();
     // The file goes away. (Windows will not delete a file the engine has
@@ -286,15 +312,7 @@ fn prores_export_keeps_ten_bits() {
     let out = dir.join("grad.mov");
     let client = e.spawn(Arc::new(|| {}));
     let job = client.export(gpu, ExportPreset::ProResMov, MediaRef(format!("file:{}", out.display())), None);
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let result = loop {
-        if let Some(r) = job.result() {
-            break r;
-        }
-        assert!(std::time::Instant::now() < deadline, "export hung");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    result.unwrap();
+    finish(&job, || {}).unwrap();
 
     use ve_ports::{MediaBackend, Resolved};
     let mut d = media_ffmpeg::Ffmpeg::new().open_video(&Resolved { path: Some(out), guard: Box::new(()) }).unwrap();
@@ -338,7 +356,7 @@ fn create_proxies_makes_and_attaches_a_small_copy() {
     let ids = client.queue_proxies(vec![asset], 540);
     assert_eq!(ids.len(), 1);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    client.jobs().wait_idle();
+    wait_idle(client.jobs());
     let job = client.jobs().list().into_iter().find(|j| j.id == ids[0]).unwrap();
     assert_eq!((job.kind, job.title.as_str()), ("Proxy", "proxy_src.mov"));
     assert_eq!(job.state, JobState::Done, "{:?}", job.state);
@@ -409,7 +427,7 @@ fn the_job_queue_runs_holds_and_cancels_exports() {
     assert_eq!(state(second), JobState::Queued, "one at a time");
     assert_eq!(client.jobs().list().iter().find(|j| j.id == first).unwrap().progress, 0.0, "held before its first frame");
     client.stop();
-    client.jobs().wait_idle();
+    wait_idle(client.jobs());
     assert_eq!((state(first), state(second), state(third)), (JobState::Done, JobState::Done, JobState::Cancelled));
     assert!(dir.join("first.mov").exists() && dir.join("second.mov").exists());
     assert!(!dir.join("third.mov").exists(), "a job cancelled before it ran made nothing");
@@ -463,13 +481,13 @@ fn a_paused_job_yields_and_resumes_where_it_stopped() {
     // Paused: the second takes its turn and finishes.
     client.jobs().pause(a, true);
     client.stop();
-    client.jobs().wait_idle();
+    wait_idle(client.jobs());
     assert_eq!(state(a).state, JobState::Paused);
     assert_eq!(state(b).state, JobState::Done, "the queue went on past the paused job");
     assert_eq!(state(a).progress, 0.0, "paused before its first frame, it made none");
     // Resumed: it finishes, as long as the other.
     client.jobs().pause(a, false);
-    client.jobs().wait_idle();
+    wait_idle(client.jobs());
     assert_eq!(state(a).state, JobState::Done);
     let probe = |n: &str| {
         use ve_ports::MediaBackend;
@@ -491,7 +509,7 @@ fn a_job_cancelled_as_it_starts_makes_nothing() {
         let name = format!("c{n}.mov");
         let id = client.queue_export(ExportPreset::ProResMov, MediaRef(format!("file:{}", dir.join(&name).display())));
         client.jobs().cancel(id);
-        client.jobs().wait_idle();
+        wait_idle(client.jobs());
         let s = client.jobs().list().into_iter().find(|j| j.id == id).unwrap().state;
         assert_eq!(s, JobState::Cancelled);
         assert!(!dir.join(&name).exists(), "a cancelled export left {name}");
