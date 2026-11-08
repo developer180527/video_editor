@@ -1,6 +1,6 @@
 //! Encoding: H.264 / HEVC on the GPU's media engine — whichever this
-//! machine has (see [`video_encoders`]) — ProRes 422 HQ through FFmpeg's own
-//! (LGPL) encoder, AAC audio, into MP4 or MOV.
+//! machine has (see [`video_encoders`]) — ProRes (Proxy to 4444) through
+//! FFmpeg's own (LGPL) encoder, AAC audio, into MP4 or MOV.
 //!
 //! Video arrives as display-encoded RGBA — 16 bits per channel from export,
 //! 8 from elsewhere — and leaves as Rec.709 YCbCr at the codec's depth
@@ -27,11 +27,14 @@ struct Stream {
 }
 
 /// Pixel formats to offer encoder `name`, deepest first: ProRes is 10-bit
-/// 4:2:2; HEVC is 10-bit (Main 10) where the encoder can, else 8-bit; H.264
-/// is 8-bit (10-bit H.264 is rarely supported by hardware or players).
-fn pixel_formats(name: &str) -> &'static [sys::AVPixelFormat] {
+/// 4:2:2 (4:4:4 for ProRes 4444); HEVC is 10-bit (Main 10) where the encoder
+/// can, else 8-bit; H.264 is 8-bit (10-bit H.264 is rarely supported by
+/// hardware or players).
+fn pixel_formats(name: &str, profile: Option<&str>) -> &'static [sys::AVPixelFormat] {
     use sys::AVPixelFormat::*;
-    if name == "prores_ks" {
+    if name == "prores_ks" && profile.is_some_and(|p| p.starts_with("4444")) {
+        &[AV_PIX_FMT_YUV444P10LE]
+    } else if name == "prores_ks" {
         &[AV_PIX_FMT_YUV422P10LE]
     } else if name == "mpeg4" {
         &[AV_PIX_FMT_YUV420P]
@@ -145,7 +148,7 @@ impl FfEncoder {
     unsafe fn add_video(&mut self, s: &EncoderSettings) -> Result<Stream, MediaError> {
         let mut tried = Vec::new();
         for &(name, device, opts) in video_encoders(&s.video_codec) {
-            for &pix in pixel_formats(name) {
+            for &pix in pixel_formats(name, s.profile.as_deref()) {
                 match unsafe { self.try_video(s, name, device, opts, pix) } {
                     Ok(st) => return Ok(st),
                     Err(e) => tried.push(format!("{name} ({pix:?}): {e}")),
@@ -189,8 +192,11 @@ impl FfEncoder {
             } else {
                 pixels * 10 // ~20 Mb/s at 1080p
             }) as i64;
-            for (k, v) in opts {
-                let (k, v) = (CString::new(*k).unwrap(), CString::new(*v).unwrap());
+            // The candidate's own options, then the profile asked for (which
+            // replaces a default profile among them).
+            let profile = s.profile.as_deref().map(|p| ("profile", p));
+            for (k, v) in opts.iter().copied().chain(profile) {
+                let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
                 sys::av_opt_set((*ctx).priv_data, k.as_ptr(), v.as_ptr(), 0);
             }
             if (*(*self.oc).oformat).flags & sys::AVFMT_GLOBALHEADER as c_int != 0 {

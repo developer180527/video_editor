@@ -116,8 +116,14 @@ fn encode(codec: &str, container: &str) -> Option<ve_model::MediaInfo> {
 
 /// As `encode`, feeding 16-bit frames when `deep`; also returns the path.
 fn encode_frames(codec: &str, container: &str, deep: bool) -> Option<(ve_model::MediaInfo, PathBuf)> {
+    encode_profile(codec, None, container, deep)
+}
+
+/// As `encode_frames`, in codec profile `profile`.
+fn encode_profile(codec: &str, profile: Option<&str>, container: &str, deep: bool) -> Option<(ve_model::MediaInfo, PathBuf)> {
     use ve_ports::*;
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("encode_test_{codec}{}.{container}", if deep { "_deep" } else { "" }));
+    let name = format!("encode_test_{codec}{}{}.{container}", profile.map(|p| format!("_{p}")).unwrap_or_default(), if deep { "_deep" } else { "" });
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let settings = EncoderSettings {
         video_codec: codec.into(),
         audio_codec: "aac".into(),
@@ -128,6 +134,7 @@ fn encode_frames(codec: &str, container: &str, deep: bool) -> Option<(ve_model::
         sample_rate: 48_000,
         channels: 2,
         video_bitrate: None,
+        profile: profile.map(Into::into),
         prefer_hardware: true,
     };
     let out = Resolved { path: Some(path.clone()), guard: Box::new(()) };
@@ -191,6 +198,23 @@ fn encode_h264_mp4_round_trips() {
     assert_eq!(info.audio[0].codec, "aac");
     let secs = info.duration.as_seconds_f64();
     assert!((1.9..2.2).contains(&secs), "{secs}");
+}
+
+/// Each ProRes profile is written as itself: the MOV's sample entry holds
+/// the flavour's four-character code (what Final Cut, Resolve and
+/// QuickTime read), the files grow with the profile, and each decodes.
+#[test]
+fn prores_profiles_are_what_they_say() {
+    let mut last = 0;
+    for (profile, fourcc) in [("proxy", b"apco"), ("lt", b"apcs"), ("standard", b"apcn"), ("hq", b"apch"), ("4444", b"ap4h")] {
+        let (_, path) = encode_profile("prores", Some(profile), "mov", true).expect("ProRes is encoded in software everywhere");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.windows(4).any(|w| w == fourcc), "ProRes {profile} is tagged {}", String::from_utf8_lossy(fourcc));
+        assert!(bytes.len() > last, "ProRes {profile} ({} bytes) is larger than the profile below it ({last})", bytes.len());
+        last = bytes.len();
+        let mut d = Ffmpeg::new().open_video(&Resolved { path: Some(path), guard: Box::new(()) }).unwrap();
+        assert!(d.next_frame().unwrap().is_some(), "ProRes {profile} decodes");
+    }
 }
 
 #[test]
@@ -399,6 +423,7 @@ fn mpeg4_encodes_where_nothing_else_does() {
         sample_rate: 48_000,
         channels: 2,
         video_bitrate: Some(500_000),
+        profile: None,
         prefer_hardware: false,
     };
     let ff = Ffmpeg::new();

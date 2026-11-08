@@ -685,7 +685,7 @@ impl EditorUi {
 
     /// Export to `path` with the chosen preset (after the host's save dialog).
     pub fn start_export(&mut self, path: &std::path::Path) {
-        let preset = ve_engine::ExportPreset::ALL[self.export_preset.min(2)];
+        let preset = ve_engine::ExportPreset::ALL[self.export_preset.min(ve_engine::ExportPreset::ALL.len() - 1)];
         let mut p = path.to_path_buf();
         if p.extension().is_none() {
             p.set_extension(preset.extension());
@@ -714,6 +714,9 @@ impl EditorUi {
             ui.space(6.0);
             ui.combo("Format", &mut preset, &presets);
             ui.space(4.0);
+            if let (Some(s), Some(p)) = (&seq, ve_engine::ExportPreset::ALL.get(preset)) {
+                ui.label_muted(&p.summary(s.format.width, s.format.height, s.format.rate.as_f64()));
+            }
             ui.label_muted("Video is encoded in Rec.709; audio as AAC, 48 kHz stereo.");
             ui.space(10.0);
             ui.row(|ui| {
@@ -728,7 +731,7 @@ impl EditorUi {
         }
         if go || r.submitted {
             self.show_export = false;
-            let p = ve_engine::ExportPreset::ALL[preset];
+            let p = ve_engine::ExportPreset::ALL[preset.min(ve_engine::ExportPreset::ALL.len() - 1)];
             let empty = seq.as_ref().is_none_or(|s| s.duration() == Time::ZERO);
             if empty {
                 self.errors.push("Nothing to export: the sequence is empty.".into());

@@ -157,6 +157,9 @@ pub struct EncoderSettings {
     pub sample_rate: u32,
     pub channels: u16,
     pub video_bitrate: Option<u64>,
+    /// The codec's profile, by its usual short name (ProRes: "proxy", "lt",
+    /// "standard", "hq", "4444"). `None`: the backend's choice (ProRes 422 HQ).
+    pub profile: Option<String>,
     pub prefer_hardware: bool,
 }
 

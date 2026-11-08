@@ -18,39 +18,118 @@ use ve_ports::{AudioBlock, ColorTags, EncoderSettings, FrameData, PixelFormat, P
 use ve_render::{Compositor, Quality};
 use ve_time::Time;
 
+/// What an export is encoded as. Video is Rec.709 at the sequence's size
+/// and rate; audio is AAC, 48 kHz stereo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportPreset {
+    /// H.264, about 20 Mb/s at 1080p: plays everywhere.
     H264Mp4,
+    /// H.264, about 50 Mb/s at 1080p: for uploading to sites that encode
+    /// again (each generation loses less).
+    H264Mp4High,
+    /// HEVC, 10-bit where the encoder can, about 12 Mb/s at 1080p.
     HevcMp4,
+    /// HEVC, about 30 Mb/s at 1080p.
+    HevcMp4High,
+    /// ProRes 422 Proxy: offline edits, reviews.
+    ProResProxy,
+    /// ProRes 422 LT.
+    ProResLt,
+    /// ProRes 422.
+    ProRes422,
+    /// ProRes 422 HQ: the master.
     ProResMov,
+    /// ProRes 4444: full-resolution colour (4:4:4) for grading and effects
+    /// work elsewhere.
+    ProRes4444,
     /// A proxy: small H.264 for smooth previews (not offered as an export).
     Proxy,
 }
 
 impl ExportPreset {
-    pub const ALL: [ExportPreset; 3] = [ExportPreset::H264Mp4, ExportPreset::HevcMp4, ExportPreset::ProResMov];
+    /// The presets offered for export, in the order shown.
+    pub const ALL: [ExportPreset; 9] = [
+        ExportPreset::H264Mp4,
+        ExportPreset::H264Mp4High,
+        ExportPreset::HevcMp4,
+        ExportPreset::HevcMp4High,
+        ExportPreset::ProResProxy,
+        ExportPreset::ProResLt,
+        ExportPreset::ProRes422,
+        ExportPreset::ProResMov,
+        ExportPreset::ProRes4444,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             ExportPreset::H264Mp4 => "H.264 (MP4)",
+            ExportPreset::H264Mp4High => "H.264, high bitrate (MP4)",
             ExportPreset::HevcMp4 => "HEVC (MP4)",
+            ExportPreset::HevcMp4High => "HEVC, high bitrate (MP4)",
+            ExportPreset::ProResProxy => "Apple ProRes 422 Proxy (MOV)",
+            ExportPreset::ProResLt => "Apple ProRes 422 LT (MOV)",
+            ExportPreset::ProRes422 => "Apple ProRes 422 (MOV)",
             ExportPreset::ProResMov => "Apple ProRes 422 HQ (MOV)",
+            ExportPreset::ProRes4444 => "Apple ProRes 4444 (MOV)",
             ExportPreset::Proxy => "Proxy (H.264)",
         }
     }
 
     pub fn extension(self) -> &'static str {
-        match self {
-            ExportPreset::ProResMov => "mov",
+        match self.codec() {
+            "prores" => "mov",
             _ => "mp4",
         }
     }
 
     fn codec(self) -> &'static str {
         match self {
-            ExportPreset::H264Mp4 | ExportPreset::Proxy => "h264",
-            ExportPreset::HevcMp4 => "hevc",
-            ExportPreset::ProResMov => "prores",
+            ExportPreset::H264Mp4 | ExportPreset::H264Mp4High | ExportPreset::Proxy => "h264",
+            ExportPreset::HevcMp4 | ExportPreset::HevcMp4High => "hevc",
+            ExportPreset::ProResProxy | ExportPreset::ProResLt | ExportPreset::ProRes422 | ExportPreset::ProResMov | ExportPreset::ProRes4444 => {
+                "prores"
+            }
+        }
+    }
+
+    /// The codec profile (ProRes' flavour); `None` for the codec's default.
+    fn profile(self) -> Option<&'static str> {
+        match self {
+            ExportPreset::ProResProxy => Some("proxy"),
+            ExportPreset::ProResLt => Some("lt"),
+            ExportPreset::ProRes422 => Some("standard"),
+            ExportPreset::ProResMov => Some("hq"),
+            ExportPreset::ProRes4444 => Some("4444"),
+            _ => None,
+        }
+    }
+
+    /// The video bitrate for a `width`×`height` picture at `fps`, for the
+    /// codecs that take one (ProRes sets its own by profile).
+    pub fn video_bitrate(self, width: u32, height: u32, fps: f64) -> Option<u64> {
+        let pixels = width as f64 * height as f64;
+        let per_pixel = match self {
+            ExportPreset::H264Mp4 => 10.0,
+            ExportPreset::H264Mp4High => 24.0,
+            ExportPreset::HevcMp4 => 6.0,
+            ExportPreset::HevcMp4High => 15.0,
+            // Proxies: about 0.12 bits a pixel — light to decode, fine to cut with.
+            ExportPreset::Proxy => return Some((pixels * fps * 0.12) as u64),
+            _ => return None,
+        };
+        Some((pixels * per_pixel) as u64)
+    }
+
+    /// One line for the export dialog: what this preset makes of a
+    /// `width`×`height` sequence at `fps`.
+    pub fn summary(self, width: u32, height: u32, fps: f64) -> String {
+        if let Some(b) = self.video_bitrate(width, height, fps) {
+            let depth = if self.codec() == "hevc" { "10-bit where this machine's encoder can, else 8-bit" } else { "8-bit" };
+            return format!("About {:.0} Mb/s, {depth} 4:2:0.", b as f64 / 1e6);
+        }
+        match self {
+            ExportPreset::ProRes4444 => "10-bit 4:4:4, intra-frame: large files.".into(),
+            _ => "10-bit 4:2:2, intra-frame: large files, light to edit.".into(),
         }
     }
 }
@@ -255,8 +334,8 @@ fn run(
         rate: f.rate,
         sample_rate: SAMPLE_RATE,
         channels: 2,
-        // Proxies: about 0.12 bits a pixel — light to decode, fine to cut with.
-        video_bitrate: (preset == ExportPreset::Proxy).then(|| (f.width as f64 * f.height as f64 * f.rate.as_f64() * 0.12) as u64),
+        video_bitrate: preset.video_bitrate(f.width, f.height, f.rate.as_f64()),
+        profile: preset.profile().map(Into::into),
         prefer_hardware: true,
     };
     let target = platform.storage.resolve_new(out).map_err(|e| e.to_string())?;
@@ -329,4 +408,25 @@ fn run(
         encode(&mut *enc, last, at)?;
     }
     enc.finish().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every offered preset names a container its codec fits, and the dialog
+    /// can describe it; ProRes takes no bitrate (its profile sets one).
+    #[test]
+    fn presets_are_consistent() {
+        for p in ExportPreset::ALL {
+            assert_eq!(p.extension(), if p.codec() == "prores" { "mov" } else { "mp4" }, "{p:?}");
+            assert_eq!(p.video_bitrate(1920, 1080, 25.0).is_none(), p.codec() == "prores", "{p:?}");
+            assert_eq!(p.profile().is_some(), p.codec() == "prores", "{p:?}");
+            assert!(!p.summary(1920, 1080, 25.0).is_empty());
+        }
+        assert!(!ExportPreset::ALL.contains(&ExportPreset::Proxy), "proxies are not offered as an export");
+        let labels: std::collections::HashSet<_> = ExportPreset::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels.len(), ExportPreset::ALL.len(), "every preset has its own name");
+        assert_eq!(ExportPreset::H264Mp4.summary(1920, 1080, 25.0), "About 21 Mb/s, 8-bit 4:2:0.");
+    }
 }
