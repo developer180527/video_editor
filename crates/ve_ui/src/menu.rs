@@ -242,11 +242,11 @@ impl EditorUi {
             Action::LinkMedia => self.requests.extend(self.view.selected_asset.map(HostRequest::RelinkMedia)),
             Action::Export => self.show_export = true,
             Action::Undo => {
-                self.pending_marks = None;
+                (self.pending_marks, self.pending_band) = (None, None);
                 self.engine.undo()
             }
             Action::Redo => {
-                self.pending_marks = None;
+                (self.pending_marks, self.pending_band) = (None, None);
                 self.engine.redo()
             }
             Action::Speed => self.open_speed_dialog(),

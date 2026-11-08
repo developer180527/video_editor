@@ -396,19 +396,6 @@ fn rubber_band_keyframes_on_clips() {
     // Down by a few pixels: a lower constant level, one undo step.
     click(&mut ui, &mut app, Vec2::new(x, y), Some(Vec2::new(x, y + 8.0)));
     wait(&app.engine, |a| matches!(op(a), Param::Constant(Value::Float(v)) if v < 100.0));
-    // The drag's steps reach the engine one by one: read the level once it
-    // has settled, not at the first step below 100 (a slow machine).
-    let mut lowered = f64::NAN;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let Param::Constant(Value::Float(v)) = opacity(&app) else { panic!() };
-        if v == lowered {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the level never settled");
-        lowered = v;
-        std::thread::sleep(Duration::from_millis(100));
-    }
     // Pen: a click on the line adds a key there.
     app.view.tool = ve_ui::Tool::Pen;
     let line_y = y + 8.0;
@@ -416,7 +403,17 @@ fn rubber_band_keyframes_on_clips() {
     wait(&app.engine, |a| matches!(op(a), Param::Animated(_)));
     let Param::Animated(keys) = opacity(&app) else { panic!() };
     assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0].value, Value::Float(lowered), "the key holds the level that was there");
+    // The drag's steps reach the engine one by one, so the level read while
+    // it lands may be a step behind (a slow machine). The engine takes
+    // requests in order: once the key is there the drag has landed, and
+    // undoing the key gives back exactly the level it was added on.
+    app.engine.undo();
+    wait(&app.engine, |a| matches!(op(a), Param::Constant(_)));
+    let Param::Constant(lowered) = opacity(&app) else { panic!() };
+    assert!(matches!(lowered, Value::Float(v) if v < 100.0), "the drag lowered the level: {lowered:?}");
+    assert_eq!(keys[0].value, lowered, "the key holds the level that was there");
+    app.engine.redo();
+    wait(&app.engine, |a| matches!(op(a), Param::Animated(k) if k.len() == 1));
     // A second key, then drag it up to the top: the line now ramps.
     click(&mut ui, &mut app, Vec2::new(at(7.0), line_y), Some(Vec2::new(at(7.0), line_y - 60.0)));
     wait(&app.engine, |a| matches!(op(a), Param::Animated(k) if k.len() == 2 && k[1].value == Value::Float(100.0)));

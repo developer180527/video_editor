@@ -378,8 +378,30 @@ fn band_drag(app: &mut EditorUi, snap_proj: &Project, seq: &Sequence, rows: &[Ro
         _ => return,
     };
     if bands::stored(c, tg) != Some(&next) {
-        let cmd = Command::SetEffectParam { clip: c.id, effect: tg.effect, param: tg.param.into(), value: Some(next) };
-        app.engine.execute_merging(cmd, app.drag_gesture);
+        send_band(app, c.id, tg, next);
+    }
+}
+
+/// Set a band's level, as part of the current drag gesture.
+fn send_band(app: &mut EditorUi, clip: ClipId, tg: bands::Target, level: Param) {
+    app.pending_band = Some((clip, tg.effect, level.clone(), std::time::Instant::now()));
+    let cmd = Command::SetEffectParam { clip, effect: tg.effect, param: tg.param.into(), value: Some(level) };
+    app.engine.execute_merging(cmd, app.drag_gesture);
+}
+
+/// The band's level as last sent: a drag's last steps may not be published
+/// yet, and a press built on the published level would put it back (a key
+/// added right after a drag would hold a level from the middle of it).
+fn band_level(app: &mut EditorUi, c: &Clip, tg: bands::Target) -> Option<Param> {
+    let published = bands::stored(c, tg)?;
+    match &app.pending_band {
+        Some((clip, effect, level, at)) if (*clip, *effect) == (c.id, tg.effect) && level != published && at.elapsed().as_secs_f32() < 1.0 => {
+            Some(level.clone())
+        }
+        _ => {
+            app.pending_band = None;
+            Some(published.clone())
+        }
     }
 }
 
@@ -393,7 +415,7 @@ fn band_press(app: &mut EditorUi, snap_proj: &Project, seq: &Sequence, g: &Geo, 
     };
     let (s, ti, c) = snap_proj.find_clip(clip_id)?;
     let tg = bands::target(c, s.tracks[ti].kind)?;
-    let p = bands::stored(c, tg)?.clone();
+    let p = band_level(app, c, tg)?;
     app.view.selection = if app.view.linked { edit::linked(snap_proj, clip_id) } else { vec![clip_id] };
     if let Some(i) = app.view.selection.iter().position(|x| *x == clip_id) {
         app.view.selection.swap(0, i);
@@ -404,8 +426,7 @@ fn band_press(app: &mut EditorUi, snap_proj: &Project, seq: &Sequence, g: &Geo, 
         Some(i) => i,
         None if add => {
             let (keys, i) = bands::add_key(&p, at, seq.format.rate);
-            let cmd = Command::SetEffectParam { clip: c.id, effect: tg.effect, param: tg.param.into(), value: Some(Param::Animated(keys.clone())) };
-            app.engine.execute_merging(cmd, app.drag_gesture);
+            send_band(app, c.id, tg, Param::Animated(keys.clone()));
             app.view.band_orig = Some(Param::Animated(keys));
             app.view.graph_key = Some(crate::graph::GraphKey { effect: tg.effect, param: tg.param.into(), index: i });
             return Some(Drag::BandKey { clip: clip_id, index: i });

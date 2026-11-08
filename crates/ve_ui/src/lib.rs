@@ -308,6 +308,9 @@ pub struct EditorUi {
     pub(crate) source_seek_on_open: Option<(AssetId, Time)>,
     /// The marks last sent, until the engine publishes them.
     pub(crate) pending_marks: Option<(ve_engine::MarksOwner, Marks, std::time::Instant)>,
+    /// The rubber band level last sent (clip, its Opacity or Volume, the
+    /// level), until the engine publishes it.
+    pub(crate) pending_band: Option<(ClipId, EffectId, Param, std::time::Instant)>,
     /// Where the last keyframe graph was drawn (tests aim at it).
     pub(crate) graph_rect: Option<Rect>,
     /// Where the Program monitor's picture was drawn (tests aim at it).
@@ -425,6 +428,7 @@ impl EditorUi {
             seek_after_edit: None,
             source_seek_on_open: None,
             pending_marks: None,
+            pending_band: None,
             graph_rect: None,
             monitor_rect: None,
             graphics_wanted: false,
@@ -1163,10 +1167,10 @@ impl EditorUi {
         let key = |ui: &mut Ui, k: Key| ui.consume_shortcut(Shortcut::plain(k));
 
         if cmd_shift(ui, Key::Z) {
-            self.pending_marks = None;
+            (self.pending_marks, self.pending_band) = (None, None);
             self.engine.redo();
         } else if cmd(ui, Key::Z) {
-            self.pending_marks = None;
+            (self.pending_marks, self.pending_band) = (None, None);
             self.engine.undo();
         }
         if cmd(ui, Key::I) {
