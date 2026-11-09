@@ -192,6 +192,8 @@ struct Decode {
     p0: vec4<f32>,
     p1: vec4<f32>,
     p2: vec4<f32>,
+    // x: texels per side averaged into each pixel (fs_decode_box).
+    boxf: vec4<f32>,
 };
 "#;
 
@@ -247,10 +249,9 @@ const DECODE: &str = r#"
 @group(0) @binding(2) var chroma: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 
-@fragment
-fn fs_decode(i: VsOut) -> @location(0) vec4<f32> {
-    let y = (textureSample(luma, samp, i.uv).r - d.range.x) * d.range.y;
-    let c = (textureSample(chroma, samp, i.uv).rg - vec2<f32>(d.p0.w, d.p0.w)) * d.range.z;
+fn to_working(luma_code: f32, chroma_code: vec2<f32>) -> vec3<f32> {
+    let y = (luma_code - d.range.x) * d.range.y;
+    let c = (chroma_code - vec2<f32>(d.p0.w, d.p0.w)) * d.range.z;
     let m = mat3x3<f32>(d.m0.xyz, d.m1.xyz, d.m2.xyz);
     let encoded = clamp(m * vec3<f32>(y, c.x, c.y), vec3<f32>(0.0), vec3<f32>(1.0));
     let p = mat3x3<f32>(d.p0.xyz, d.p1.xyz, d.p2.xyz);
@@ -258,7 +259,32 @@ fn fs_decode(i: VsOut) -> @location(0) vec4<f32> {
     if (d.range.w > 1.5 && d.range.w < 3.5) {
         lin = vec3<f32>(shoulder(lin.r), shoulder(lin.g), shoulder(lin.b));
     }
-    return vec4<f32>(lin, 1.0);
+    return lin;
+}
+
+@fragment
+fn fs_decode(i: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(to_working(textureSample(luma, samp, i.uv).r, textureSample(chroma, samp, i.uv).rg), 1.0);
+}
+
+// Decoded straight to a mip level: each pixel the mean of the f×f texels
+// under it, each decoded as fs_decode would (so the result is the level the
+// mip chain makes from a whole decode, without writing the whole picture).
+@fragment
+fn fs_decode_box(i: VsOut) -> @location(0) vec4<f32> {
+    let f = u32(d.boxf.x);
+    let dims = textureDimensions(luma);
+    let size = vec2<f32>(dims);
+    let origin = vec2<u32>(floor(i.position.xy)) * f;
+    var sum = vec3<f32>(0.0);
+    for (var y = 0u; y < f; y++) {
+        for (var x = 0u; x < f; x++) {
+            let t = min(origin + vec2<u32>(x, y), dims - vec2<u32>(1u));
+            let uv = (vec2<f32>(t) + 0.5) / size;
+            sum += to_working(textureLoad(luma, t, 0).r, textureSampleLevel(chroma, samp, uv, 0.0).rg);
+        }
+    }
+    return vec4<f32>(sum / f32(f * f), 1.0);
 }
 "#;
 
@@ -533,9 +559,9 @@ struct Slot {
     pair: Option<[LayerTex; 2]>,
     /// Width, height and mip levels of `pair`.
     pair_key: (u32, u32, u32),
-    decode_buf: wgpu::Buffer,
-    quad_buf: wgpu::Buffer,
-    effect_bufs: Vec<wgpu::Buffer>,
+    decode_buf: Uniform,
+    quad_buf: Uniform,
+    effect_bufs: Vec<Uniform>,
     decode_bg: Option<wgpu::BindGroup>,
     /// By which texture of the pair is composited.
     quad_bg: [Option<wgpu::BindGroup>; 2],
@@ -557,23 +583,44 @@ struct Slot {
     trans_key: (u32, u32, u32),
     trans_mip_bg: [Vec<wgpu::BindGroup>; 2],
     trans_mix: Option<Target>,
-    trans_buf: wgpu::Buffer,
+    trans_buf: Uniform,
     /// The whole-frame quad that lays a transition's mix down.
-    ident_buf: wgpu::Buffer,
+    ident_buf: Uniform,
 }
 
-const DECODE_BYTES: u64 = 7 * 16;
+const DECODE_BYTES: u64 = 8 * 16;
 const QUAD_BYTES: u64 = 5 * 16;
 const EFFECT_BYTES: u64 = (64 * 4 + 4) * 4;
 const DISPLAY_BYTES: u64 = 3 * 16;
 
-fn uniform_buf(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
+fn uniform_buf(device: &wgpu::Device, size: u64) -> Uniform {
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("uniform"),
         size,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    })
+    });
+    Uniform { buf, held: Vec::new() }
+}
+
+/// A uniform buffer that remembers what it holds. A steady frame (playing
+/// one clip, the same grade) writes the same values again, and every
+/// `write_buffer` is a staging allocation plus a GPU copy in a command
+/// buffer of its own: skipped when nothing changed.
+struct Uniform {
+    buf: wgpu::Buffer,
+    held: Vec<f32>,
+}
+
+impl Uniform {
+    fn set(&mut self, queue: &wgpu::Queue, v: &[f32]) {
+        let same = self.held.len() == v.len() && self.held.iter().zip(v).all(|(a, b)| a.to_bits() == b.to_bits());
+        if !same {
+            queue.write_buffer(&self.buf, 0, &floats(v));
+            self.held.clear();
+            self.held.extend_from_slice(v);
+        }
+    }
 }
 
 impl Slot {
@@ -686,6 +733,7 @@ pub struct Compositor {
     sixteen_bit: bool,
     sampler: wgpu::Sampler,
     decode: wgpu::RenderPipeline,
+    decode_box: wgpu::RenderPipeline,
     decode_rgba: wgpu::RenderPipeline,
     decode_layout: wgpu::BindGroupLayout,
     one_layout: wgpu::BindGroupLayout,
@@ -694,6 +742,13 @@ pub struct Compositor {
     display_deep: wgpu::RenderPipeline,
     /// Render the output at 16 bits ([`DEEP_FORMAT`]) instead of 8.
     deep_output: bool,
+    /// Small pictures decoded straight to their mip level (tests compare
+    /// with the whole decode).
+    box_decode: bool,
+    /// Targets that start transparent and have not been drawn over yet: the
+    /// first pass over one clears it (on Metal every pass is a command
+    /// buffer, so a pass that only clears is one too many).
+    owed: Vec<wgpu::TextureView>,
     mip: wgpu::RenderPipeline,
     reduce: wgpu::RenderPipeline,
     /// Compiled effect shaders, shared with other compositors on the device.
@@ -704,10 +759,10 @@ pub struct Compositor {
     work: Option<Target>,
     out: Option<Target>,
     slots: Vec<Slot>,
-    display_buf: wgpu::Buffer,
+    display_buf: Uniform,
     display_bg: Option<wgpu::BindGroup>,
     /// Bound where a pass takes a uniform it does not use (mip passes).
-    empty_buf: wgpu::Buffer,
+    empty_buf: Uniform,
     dummy_view: wgpu::TextureView,
     /// Readback buffers returned by finished [`Readback`]s, for reuse: on a
     /// GPU with its own memory each is a host-visible allocation.
@@ -799,6 +854,7 @@ impl Compositor {
         let one_layout = mk_layout(1);
         let effect_layout = pipes.layout.clone();
         let decode = pipeline(device, &format!("{COMMON}{DECODE_STRUCT}{TRANSFER}{DECODE}"), "vs_full", "fs_decode", &decode_layout, WORKING_FORMAT, None);
+        let decode_box = pipeline(device, &format!("{COMMON}{DECODE_STRUCT}{TRANSFER}{DECODE}"), "vs_full", "fs_decode_box", &decode_layout, WORKING_FORMAT, None);
         let decode_rgba = pipeline(device, &format!("{COMMON}{DECODE_STRUCT}{TRANSFER}{RGBA_DECODE}"), "vs_full", "fs_rgba", &one_layout, WORKING_FORMAT, None);
         let composite = [Blend::Normal, Blend::Multiply, Blend::Screen, Blend::Add, Blend::Overlay]
             .into_iter()
@@ -813,6 +869,7 @@ impl Compositor {
             sixteen_bit,
             sampler,
             decode,
+            decode_box,
             decode_rgba,
             decode_layout,
             one_layout,
@@ -820,6 +877,8 @@ impl Compositor {
             display,
             display_deep,
             deep_output: false,
+            box_decode: true,
+            owed: Vec::new(),
             mip,
             reduce,
             pipes,
@@ -843,6 +902,13 @@ impl Compositor {
     /// from the full picture. The monitor stays 8-bit.
     pub fn set_deep_output(&mut self, deep: bool) {
         self.deep_output = deep;
+    }
+
+    /// Off: decode every picture whole and build its mip chain, as before
+    /// pictures shown small were decoded small. For tests.
+    #[doc(hidden)]
+    pub fn set_box_decode(&mut self, on: bool) {
+        self.box_decode = on;
     }
 
     /// Use `importer` for frames left in GPU memory by hardware decoders.
@@ -997,7 +1063,7 @@ impl Compositor {
 
     /// Bind groups for `t`'s mip passes: each level reads the one above.
     fn mip_groups(&self, device: &wgpu::Device, t: &LayerTex) -> Vec<wgpu::BindGroup> {
-        (1..=t.levels.len()).map(|l| self.bind(device, &self.one_layout, &self.empty_buf, &[if l == 1 { &t.base } else { &t.levels[l - 2] }])).collect()
+        (1..=t.levels.len()).map(|l| self.bind(device, &self.one_layout, &self.empty_buf.buf, &[if l == 1 { &t.base } else { &t.levels[l - 2] }])).collect()
     }
 
     /// Fill `t`'s levels 1.., each a 2×2 average of the level above
@@ -1024,6 +1090,14 @@ impl Compositor {
 
     /// Draw `layers` (bottom first) for `plan` and produce the monitor image.
     pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, plan: &FramePlan, layers: &[RenderLayer], seq_size: (u32, u32), space: WorkingSpace) {
+        let commands = self.encode(device, queue, plan, layers, seq_size, space);
+        queue.submit([commands]);
+    }
+
+    /// [`render`](Self::render), handing back the commands instead of
+    /// submitting them: to go in the same submission as the frame that shows
+    /// the picture (each submission is a trip to the GPU driver).
+    pub fn encode(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, plan: &FramePlan, layers: &[RenderLayer], seq_size: (u32, u32), space: WorkingSpace) -> wgpu::CommandBuffer {
         let (w, h) = (plan.width, plan.height);
         let target_usage = LAYER_USAGE | wgpu::TextureUsages::COPY_SRC;
         if Self::target(&mut self.work, device, "work", w, h, WORKING_FORMAT, target_usage) {
@@ -1033,20 +1107,20 @@ impl Compositor {
         Self::target(&mut self.out, device, "monitor", w, h, out_format, target_usage);
         let mut enc = device.create_command_encoder(&Default::default());
         let work = self.work.as_ref().unwrap().view.clone();
-        {
-            let _clear = begin(&mut enc, &work, Some(wgpu::Color::TRANSPARENT));
-        }
+        self.owed.clear();
+        self.owed.push(work.clone());
         let mut next = 0;
         self.draw(device, queue, &mut enc, &work, (w, h), layers, seq_size, space, &mut next);
+        self.pay(&mut enc, &work);
         // Display.
         let to_display = match space {
             WorkingSpace::AcesCg => ap1_to_709(),
             WorkingSpace::LinearRec709 => IDENTITY,
         };
         let u: Vec<f32> = columns(to_display).iter().flatten().copied().collect();
-        queue.write_buffer(&self.display_buf, 0, &floats(&u));
+        self.display_buf.set(queue, &u);
         if self.display_bg.is_none() {
-            self.display_bg = Some(self.bind(device, &self.one_layout, &self.display_buf, &[&self.work.as_ref().unwrap().view]));
+            self.display_bg = Some(self.bind(device, &self.one_layout, &self.display_buf.buf, &[&self.work.as_ref().unwrap().view]));
         }
         {
             let mut pass = begin(&mut enc, &self.out.as_ref().unwrap().view, Some(wgpu::Color::BLACK));
@@ -1054,7 +1128,21 @@ impl Compositor {
             pass.set_bind_group(0, self.display_bg.as_ref(), &[]);
             pass.draw(0..3, 0..1);
         }
-        queue.submit([enc.finish()]);
+        enc.finish()
+    }
+
+    /// How a pass drawing over `target` starts: cleared, if that is owed.
+    fn load(&mut self, target: &wgpu::TextureView) -> Option<wgpu::Color> {
+        let k = self.owed.iter().position(|v| v == target)?;
+        self.owed.swap_remove(k);
+        Some(wgpu::Color::TRANSPARENT)
+    }
+
+    /// Clear `target` now if nothing was drawn over it.
+    fn pay(&mut self, enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+        if let Some(c) = self.load(target) {
+            let _clear = begin(enc, target, Some(c));
+        }
     }
 
     /// The next free slot this frame. Layers take slots in drawing order —
@@ -1121,9 +1209,7 @@ impl Compositor {
         let (a, b, a_all, b_all) = (ta.base.clone(), tb.base.clone(), ta.all.clone(), tb.all.clone());
         let c = self.slots[i].trans_mix.as_ref().unwrap().view.clone();
         let (a, b, c) = (&a, &b, &c);
-        for v in [a, b] {
-            let _clear = begin(enc, v, Some(wgpu::Color::TRANSPARENT));
-        }
+        self.owed.extend([a.clone(), b.clone()]);
         let plain = |l: &RenderLayer| RenderLayer { transition: None, ..l.clone() };
         let (going, coming) = if tr.self_incoming { (None, Some(plain(layer))) } else { (Some(plain(layer)), tr.incoming.as_ref().map(plain)) };
         if let Some(l) = &going {
@@ -1132,6 +1218,8 @@ impl Compositor {
         if let Some(l) = &coming {
             self.draw_layer(device, queue, enc, b, out, l, seq_size, space, next);
         }
+        self.pay(enc, a);
+        self.pay(enc, b);
         // The mix: the transition's shader, or a cut at half-way without one.
         let mixed = if self.effect_pipeline(device, &tr.effect).is_some() {
             for k in (0..2).filter(|_| tr.effect.mips) {
@@ -1149,8 +1237,8 @@ impl Compositor {
             vals[256] = tr.effect.time;
             vals[257] = tr.progress.clamp(0.0, 1.0);
             vals[258] = out.0 as f32 / seq_size.0.max(1) as f32;
-            queue.write_buffer(&self.slots[i].trans_buf, 0, &floats(&vals));
-            let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf, &[&a_all, &self.dummy_view, &b_all]);
+            self.slots[i].trans_buf.set(queue, &vals);
+            let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf.buf, &[&a_all, &self.dummy_view, &b_all]);
             let mut pass = begin(enc, c, Some(wgpu::Color::TRANSPARENT));
             pass.set_pipeline((*self.effects[&tr.effect.key]).as_ref().unwrap());
             pass.set_bind_group(0, &bg, &[]);
@@ -1165,9 +1253,10 @@ impl Compositor {
         let full: [f32; 16] = [-1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0];
         let mut u = full.to_vec();
         u.extend([1.0, 0.0, 0.0, 0.0]);
-        queue.write_buffer(&self.slots[i].ident_buf, 0, &floats(&u));
-        let bg = self.bind(device, &self.one_layout, &self.slots[i].ident_buf, &[mixed]);
-        let mut pass = begin(enc, target, None);
+        self.slots[i].ident_buf.set(queue, &u);
+        let bg = self.bind(device, &self.one_layout, &self.slots[i].ident_buf.buf, &[mixed]);
+        let load = self.load(target);
+        let mut pass = begin(enc, target, load);
         pass.set_pipeline(&self.composite[&Blend::Normal]);
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..6, 0..1);
@@ -1212,7 +1301,20 @@ impl Compositor {
         // in an HD sequence (or any half-size preview) is filtered down
         // once, and its effects touch a quarter of the pixels or fewer.
         let reduce = !layer.effects.is_empty() && scale < 0.75;
-        let (pw, ph) = if reduce { (((tw as f32 * scale).ceil() as u32).max(1), ((th as f32 * scale).ceil() as u32).max(1)) } else { (tw, th) };
+        // A decoded picture without effects shown below half size is decoded
+        // straight to the mip level it would be read at (up to 8×8 texels a
+        // pixel; the chain goes on from there): a UHD frame in a quarter-size
+        // monitor writes 0.5 MPixels, not 8.3 and its chain.
+        let rgba = self.slots[i].planes.as_ref().is_some_and(|p| p.rgba);
+        let boxk = match &layer.source {
+            LayerSource::Frame(_) if self.box_decode && !reduce && !rgba && scale > 0.0 && scale < 0.5 => ((1.0 / scale).log2().floor() as u32).min(3).min(full_levels(tw, th) - 1),
+            _ => 0,
+        };
+        let (pw, ph) = if reduce {
+            (((tw as f32 * scale).ceil() as u32).max(1), ((th as f32 * scale).ceil() as u32).max(1))
+        } else {
+            ((tw >> boxk).max(1), (th >> boxk).max(1))
+        };
         let p_across = if turned { ph } else { pw };
         // Effects may read a mip chain (wide blurs); otherwise only a
         // layer drawn small needs one.
@@ -1247,7 +1349,7 @@ impl Compositor {
                 let (yo, ys, cs, cm) = yuv_levels(deep, f.color.full_range);
                 let mut pm = columns(primaries_to(space, &f.color.primaries));
                 pm[0][3] = cm; // the chroma midpoint rides in the spare lane
-                let mut u = Vec::with_capacity(28);
+                let mut u = Vec::with_capacity(32);
                 for c in m {
                     u.extend(c);
                 }
@@ -1255,20 +1357,27 @@ impl Compositor {
                 for c in pm {
                     u.extend(c);
                 }
-                queue.write_buffer(&self.slots[i].decode_buf, 0, &floats(&u));
+                u.extend([(1u32 << boxk) as f32, 0.0, 0.0, 0.0]);
+                self.slots[i].decode_buf.set(queue, &u);
                 if self.slots[i].decode_bg.is_none() {
                     let s = &self.slots[i];
                     let p = s.planes.as_ref().unwrap();
                     let bg = if rgba {
-                        self.bind(device, &self.one_layout, &s.decode_buf, &[&p.luma_view])
+                        self.bind(device, &self.one_layout, &s.decode_buf.buf, &[&p.luma_view])
                     } else {
-                        self.bind(device, &self.decode_layout, &s.decode_buf, &[&p.luma_view, &p.chroma_view])
+                        self.bind(device, &self.decode_layout, &s.decode_buf.buf, &[&p.luma_view, &p.chroma_view])
                     };
                     self.slots[i].decode_bg = Some(bg);
                 }
                 let s = &self.slots[i];
                 let mut pass = begin(enc, &first, Some(wgpu::Color::TRANSPARENT));
-                pass.set_pipeline(if rgba { &self.decode_rgba } else { &self.decode });
+                pass.set_pipeline(if rgba {
+                    &self.decode_rgba
+                } else if boxk > 0 {
+                    &self.decode_box
+                } else {
+                    &self.decode
+                });
                 pass.set_bind_group(0, s.decode_bg.as_ref(), &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -1282,18 +1391,17 @@ impl Compositor {
                 }
                 vals[256] = e.time;
                 vals[258] = fx_scale;
-                queue.write_buffer(&self.slots[i].trans_buf, 0, &floats(&vals));
-                let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf, &[&self.dummy_view, &self.dummy_view, &self.dummy_view]);
+                self.slots[i].trans_buf.set(queue, &vals);
+                let bg = self.bind(device, &self.effect_layout, &self.slots[i].trans_buf.buf, &[&self.dummy_view, &self.dummy_view, &self.dummy_view]);
                 let mut pass = begin(enc, &first, Some(wgpu::Color::TRANSPARENT));
                 pass.set_pipeline((*self.effects[&e.key]).as_ref().unwrap());
                 pass.set_bind_group(0, &bg, &[]);
                 pass.draw(0..3, 0..1);
             }
             LayerSource::Nested(n) => {
-                {
-                    let _clear = begin(enc, &first, Some(wgpu::Color::TRANSPARENT));
-                }
+                self.owed.push(first.clone());
                 self.draw(device, queue, enc, &first, (n.width, n.height), &n.layers, n.seq_size, space, next);
+                self.pay(enc, &first);
             }
         }
         // 1b. Reduced: the whole picture's mip chain, then one trilinear
@@ -1304,7 +1412,7 @@ impl Compositor {
                 self.slots[i].whole_mip_bg = bgs;
             }
             if self.slots[i].reduce_bg.is_none() {
-                let bg = self.bind(device, &self.one_layout, &self.empty_buf, &[&self.slots[i].whole.as_ref().unwrap().all]);
+                let bg = self.bind(device, &self.one_layout, &self.empty_buf.buf, &[&self.slots[i].whole.as_ref().unwrap().all]);
                 self.slots[i].reduce_bg = Some(bg);
             }
             let s = &self.slots[i];
@@ -1336,12 +1444,12 @@ impl Compositor {
                 s.effect_bufs.push(uniform_buf(device, EFFECT_BYTES));
                 s.effect_bg.push([None, None]);
             }
-            queue.write_buffer(&s.effect_bufs[k], 0, &floats(&vals));
+            s.effect_bufs[k].set(queue, &vals);
             if self.slots[i].effect_bg[k][cur].is_none() {
                 let s = &self.slots[i];
                 // Bindings: source (with its mip chain), (unused slot), source_b.
                 let src = &s.pair.as_ref().unwrap()[cur].all;
-                let bg = self.bind(device, &self.effect_layout, &s.effect_bufs[k], &[src, &self.dummy_view, &self.dummy_view]);
+                let bg = self.bind(device, &self.effect_layout, &s.effect_bufs[k].buf, &[src, &self.dummy_view, &self.dummy_view]);
                 self.slots[i].effect_bg[k][cur] = Some(bg);
             }
             let s = &self.slots[i];
@@ -1369,14 +1477,15 @@ impl Compositor {
         }
         let mut u: Vec<f32> = corners.iter().flatten().copied().collect();
         u.extend([layer.opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0]);
-        queue.write_buffer(&self.slots[i].quad_buf, 0, &floats(&u));
+        self.slots[i].quad_buf.set(queue, &u);
         if self.slots[i].quad_bg[cur].is_none() {
             let s = &self.slots[i];
-            let bg = self.bind(device, &self.one_layout, &s.quad_buf, &[&s.pair.as_ref().unwrap()[cur].all]);
+            let bg = self.bind(device, &self.one_layout, &s.quad_buf.buf, &[&s.pair.as_ref().unwrap()[cur].all]);
             self.slots[i].quad_bg[cur] = Some(bg);
         }
+        let load = self.load(target);
         let s = &self.slots[i];
-        let mut pass = begin(enc, target, None);
+        let mut pass = begin(enc, target, load);
         pass.set_pipeline(&self.composite[&layer.blend]);
         pass.set_bind_group(0, s.quad_bg[cur].as_ref(), &[]);
         pass.draw(0..6, 0..1);

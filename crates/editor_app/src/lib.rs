@@ -26,6 +26,8 @@ struct App {
     store: Store,
     /// The main window's frame, as last drawn: saved with the layout.
     main_window: WindowGeometry,
+    /// The monitors' commands for the frame being built.
+    commands: Vec<wgpu::CommandBuffer>,
 }
 
 /// Where the editor keeps its settings and layout: the app-data folder.
@@ -114,11 +116,19 @@ impl App {
 impl ShellApp for App {
     fn prepare(&mut self, gpu: &Gpu, renderer: &mut libgui_wgpu::Renderer, surface: SurfaceId) {
         if surface == SurfaceId::MAIN {
-            self.ui.prepare_gpu(&gpu.device, &gpu.queue, renderer);
+            self.commands = self.ui.prepare_gpu(&gpu.device, &gpu.queue, renderer);
         } else {
             // A torn-off panel shows the same monitor and thumbnails.
             self.ui.share_textures(surface, renderer);
         }
+    }
+
+    fn textures_changed(&mut self, surface: SurfaceId) -> Option<Vec<libgui::TextureId>> {
+        self.ui.textures_changed(surface)
+    }
+
+    fn commands(&mut self, _surface: SurfaceId) -> Vec<wgpu::CommandBuffer> {
+        std::mem::take(&mut self.commands)
     }
 
     fn ui(&mut self, ui: &mut Ui, surface: SurfaceId, shell: &mut ShellCtx) {
@@ -318,6 +328,6 @@ pub fn run(engine: Engine, touch: bool) {
         if let Some(text) = layout {
             ui.restore_layout(&text);
         }
-        App { ui, pick: None, menu_actions: Vec::new(), store, main_window: WindowGeometry::default() }
+        App { ui, pick: None, menu_actions: Vec::new(), store, main_window: WindowGeometry::default(), commands: Vec::new() }
     });
 }

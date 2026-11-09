@@ -12,6 +12,9 @@ use ve_ports::*;
 #[derive(Default)]
 pub struct CpalAudio;
 
+/// The output buffer asked for while playing (see `open`).
+const PLAYBACK_FRAMES: u32 = 2048;
+
 enum Ctl {
     Play,
     Pause,
@@ -48,19 +51,26 @@ impl AudioOutput for CpalAudio {
             .spawn(move || {
                 let open = || -> Result<cpal::Stream, AudioError> {
                     let device = cpal::default_host().default_output_device().ok_or(AudioError::NoDevice)?;
-                    let config = cpal::StreamConfig {
-                        channels: want.channels,
-                        sample_rate: want.sample_rate,
-                        buffer_size: cpal::BufferSize::Default,
+                    // Playback, not live monitoring: a long buffer wakes the
+                    // CPU less often (2048 frames, ~23 times a second at
+                    // 48 kHz, against ~94 for the usual 512), and the clock
+                    // allows for the latency. Where the device cannot, its own.
+                    let sizes = device.default_output_config().ok().map(|c| *c.buffer_size());
+                    let fixed = match sizes {
+                        Some(cpal::SupportedBufferSize::Range { min, max }) if min <= max => Some(PLAYBACK_FRAMES.clamp(min, max)),
+                        _ => None,
                     };
-                    let channels = want.channels as u64;
-                    let (render, counter, rebuild) = (render.clone(), counter.clone(), rebuild.clone());
-                    device
-                        .build_output_stream(
+                    let build = |buffer_size: cpal::BufferSize| {
+                        let config = cpal::StreamConfig { channels: want.channels, sample_rate: want.sample_rate, buffer_size };
+                        let channels = want.channels as u64;
+                        let (render, counter, rebuild) = (render.clone(), counter.clone(), rebuild.clone());
+                        device.build_output_stream(
                             config,
-                            move |buf: &mut [f32], _| {
+                            move |buf: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                                let t = info.timestamp();
+                                let heard_in = t.playback.duration_since(t.callback);
                                 match render.try_lock() {
-                                    Ok(mut r) => r(buf),
+                                    Ok(mut r) => r(buf, heard_in),
                                     Err(_) => buf.fill(0.0),
                                 }
                                 counter.advance(buf.len() as u64 / channels);
@@ -71,6 +81,10 @@ impl AudioOutput for CpalAudio {
                             },
                             None,
                         )
+                    };
+                    fixed
+                        .and_then(|n| build(cpal::BufferSize::Fixed(n)).ok())
+                        .map_or_else(|| build(cpal::BufferSize::Default), Ok)
                         .map_err(|e| AudioError::Other(e.to_string()))
                 };
                 let mut stream = match open() {

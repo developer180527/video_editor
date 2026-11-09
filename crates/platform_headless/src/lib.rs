@@ -164,7 +164,7 @@ impl NullAudioStream {
     /// Pretend the device played `n` frames: pulls them through the callback.
     pub fn advance(&self, n: usize) {
         let mut buf = vec![0.0; n * self.config.channels as usize];
-        (self.render.lock().unwrap())(&mut buf);
+        (self.render.lock().unwrap())(&mut buf, std::time::Duration::ZERO);
         self.clock.advance(n as u64);
     }
 }

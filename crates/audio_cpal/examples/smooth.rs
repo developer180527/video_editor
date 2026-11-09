@@ -7,7 +7,7 @@ use ve_ports::{clock_now, AudioOutput};
 fn main() {
     let a = audio_cpal::CpalAudio;
     let cfg = a.preferred().expect("no device");
-    let mut s = a.open(cfg, Box::new(|b: &mut [f32]| b.fill(0.0))).unwrap();
+    let mut s = a.open(cfg, Box::new(|b: &mut [f32], _| b.fill(0.0))).unwrap();
     s.play().unwrap();
     std::thread::sleep(Duration::from_millis(300));
     let clock = s.clock();

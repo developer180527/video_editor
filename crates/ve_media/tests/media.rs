@@ -179,7 +179,7 @@ fn playback_callback_delivers_mixed_audio() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         std::thread::sleep(Duration::from_millis(10));
-        callback(&mut out);
+        callback(&mut out, std::time::Duration::ZERO);
         if peak(&out, 0) > 0.05 {
             break;
         }
@@ -187,7 +187,7 @@ fn playback_callback_delivers_mixed_audio() {
     }
     assert!(pb.meters.peaks()[0] > 0.05, "and the meters see it");
     pb.stop();
-    callback(&mut out);
+    callback(&mut out, std::time::Duration::ZERO);
     assert_eq!(peak(&out, 0), 0.0, "silence after stop");
 }
 
@@ -305,13 +305,13 @@ fn playback_clock_waits_for_the_mixer() {
     let mut buf = vec![0f32; 512 * 2];
     let (p, seq) = project(&PathBuf::from("/nowhere.mov"));
     // Stopped: silence, and the clock stands still.
-    callback(&mut buf);
+    callback(&mut buf, std::time::Duration::ZERO);
     assert_eq!(clock.read().0, 0);
     // Started, but the mixer is stuck opening the clip: device silence is
     // not playback.
     pb.play(Arc::new(p), seq, Time::ZERO);
     std::thread::sleep(Duration::from_millis(50));
-    callback(&mut buf);
+    callback(&mut buf, std::time::Duration::ZERO);
     assert_eq!(clock.read().0, 0, "silence before the mixer delivers is not playback");
     // Once the mixer runs, whole buffers count.
     *gate.open.lock().unwrap() = true;
@@ -320,14 +320,14 @@ fn playback_clock_waits_for_the_mixer() {
     while clock.read().0 == 0 {
         assert!(std::time::Instant::now() < deadline, "mixer never delivered");
         std::thread::sleep(Duration::from_millis(5));
-        callback(&mut buf);
+        callback(&mut buf, std::time::Duration::ZERO);
     }
     // The frames actually heard: all of the buffer, or as much of it as the
     // mixer had ready (a slow machine catches it part-way).
     let n = clock.read().0;
     assert!(n > 0 && n <= 512, "the first buffer heard counts its frames: {n}");
     pb.stop();
-    callback(&mut buf);
+    callback(&mut buf, std::time::Duration::ZERO);
     assert_eq!(clock.read().0, n, "stopped: the clock stands still");
 }
 

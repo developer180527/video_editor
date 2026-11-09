@@ -10,11 +10,13 @@ pub fn clock_now() -> Duration {
     EPOCH.get_or_init(Instant::now).elapsed()
 }
 
-/// The audio device's position: frames handed to the device, and when.
+/// The audio device's position: frames counted, and when the speaker will
+/// have played them all.
 ///
-/// The count moves in whole callback buffers (512 frames is ~11.6 ms at
-/// 44.1 kHz). Reading the stamp too lets a reader extrapolate between
-/// callbacks, so a playhead built on it moves smoothly.
+/// The count moves in whole callback buffers (2048 frames is ~43 ms at
+/// 48 kHz). Reading the stamp too lets a reader extrapolate between
+/// callbacks, so a playhead built on it moves smoothly — backwards from a
+/// stamp still ahead (the buffer is yet to be heard), forwards past one.
 #[derive(Default)]
 pub struct AudioClock {
     frames: AtomicU64,
@@ -30,29 +32,33 @@ impl AudioClock {
         Self::default()
     }
 
-    /// The device took `n` more frames, now. Real-time safe.
+    /// The device took `n` more frames, heard now. Real-time safe.
     pub fn advance(&self, n: u64) {
         self.tick(n, true);
     }
 
-    /// A callback counted `n` frames; `live` when that was the whole buffer.
-    /// Real-time safe.
+    /// A callback counted `n` frames, heard now; `live` when that was the
+    /// whole buffer. Real-time safe.
     pub fn tick(&self, n: u64, live: bool) {
-        self.stamp_ns.store(clock_now().as_nanos() as u64, Ordering::Release);
+        self.tick_heard(n, live, Duration::ZERO);
+    }
+
+    /// A callback counted `n` frames that will all have been heard
+    /// `done_in` from now (the output's latency and their own length).
+    /// Real-time safe.
+    pub fn tick_heard(&self, n: u64, live: bool, done_in: Duration) {
+        self.stamp_ns.store((clock_now() + done_in).as_nanos() as u64, Ordering::Release);
         self.frames.fetch_add(n, Ordering::AcqRel);
         self.live.store(live, Ordering::Release);
     }
 
-    /// Frames so far, and when the count last moved (on [`clock_now`]'s
-    /// epoch). A stalled count is stamped "now", so readers do not
-    /// extrapolate it.
+    /// Frames so far, and when the speaker reaches that count (on
+    /// [`clock_now`]'s epoch) — possibly still ahead. A stalled count is
+    /// not extrapolated past: its stamp is at most "now".
     pub fn read(&self) -> (u64, Duration) {
         let frames = self.frames.load(Ordering::Acquire);
-        let at = if self.live.load(Ordering::Acquire) {
-            Duration::from_nanos(self.stamp_ns.load(Ordering::Acquire))
-        } else {
-            clock_now()
-        };
+        let stamp = Duration::from_nanos(self.stamp_ns.load(Ordering::Acquire));
+        let at = if self.live.load(Ordering::Acquire) { stamp } else { stamp.max(clock_now()) };
         (frames, at)
     }
 }
@@ -73,9 +79,11 @@ pub struct AudioConfig {
     pub buffer_frames: u32,
 }
 
-/// Fills an interleaved buffer. Runs on the real-time audio thread: it must
-/// not allocate, lock, or wait.
-pub type RenderCallback = Box<dyn FnMut(&mut [f32]) + Send>;
+/// Fills an interleaved buffer; the `Duration` is how long until its first
+/// frame reaches the speaker (the output's latency; zero when the device
+/// cannot say). Runs on the real-time audio thread: it must not allocate,
+/// lock, or wait.
+pub type RenderCallback = Box<dyn FnMut(&mut [f32], Duration) + Send>;
 
 /// An open output stream.
 pub trait AudioStream: Send {
@@ -134,4 +142,24 @@ pub trait AudioProcessor: Send {
 /// Makes [`AudioProcessor`]s for effects that are not built in.
 pub trait AudioPlugins: Send + Sync {
     fn instantiate(&self, plugin: &ve_model::PluginRef, sample_rate: u32) -> Result<Box<dyn AudioProcessor>, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_count_is_stamped_when_it_is_heard_and_a_stall_does_not_run_ahead() {
+        let c = AudioClock::new();
+        c.tick_heard(2048, true, Duration::from_millis(60));
+        let (n, at) = c.read();
+        assert_eq!(n, 2048);
+        assert!(at > clock_now() + Duration::from_millis(50), "heard in the future");
+        // A stall (a short buffer): never stamped past what is heard, and
+        // never extrapolated past now.
+        c.tick_heard(100, false, Duration::from_millis(5));
+        let (n, at) = c.read();
+        assert_eq!(n, 2148);
+        assert!(at >= clock_now());
+    }
 }

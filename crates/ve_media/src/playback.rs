@@ -122,7 +122,7 @@ impl Playback {
         let overrides = mixer.overrides();
         let (s, m) = (shared.clone(), meters.clone());
         std::thread::Builder::new().name("ve-mixer".into()).spawn(move || mix_thread(mixer, prod, s, m)).expect("mixer thread");
-        let callback = make_callback(cons, shared.clone(), meters.clone(), clock.clone(), channels as usize);
+        let callback = make_callback(cons, shared.clone(), meters.clone(), clock.clone(), channels as usize, rate);
         (Playback { shared, meters, overrides, clock, rate }, callback)
     }
 
@@ -178,6 +178,12 @@ fn mix_thread(mut mixer: Mixer, mut prod: Producer<(u64, [f32; 2])>, s: Arc<Shar
     // How far ahead of the device to stay: enough to ride out a slow
     // decode, little enough that an edit or a fader is heard promptly.
     let ahead = rate as usize / 4;
+    // Mixed in batches: once ahead, sleep until 100 ms has played, then mix
+    // it in one go. The device takes its buffer in bursts (1024 frames at a
+    // time over Bluetooth), so a wait timed as if it drained smoothly woke
+    // this thread several times per callback to find nothing yet taken.
+    let low = ahead.saturating_sub(rate as usize / 10);
+    let mut filling = true;
     let capacity = prod.buffer().capacity();
     while !s.quit.load(Ordering::Relaxed) {
         // A new job replaces the current one; a new playback starts a new
@@ -188,6 +194,7 @@ fn mix_thread(mut mixer: Mixer, mut prod: Producer<(u64, [f32; 2])>, s: Arc<Shar
             }
             current = Some(job);
             rendered = 0;
+            filling = true;
         }
         if !s.playing.load(Ordering::Relaxed) {
             current = None;
@@ -199,11 +206,16 @@ fn mix_thread(mut mixer: Mixer, mut prod: Producer<(u64, [f32; 2])>, s: Arc<Shar
             continue;
         };
         let filled = capacity - prod.slots();
-        if prod.slots() < BLOCK || filled > ahead {
-            // Far enough ahead: sleep until the device has played enough to
-            // make room — about one wake per block mixed, not a 3 ms poll
-            // (~330 a second) — or until a new job, stop or quit.
-            let frames = filled.saturating_sub(ahead).max(BLOCK.saturating_sub(prod.slots())).max(1);
+        if filled >= ahead {
+            filling = false;
+        } else if filled <= low {
+            filling = true;
+        }
+        if prod.slots() < BLOCK || !filling {
+            // Far enough ahead: sleep until the device has played down to
+            // the low mark — about ten wakes a second, not one per block or
+            // a 3 ms poll — or until a new job, stop or quit.
+            let frames = filled.saturating_sub(low).max(BLOCK.saturating_sub(prod.slots())).max(1);
             let wait = Duration::from_secs_f64(frames as f64 / rate as f64);
             let job = s.job.lock().unwrap();
             let _ = s.wake.wait_timeout_while(job, wait, |j| j.is_none() && !s.quit.load(Ordering::Relaxed) && s.playing.load(Ordering::Relaxed));
@@ -223,8 +235,8 @@ fn mix_thread(mut mixer: Mixer, mut prod: Producer<(u64, [f32; 2])>, s: Arc<Shar
     }
 }
 
-fn make_callback(mut cons: Consumer<(u64, [f32; 2])>, s: Arc<Shared>, meters: Arc<Meters>, clock: Arc<AudioClock>, channels: usize) -> RenderCallback {
-    Box::new(move |out: &mut [f32]| {
+fn make_callback(mut cons: Consumer<(u64, [f32; 2])>, s: Arc<Shared>, meters: Arc<Meters>, clock: Arc<AudioClock>, channels: usize, rate: u32) -> RenderCallback {
+    Box::new(move |out: &mut [f32], heard_in: Duration| {
         let g = s.generation.load(Ordering::Relaxed);
         let playing = s.playing.load(Ordering::Relaxed);
         let (mut pl, mut pr) = (0f32, 0f32);
@@ -260,7 +272,10 @@ fn make_callback(mut cons: Consumer<(u64, [f32; 2])>, s: Arc<Shared>, meters: Ar
             }
         }
         let frames = (out.len() / channels.max(1)) as u64;
-        clock.tick(heard, frames > 0 && heard == frames);
+        // The frames counted are the buffer's first `heard`: all played
+        // after the output's latency and their own length. The playhead
+        // follows what is heard, whatever the buffer size.
+        clock.tick_heard(heard, frames > 0 && heard == frames, heard_in + Duration::from_secs_f64(heard as f64 / rate.max(1) as f64));
         if meters.heard_gen.load(Ordering::Relaxed) != g {
             meters.heard_gen.store(g, Ordering::Relaxed);
             meters.heard.store(0, Ordering::Release);

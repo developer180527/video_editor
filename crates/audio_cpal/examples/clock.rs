@@ -7,7 +7,7 @@ fn main() {
     let a = audio_cpal::CpalAudio;
     let cfg = a.preferred().expect("no device");
     println!("device: {} Hz, {} ch", cfg.sample_rate, cfg.channels);
-    let mut s = a.open(cfg, Box::new(|b: &mut [f32]| b.fill(0.0))).unwrap();
+    let mut s = a.open(cfg, Box::new(|b: &mut [f32], _| b.fill(0.0))).unwrap();
     s.play().unwrap();
     std::thread::sleep(Duration::from_millis(300));
     let start = Instant::now();

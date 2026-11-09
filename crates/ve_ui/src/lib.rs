@@ -262,6 +262,9 @@ pub struct EditorUi {
     monitor_view: Option<wgpu::TextureView>,
     /// Per torn-off window: the thumbnails its renderer has been given.
     shared: HashMap<SurfaceId, HashSet<TextureId>>,
+    /// Main-window textures given a new picture since the shell last asked:
+    /// only where they show is repainted.
+    repointed: Vec<TextureId>,
     /// How the window being built is framed.
     frame: WindowFrame,
     window_actions: Vec<(SurfaceId, WindowAction)>,
@@ -401,6 +404,7 @@ impl EditorUi {
             monitor: None,
             monitor_view: None,
             shared: HashMap::new(),
+            repointed: Vec::new(),
             frame: WindowFrame::default(),
             window_actions: Vec::new(),
             tab_height: 24.0,
@@ -477,8 +481,15 @@ impl EditorUi {
     }
 
     /// Render the program monitor and hand its texture (and new thumbnails)
-    /// to the main window's UI renderer.
-    pub fn prepare_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui_wgpu::Renderer) {
+    /// to the main window's UI renderer. Returns the monitors' commands, to
+    /// submit before (or with) the frame that shows them.
+    pub fn prepare_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui_wgpu::Renderer) -> Vec<wgpu::CommandBuffer> {
+        let mut commands = Vec::new();
+        self.prepare_monitors(device, queue, renderer, &mut commands);
+        commands
+    }
+
+    fn prepare_monitors(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut libgui_wgpu::Renderer, commands: &mut Vec<wgpu::CommandBuffer>) {
         // Resolution from the quality menu while playing; a still frame is
         // drawn whole (titles and fine detail stay sharp), as the setting
         // says. Proxies from their toggle.
@@ -551,13 +562,18 @@ impl EditorUi {
                     c.set_importer(importer.clone());
                     c
                 });
-                comp.render(device, queue, &frame.plan, &frame.layers, frame.seq_size, frame.space);
+                commands.push(comp.encode(device, queue, &frame.plan, &frame.layers, frame.seq_size, frame.space));
                 self.source_catching_up = !frame.complete;
                 self.errors.append(&mut comp.errors);
                 if let Some(tex) = comp.output() {
                     let view = tex.create_view(&Default::default());
                     match self.source_tex {
-                        Some(id) => renderer.update_texture(id, &view),
+                        Some(id) => {
+                            renderer.update_texture(id, &view);
+                            if !self.repointed.contains(&id) {
+                        self.repointed.push(id);
+                    }
+                        }
                         None => self.source_tex = Some(renderer.register_texture(&view)),
                     }
                     self.source_view = Some(view);
@@ -583,13 +599,18 @@ impl EditorUi {
             c.set_importer(importer.clone());
             c
         });
-        comp.render(device, queue, &frame.plan, &frame.layers, frame.seq_size, frame.space);
+        commands.push(comp.encode(device, queue, &frame.plan, &frame.layers, frame.seq_size, frame.space));
         self.catching_up = !frame.complete;
         self.errors.append(&mut comp.errors);
         if let Some(tex) = comp.output() {
             let view = tex.create_view(&Default::default());
             match self.monitor {
-                Some(id) => renderer.update_texture(id, &view),
+                Some(id) => {
+                    renderer.update_texture(id, &view);
+                    if !self.repointed.contains(&id) {
+                        self.repointed.push(id);
+                    }
+                }
                 None => self.monitor = Some(renderer.register_texture(&view)),
             }
             self.monitor_view = Some(view);
@@ -598,12 +619,19 @@ impl EditorUi {
             let scope_key = (key, self.view.scope);
             if std::mem::take(&mut self.scopes_wanted) && self.scope_key.as_ref() != Some(&scope_key) {
                 self.scope_key = Some(scope_key);
+                // The scopes read the picture: it is drawn first.
+                queue.submit(commands.drain(..));
                 let scopes = self.scopes.get_or_insert_with(|| ve_render::scopes::Scopes::new(device));
                 scopes.render(device, queue, tex, self.view.scope);
                 if let Some(out) = scopes.output() {
                     let view = out.create_view(&Default::default());
                     match self.scope_tex {
-                        Some(id) => renderer.update_texture(id, &view),
+                        Some(id) => {
+                            renderer.update_texture(id, &view);
+                            if !self.repointed.contains(&id) {
+                        self.repointed.push(id);
+                    }
+                        }
                         None => self.scope_tex = Some(renderer.register_texture(&view)),
                     }
                     self.scope_view = Some(view);
@@ -875,6 +903,13 @@ impl EditorUi {
     /// Give a torn-off window's renderer the textures the main window's has
     /// (the monitor, thumbnails), under the same ids, so panels show the same
     /// pictures wherever they are. Call before building that window's UI.
+    /// The textures whose pictures changed since the last call, for the
+    /// main window (`prepare_gpu` draws them); `None` for a torn-off one,
+    /// whose textures are pointed at again every frame.
+    pub fn textures_changed(&mut self, surface: SurfaceId) -> Option<Vec<TextureId>> {
+        (surface == SurfaceId::MAIN).then(|| std::mem::take(&mut self.repointed))
+    }
+
     pub fn share_textures(&mut self, surface: SurfaceId, renderer: &mut libgui_wgpu::Renderer) {
         if surface == SurfaceId::MAIN {
             return;

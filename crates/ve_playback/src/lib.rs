@@ -49,11 +49,16 @@ pub struct Clocks {
 const MAX_EXTRAPOLATION: Duration = Duration::from_millis(100);
 
 impl Clocks {
-    /// Frames played by now, extrapolated past the last callback.
+    /// Frames heard by now: the count, less what is still to play before
+    /// its stamp, or extrapolated past it.
     fn audio_frames(&self, rate: u32) -> Option<f64> {
         self.audio.map(|(frames, at)| {
-            let since = self.monotonic.saturating_sub(at).min(MAX_EXTRAPOLATION);
-            frames as f64 + since.as_secs_f64() * rate as f64
+            if self.monotonic >= at {
+                let since = (self.monotonic - at).min(MAX_EXTRAPOLATION);
+                frames as f64 + since.as_secs_f64() * rate as f64
+            } else {
+                (frames as f64 - (at - self.monotonic).as_secs_f64() * rate as f64).max(0.0)
+            }
         })
     }
 }
@@ -139,6 +144,30 @@ mod tests {
         // A stalled device: the clock stops 100 ms after the last callback.
         let p = t.position_at(Clocks { audio: Some((512, cb)), monotonic: cb + Duration::from_secs(5) });
         assert!(p.as_seconds_f64() < 0.12);
+    }
+
+    /// Long device buffers: each count is stamped when the speaker will
+    /// have played it, which is still ahead when it is counted. The
+    /// playhead follows what is heard: it waits out the latency, then moves
+    /// with the sound, never ahead of it, and without steps between buffers.
+    #[test]
+    fn follows_what_is_heard_through_the_output_latency() {
+        let mut t = Transport::new(48_000);
+        let start = Duration::from_millis(1000);
+        t.play(1.0, Clocks { audio: Some((0, start)), monotonic: start });
+        // 2048 frames (42.67 ms) handed over at 1 s, heard after 20 ms of
+        // latency: all of them by 1.06267 s.
+        let heard = |ms_after: f64| {
+            let done = start + Duration::from_micros(62_667);
+            t.position_at(Clocks { audio: Some((2048, done)), monotonic: start + Duration::from_secs_f64(ms_after / 1000.0) }).as_seconds_f64()
+        };
+        assert_eq!(heard(0.0), 0.0, "nothing is heard yet");
+        assert_eq!(heard(15.0), 0.0, "still inside the latency");
+        assert!((heard(41.0) - 0.021).abs() < 0.0005, "{}", heard(41.0));
+        assert!((heard(62.667) - 0.042_667).abs() < 0.0005, "{}", heard(62.667));
+        // The next buffer counted at 1.04267 s continues the same line.
+        let next = Clocks { audio: Some((4096, start + Duration::from_micros(105_333))), monotonic: start + Duration::from_millis(70) };
+        assert!((t.position_at(next).as_seconds_f64() - 0.05).abs() < 0.0005);
     }
 
     #[test]

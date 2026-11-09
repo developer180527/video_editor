@@ -612,15 +612,19 @@ dependencies = [
  "gpu_import",
  "libgui",
  "libgui_keymap",
+ "libgui_soft",
  "libgui_wgpu",
+ "platform_headless",
  "platform_winit",
  "serde",
  "toml",
+ "ve_builtins",
  "ve_engine",
  "ve_model",
  "ve_ports",
  "ve_time",
  "ve_ui",
+ "wgpu",
 ]
 
 [[package]]
@@ -1896,6 +1900,7 @@ name = "platform_winit"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "bytemuck",
  "libc",
  "libgui",
  "libgui_keymap",

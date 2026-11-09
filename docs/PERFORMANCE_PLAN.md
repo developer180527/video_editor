@@ -60,7 +60,11 @@ built-in ProMotion display (120 Hz), and an iPad Pro M5 (see the end).
 | `scripts/measure_app.sh <label> [project] [play]` | The real app: mean CPU % and macOS energy impact over 12 s, after 6 s settling. |
 | `VE_PROFILE_FPS=1` | UI frames built and presented per second, per window, and the process's CPU % — works on the iPad too. |
 | `VE_PROFILE_PLAY=1`, `VE_PROFILE_MEDIA=<file>` | Start playing (looping) / put a file on the timeline at launch, so Instruments can record untouched — on the Mac or the iPad (`devicectl … --environment-variables`). |
-| Instruments: Time Profiler, Power Profiler, Metal System Trace | Where the time goes; `xctrace record --attach <pid>`. |
+| Instruments: Time Profiler, Power Profiler, Metal System Trace | Where the time goes; `xctrace record --attach <pid>`. Power Profiler records on iOS/iPadOS only. |
+| `scripts/profile_app.sh <label> [media\|project] [play] [template]` | The app in one state: the kernel's own accounting over 10 s after 8 s settling (`scripts/rusage.py`: CPU, idle and interrupt wakeups/s, instructions, energy in mW, footprint), then optionally 10 s of an Instruments template into `target/traces/<label>.trace`. Builds `target/prof` (release + line tables). `top`'s IDLEW column reads 0 on macOS 27 (even for a 1 kHz sleeper); `rusage.py` does not. |
+| `scripts/tprof.py <trace> [N] [--thread S] [--focus S]` | A Time Profiler trace summarised in the terminal: threads, top self and inclusive functions. |
+| `scripts/gpu_summary.py <trace>` | A Metal System Trace: GPU time by pass, GPU busy %, command buffers per second. |
+| `VE_PROFILE_FPS=1` (also prints) / `VE_DAMAGE_DEBUG=1` | How much of the window each present repainted / the damage rectangles themselves. |
 
 ## Baseline
 
@@ -230,3 +234,78 @@ meter 21 % before the fix), decoding 5 %, thumbnails 3 %.
 Left as is: scrubbing that jumps 15 times a second across a file (the
 bench's synthetic case) shows stand-ins 100+ frames away — real drags (the
 "dragging" rows) stay within 0–2 frames forwards, 11 backwards at p95.
+
+## Third round (2026-11-09): Instruments, energy first
+
+Measured on the MacBook Pro (M4 Pro) with `scripts/profile_app.sh` (kernel
+accounting: `proc_pid_rusage`), Metal System Trace and Time Profiler.
+Playback output: Bluetooth headphones (44.1 kHz, buffers up to 1024 frames).
+
+| State | Before | After |
+|---|---|---|
+| Idle · paused (1080p, UHD HEVC) | 0 % CPU, 0.4 wakeups/s | same (no work at all: nothing presented while paused) |
+| **Paused UHD HEVC: memory** | **980 MB** (peak 1.17 GB) | **450 MB** |
+| **Playing UHD HEVC: memory** | **1.18 GB** | **545 MB** |
+| **Playing UHD HEVC: GPU busy** | **12.2 %** (122 ms/s) | **6.3 %** (63 ms/s) |
+| Playing: UI fragment work | 94 ms/s (the whole window, 3.8× its area) | 29 ms/s (23 % of the window: the monitor, playhead, timecode, meters) |
+| Playing: command buffers | 194/s (8 a frame) | 146/s (6 a frame) |
+| **Playing: wakeups** | **97/s** | **47/s** |
+| Playing UHD HEVC: CPU · energy (process) | 19–20 % · 31–34 mW | 17.3 % · 29 mW |
+| Playing 1080p: CPU · energy | 15–17 % · 22–26 mW | 15.5 % · 24 mW |
+| Export (`ve bench --jobs`) | — | unchanged (H.264 7.5×, HEVC 7.5×, ProRes 5.6× on UHD H.264) |
+
+What was found and fixed:
+
+- **Hardware decoders ran 13 frame threads each.** `thread_count = 0` gave
+  every VideoToolbox decoder a frame-thread context per core, each with its
+  own copy of the HEVC tables (~10 MB a thread at UHD): 550 MB of a paused
+  UHD project, 27 extra threads, and no speed (FFmpeg serialises the
+  hardware). Hardware decoders now use one thread; a stream the hardware
+  refuses after all moves to the threaded software decoder. What is left
+  is FFmpeg's per-picture HEVC side data (12 × 10.5 MB at UHD) — FFmpeg's.
+- **The whole window was shaded again for every picture.** The shell now
+  diffs each frame's draw list against the last one drawn
+  (`platform_winit::damage`): instances in one frame and not the other, and
+  images whose texture got a new picture (`ShellApp::textures_changed`),
+  damage where they cover; only that is repainted (scissored, with only
+  the instances that reach each rectangle) into a kept canvas, which is
+  copied to the swapchain image (0.35 ms a frame). A frame built with
+  nothing different presents nothing. `editor_app/tests/damage.rs` renders
+  real editor frames before and after changes (playhead, hover, selection,
+  scrolling, a dialog) on the CPU and checks that every changed pixel is
+  inside the damage.
+- **The UHD picture was decoded whole into a float texture, then reduced.**
+  A decoded picture without effects shown below half size is decoded
+  straight to the mip level it is read at — each pixel the linear-light
+  mean of the texels under it, which is what the chain made: no 66 MB
+  intermediate, no chain passes (5 → 3 passes a frame, −90 MB). The GPU
+  time is unchanged (the transfer function's `pow` dominates either way);
+  the saving is memory and DRAM traffic. `small_pictures_decoded_small_match_the_whole_decode`
+  holds it to ±1 code value against the old path.
+- **Per-frame GPU plumbing.** Uniforms are written only when they change
+  (each `write_buffer` is a staging buffer and a copy); a target's clear
+  rides in the first pass that draws over it; the monitors' commands go in
+  the frame's one submission (`ShellApp::commands`).
+- **Audio woke the CPU ~4 times per device callback.** The mixer slept
+  "until the ring drains to the target" as if the device drained smoothly,
+  but it takes its buffer in bursts. It now fills to 250 ms ahead, sleeps
+  until 100 ms has played and mixes that in one go (~10 wakes a second;
+  an edit is still heard within 250 ms). The output asks for 2048-frame
+  buffers where the device allows (built-in output; Bluetooth stops at
+  1024). The clock now stamps each count with when it is *heard*
+  (`RenderCallback` gets the output latency; cpal reports it), so the
+  picture follows the sound at any buffer size — before, it ran ahead by a
+  buffer plus the latency (most on Bluetooth).
+
+Measured and left alone:
+
+- **Allocation churn**: 6.7 % of playback CPU is the allocator and
+  zeroing, nearly all inside Metal, FFmpeg's HEVC parser and XPC; our own
+  code is under 0.5 %. Arenas would not pay.
+- **File reads**: 0.4 % of a core, from the page cache; the kernel reads
+  ahead for sequential files. A larger AVIO buffer would not be measurable.
+- **Importing the decoded IOSurface planes** (≈5 % of process CPU): a
+  texture per frame. Caching per IOSurface would keep VideoToolbox's pool
+  buffers pinned; not done.
+- **wgpu on Metal makes a command buffer per pass**; the per-pass driver
+  cost (≈10 % of the main thread) is what fewer passes buy back.

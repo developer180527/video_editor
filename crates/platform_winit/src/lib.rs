@@ -22,6 +22,9 @@
 //! [`Waker`], so an idle window redraws when there is news and otherwise
 //! sleeps.
 
+mod canvas;
+/// What changed on screen between frames (public for the editor's tests).
+pub mod damage;
 #[cfg(target_os = "ios")]
 mod ios_scene;
 #[cfg(target_os = "ios")]
@@ -213,6 +216,17 @@ pub trait ShellApp {
     fn prepare(&mut self, _gpu: &Gpu, _renderer: &mut libgui_wgpu::Renderer, _surface: SurfaceId) {}
     /// Build one window's UI. `surface` is `SurfaceId::MAIN` for the main window.
     fn ui(&mut self, ui: &mut Ui, surface: SurfaceId, shell: &mut ShellCtx);
+    /// The registered textures whose pictures changed since `surface` last
+    /// asked (called once per frame built, after `prepare`): only where
+    /// they are shown is repainted. `None`: unknown, every one may have.
+    fn textures_changed(&mut self, _surface: SurfaceId) -> Option<Vec<libgui::TextureId>> {
+        None
+    }
+    /// GPU work `prepare` recorded for `surface`'s frame (a monitor's
+    /// picture): submitted together with the frame, ahead of it.
+    fn commands(&mut self, _surface: SurfaceId) -> Vec<wgpu::CommandBuffer> {
+        Vec::new()
+    }
     /// True while something changes every frame on its own (playback).
     fn animating(&self) -> bool {
         false
@@ -302,6 +316,16 @@ struct Win {
     presented: bool,
     /// Frames built and presented this second (VE_PROFILE_FPS=1 prints them).
     stats: (u32, u32, Instant),
+    /// The picture kept between frames, when the swapchain can be copied
+    /// into (else every frame is drawn whole, straight to it).
+    canvas: Option<canvas::Canvas>,
+    damage: damage::Tracker,
+    /// What the next present repaints.
+    pending: damage::Damage,
+    /// Window areas repainted this second (VE_PROFILE_FPS).
+    painted: f64,
+    /// The app's commands for the frame being built (see `ShellApp::commands`).
+    commands: Vec<wgpu::CommandBuffer>,
     /// Why frames were built this second: rebuild asked (another thread,
     /// an event), the app animating, the dock, libgui (input, a due wake).
     why: [u32; 4],
@@ -442,6 +466,12 @@ impl<A: ShellApp> Shell<A> {
         let caps = surface.get_capabilities(&g.adapter);
         config.format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
         config.present_mode = wgpu::PresentMode::AutoVsync;
+        // Repaint only what changed into a kept canvas, then copy it over.
+        let keep = caps.usages.contains(wgpu::TextureUsages::COPY_DST);
+        if keep {
+            config.usage |= wgpu::TextureUsages::COPY_DST;
+        }
+        let format = config.format;
         surface.configure(&g.gpu.device, &config);
         let mut renderer = libgui_wgpu::Renderer::new(&g.gpu.device, &g.gpu.queue, config.format);
         if main {
@@ -495,6 +525,11 @@ impl<A: ShellApp> Shell<A> {
                 presented: false,
                 stats: (0, 0, Instant::now()),
                 why: [0; 4],
+                canvas: keep.then(|| canvas::Canvas::new(format)),
+                damage: damage::Tracker::default(),
+                pending: damage::Damage::All,
+                painted: 0.0,
+                commands: Vec::new(),
             }),
         );
         id
@@ -610,10 +645,21 @@ impl<A: ShellApp> Shell<A> {
             w.batches.clear();
             w.batches.extend_from_slice(&out.draw.batches);
             w.wake = platform.repaint_after.map(|s| now + std::time::Duration::from_secs_f32(s.max(0.0)));
-            w.presented = false;
+            w.commands.extend(self.app.commands(w.dock_id));
+            let changed = self.app.textures_changed(w.dock_id);
+            let c = w.clear;
+            let d = w.damage.diff(&out.draw.instances, &out.draw.batches, changed.as_deref(), (w.config.width, w.config.height), scale, [c.r, c.g, c.b, 1.0]);
+            // A build that was never presented left its damage unpainted.
+            w.pending = if w.presented { d } else { damage::Damage::All };
+            // Built, and nothing on screen differs: no GPU work at all.
+            w.presented = w.presented && w.pending == damage::Damage::Nothing;
         }
         if w.presented {
-            // Nothing changed since the last present: no GPU work at all.
+            // Nothing changed since the last present: no GPU work at all
+            // (but what the app recorded, should it have).
+            if !w.commands.is_empty() {
+                g.gpu.queue.submit(w.commands.drain(..));
+            }
             self.wins.insert(wid, w);
             return;
         }
@@ -622,14 +668,25 @@ impl<A: ShellApp> Shell<A> {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
             _ => {
                 w.surface.configure(&g.gpu.device, &w.config);
+                w.pending = damage::Damage::All;
                 None
             }
         };
         if let Some(frame) = frame {
-            let view = frame.texture.create_view(&Default::default());
             let mut enc = g.gpu.device.create_command_encoder(&Default::default());
-            {
-                let c = w.clear;
+            let c = w.clear;
+            let damage = std::mem::replace(&mut w.pending, damage::Damage::Nothing);
+            if std::env::var_os("VE_DAMAGE_DEBUG").is_some() {
+                eprintln!("[damage] {:?} of {}x{}", damage, w.config.width, w.config.height);
+            }
+            w.painted += match &damage {
+                damage::Damage::Rects(r) => r.iter().map(|r| ((r[2] - r[0]) as u64 * (r[3] - r[1]) as u64) as f64).sum::<f64>() / (w.config.width as f64 * w.config.height as f64),
+                _ => 1.0,
+            };
+            if let Some(canvas) = w.canvas.as_mut() {
+                canvas.paint(&g.gpu.device, &mut enc, &mut w.renderer, &w.batches, &damage, &w.damage, [c.r, c.g, c.b, 1.0], (w.config.width, w.config.height), &frame.texture);
+            } else {
+                let view = frame.texture.create_view(&Default::default());
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("ui"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -648,7 +705,7 @@ impl<A: ShellApp> Shell<A> {
                 });
                 w.renderer.render_batches(&mut pass, &w.batches);
             }
-            g.gpu.queue.submit([enc.finish()]);
+            g.gpu.queue.submit(w.commands.drain(..).chain([enc.finish()]));
             w.window.pre_present_notify();
             g.gpu.queue.present(frame);
             w.presented = true;
@@ -660,12 +717,13 @@ impl<A: ShellApp> Shell<A> {
                     let used = PROFILE_CPU.with(|c| cpu - c.replace(cpu));
                     let [r, a, d, l] = w.why;
                     eprintln!(
-                        "[fps] window {:?}: {} built (rebuild {r}, animating {a}, dock {d}, ui {l}), {} presented, process {:.0}% CPU, peak {:.0} MB",
-                        w.dock_id, w.stats.0, w.stats.1, used / secs * 100.0, peak_mb()
+                        "[fps] window {:?}: {} built (rebuild {r}, animating {a}, dock {d}, ui {l}), {} presented ({:.0}% of the window repainted each), process {:.0}% CPU, peak {:.0} MB",
+                        w.dock_id, w.stats.0, w.stats.1, 100.0 * w.painted / w.stats.1.max(1) as f64, used / secs * 100.0, peak_mb()
                     );
                     w.why = [0; 4];
                 }
                 w.stats = (0, 0, Instant::now());
+                w.painted = 0.0;
             }
         }
         // An output from a frame that was only re-presented is ignored.

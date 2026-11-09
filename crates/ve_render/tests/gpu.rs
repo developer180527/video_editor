@@ -219,6 +219,46 @@ fn downscaled_layers_are_filtered() {
     }
 }
 
+/// A picture shown small is decoded straight to the mip level it is read
+/// at; that is the level a whole decode and its chain would make, so the
+/// monitor shows the same pixels. Detail at every scale: noise, in colour.
+#[test]
+fn small_pictures_decoded_small_match_the_whole_decode() {
+    let Some((device, queue)) = gpu() else { return eprintln!("skipped: no GPU") };
+    let (w, h) = (640u32, 360u32);
+    let mut seed = 0x9e37_79b9u32;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (16 + seed % 220) as u8
+            })
+            .collect()
+    };
+    let frame = Arc::new(VideoFrame {
+        pts: Time::ZERO,
+        duration: Time::from_seconds(1),
+        width: w,
+        height: h,
+        format: PixelFormat::Nv12,
+        color: ColorTags { primaries: "bt709".into(), transfer: "bt709".into(), matrix: "bt709".into(), full_range: false },
+        data: FrameData::Cpu { planes: vec![noise((w * h) as usize), noise((w * h / 2) as usize)], strides: vec![w as usize, w as usize] },
+    });
+    for scale in [40.0, 20.0, 10.0, 4.0] {
+        let shown = |boxed: bool| {
+            let mut c = Compositor::new(&device);
+            c.set_box_decode(boxed);
+            c.render(&device, &queue, &plan(160, 90), &[layer(frame.clone(), scale, 1.0)], (160, 90), WorkingSpace::AcesCg);
+            c.read_output(&device, &queue).unwrap()
+        };
+        let (a, b) = (shown(true), shown(false));
+        let worst = a.2.iter().zip(&b.2).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+        assert!(worst <= 1, "scale {scale}%: differs by up to {worst} code values");
+    }
+}
+
 /// Rendering again with nothing changed gives the same picture (cached
 /// buffers and bind groups are rewritten, not stale), and a new frame in
 /// the same slot shows.

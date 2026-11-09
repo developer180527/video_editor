@@ -18,4 +18,10 @@ gpu_import.workspace = true
 platform_winit.workspace = true
 libgui.workspace = true
 libgui_wgpu.workspace = true
+wgpu.workspace = true
 libgui_keymap.workspace = true
+
+[dev-dependencies]
+platform_headless.workspace = true
+ve_builtins.workspace = true
+libgui_soft = { path = "../../third_party/libgui/crates/libgui_soft" }

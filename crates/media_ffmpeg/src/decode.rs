@@ -61,6 +61,13 @@ impl Codec {
                     (*ctx).opaque = fmt as i32 as isize as *mut std::ffi::c_void;
                     (*ctx).get_format = Some(pick_hw_format);
                     using_hw = true;
+                    // One thread: the hardware decodes and FFmpeg serialises
+                    // it, so frame threads only add a context each, with its
+                    // own tables (~10 MB per thread for UHD HEVC: 13 threads
+                    // held 550 MB of a paused UHD project; no faster). Should
+                    // the hardware refuse the stream after all, `emit` moves
+                    // to the threaded software decoder.
+                    (*ctx).thread_count = 1;
                 }
             }
             let r = sys::avcodec_open2(ctx, codec, ptr::null_mut());
@@ -206,6 +213,12 @@ unsafe extern "C" fn pick_hw_format(ctx: *mut sys::AVCodecContext, fmts: *const 
         }
         software.unwrap_or(*fmts)
     }
+}
+
+/// A frame in hardware memory (any device).
+unsafe fn is_hw_format(format: c_int) -> bool {
+    let d = unsafe { sys::av_pix_fmt_desc_get(std::mem::transmute::<c_int, sys::AVPixelFormat>(format)) };
+    !d.is_null() && unsafe { (*d).flags } & sys::AV_PIX_FMT_FLAG_HWACCEL as u64 != 0
 }
 
 fn first_stream(input: &Input, kind: sys::AVMediaType) -> Option<usize> {
@@ -398,6 +411,14 @@ impl VideoDec {
     /// Hand out `f` (convert it), noting where the next frame starts. A
     /// hardware frame that cannot be read back triggers the software path.
     fn emit(&mut self, f: *mut sys::AVFrame, start: Time) -> Result<Option<Option<VideoFrame>>, MediaError> {
+        if self.hardware && !unsafe { is_hw_format((*f).format) } {
+            // `pick_hw_format` fell back to software (a profile the hardware
+            // cannot do) inside the one-thread hardware context.
+            unsafe { sys::av_frame_unref(f) };
+            self.resume_at = start;
+            self.fall_back_to_software(MediaError::Unsupported("software decoder".into()))?;
+            return Ok(None);
+        }
         let out = self.convert(f);
         unsafe { sys::av_frame_unref(f) };
         match out {
